@@ -283,6 +283,42 @@ TEST_CASE("APPs APIs", "[API]") {
   REQUIRE(wolf_apps.at(2)->base.title == "Test app");
   REQUIRE(wolf_apps.at(2)->video_producer_buffer_caps == "video/x-raw(memory:DMABuf)");
 
+  // Test that apps survive a restart: reloading the saved config gives back the same apps
+  {
+    auto reloaded = state::load_or_default(config.config_source, event_bus, running_sessions);
+    immer::vector<immer::box<events::App>> reloaded_apps = state::get_moonlight_profile(reloaded).value()->apps->load();
+    REQUIRE(reloaded_apps.size() == 3);
+    for (auto i = 0; i < 3; i++) {
+      REQUIRE(reloaded_apps.at(i)->base.title == wolf_apps.at(i)->base.title);
+      REQUIRE(reloaded_apps.at(i)->base.id == wolf_apps.at(i)->base.id);
+      REQUIRE(reloaded_apps.at(i)->video_producer_buffer_caps == wolf_apps.at(i)->video_producer_buffer_caps);
+      REQUIRE(reloaded_apps.at(i)->h264_gst_pipeline == wolf_apps.at(i)->h264_gst_pipeline);
+      REQUIRE(reloaded_apps.at(i)->opus_gst_pipeline == wolf_apps.at(i)->opus_gst_pipeline);
+      REQUIRE(reloaded_apps.at(i)->render_node == wolf_apps.at(i)->render_node);
+      REQUIRE(reloaded_apps.at(i)->start_virtual_compositor == wolf_apps.at(i)->start_virtual_compositor);
+    }
+    REQUIRE(reloaded_apps.at(2)->base.id == "test");
+    REQUIRE(reloaded_apps.at(2)->video_producer_buffer_caps == "video/x-raw(memory:DMABuf)");
+    REQUIRE(reloaded_apps.at(2)->h264_gst_pipeline == "h264");
+    REQUIRE(reloaded_apps.at(2)->opus_gst_pipeline == "opus");
+    if (!reloaded_apps.at(0)->hevc_gst_pipeline.empty()) { // HEVC encoder available
+      REQUIRE(reloaded_apps.at(2)->hevc_gst_pipeline == "hevc");
+    }
+
+    // Apps from the config file keep their entry as written, and defaults aren't frozen into the file
+    auto tml = rfl::toml::load<wolf::config::WolfConfig, rfl::DefaultIfMissing>(config.config_source).value();
+    auto tml_profile = std::find_if(tml.profiles.begin(), tml.profiles.end(), [](const auto &p) {
+      return p.id == events::MOONLIGHT_PROFILE_ID;
+    });
+    REQUIRE(tml_profile != tml.profiles.end());
+    REQUIRE_FALSE(tml_profile->apps.at(0).video.has_value());
+    REQUIRE_FALSE(tml_profile->apps.at(0).id.has_value());
+    REQUIRE(tml_profile->apps.at(1).video->source == "override DEFAULT SOURCE");
+    REQUIRE_FALSE(tml_profile->apps.at(1).video->h264_pipeline.has_value());
+    REQUIRE(tml_profile->apps.at(2).id == "test");
+    REQUIRE_FALSE(tml_profile->apps.at(2).video->source.has_value());
+  }
+
   // Test that we can remove an app
   auto app_delete = AppDeleteRequest{.id = "test"};
   response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/apps/delete", rfl::json::write(app_delete));
