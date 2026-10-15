@@ -9,6 +9,7 @@ on:
 
 jobs:
   build-docs:
+    # Dispatches to games-on-whales' docs repo with its token; forks have neither.
     if: github.event_name == 'push' && github.repository == 'games-on-whales/wolf'
     runs-on: ubuntu-latest
     steps:
