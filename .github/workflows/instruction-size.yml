@@ -1,0 +1,30 @@
+# xerktech fork: keeps agent instruction files under Claude Code's 40k-character
+# threshold, past which it warns at startup and adherence drops.
+name: Instruction file size
+
+on:
+  push:
+    paths:
+      - "CLAUDE.md"
+      - "AGENTS.md"
+      - ".claude/rules/**"
+      - ".github/workflows/instruction-size.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check sizes
+        run: |
+          fail=0
+          for f in CLAUDE.md AGENTS.md .claude/rules/*.md; do
+            [ -f "$f" ] || continue
+            n=$(wc -m < "$f")
+            echo "$f: $n chars"
+            if [ "$n" -ge 40000 ]; then echo "::error file=$f::$n chars, over the 40000 cap"; fail=1; fi
+          done
+          exit $fail
