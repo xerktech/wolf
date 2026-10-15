@@ -1,0 +1,28 @@
+---
+paths:
+  - src/moonlight-server/control/**
+  - src/moonlight-server/streaming/**
+  - src/moonlight-server/sessions/**
+  - src/moonlight-server/rest/endpoints.hpp
+  - src/moonlight-server/events/events.hpp
+  - tests/testControl.cpp
+---
+
+# Stream sessions and stream instances
+
+- A `session_id` is the paired client's cert hash: it identifies the client, not one stream.
+  - `/resume` replaces the running `StreamSession` with a new one under the same `session_id`
+    (new `enet_secret_payload`, `rtp_secret_payload`, `aes_key`).
+- `PauseStreamEvent` / `StopStreamEvent` are keyed by `session_id` only, so they end every
+  pipeline of that client, including a resumed stream. Never fire them on behalf of a stream
+  instance that a resume has already replaced.
+  - A dead client's ENet peer lingers until ENet times it out (~5 s) and can disconnect after the
+    resume. `control.cpp` treats it as superseded: it fires `EndSupersededStreamEvent` (keyed by
+    `rtp_secret_payload`) instead of a pause.
+  - On ENet connect the newest peer owns the session; older peers of the same session are dropped.
+- `PauseStreamEvent` is also broadcast on the API event stream; external tools (fenrir) read it as
+  "this client's stream paused". Don't overload it with per-instance semantics.
+- Tests: `tests/testControl.cpp` — "control: a dead client's late pause doesn't end its resumed
+  stream" (real ENet), "streaming: a superseded stream instance ends only its own pipelines".
+  - The ENet test client must keep servicing its host after connect, or the server never sees the
+    CONNECT (the handshake ack is sent on the next service call).
