@@ -490,6 +490,14 @@ static bool same_settings(const events::App &a, const events::App &b) {
          a.start_virtual_compositor == b.start_virtual_compositor && a.start_audio_server == b.start_audio_server;
 }
 
+// A runner as the app built from it would serialise it, see parse_app()
+static events::RunnerTypes normalize_runner(const events::RunnerTypes &runner) {
+  if (rfl::holds_alternative<AppDocker>(runner.variant())) {
+    return docker::RunDocker::normalize_cfg(rfl::get<AppDocker>(runner.variant()));
+  }
+  return runner;
+}
+
 /**
  * The config file entry for an app.
  * An app that still matches its existing entry keeps it verbatim, so hand-written partial overrides survive.
@@ -499,7 +507,9 @@ static bool same_settings(const events::App &a, const events::App &b) {
 static BaseApp to_base_app(const Config &cfg, const events::App &app, const std::vector<BaseApp> &existing_apps) {
   auto runner = app.runner->serialize();
   for (const auto &existing : existing_apps) {
-    if (rfl::json::write(existing.runner) == rfl::json::write(runner) && same_settings(cfg.parse_app(existing), app)) {
+    if (existing.title == app.base.title &&
+        rfl::json::write(normalize_runner(existing.runner)) == rfl::json::write(runner) &&
+        same_settings(cfg.parse_app(existing), app)) {
       return existing;
     }
   }

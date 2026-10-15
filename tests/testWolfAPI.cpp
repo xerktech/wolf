@@ -316,6 +316,12 @@ TEST_CASE("APPs APIs", "[API]") {
     REQUIRE(tml_profile != tml.profiles.end());
     REQUIRE_FALSE(tml_profile->apps.at(0).video.has_value());
     REQUIRE_FALSE(tml_profile->apps.at(0).id.has_value());
+    auto pristine = rfl::toml::load<wolf::config::WolfConfig, rfl::DefaultIfMissing>("config.test.toml").value();
+    auto pristine_profile = std::find_if(pristine.profiles.begin(), pristine.profiles.end(), [](const auto &p) {
+      return p.id == events::MOONLIGHT_PROFILE_ID;
+    });
+    REQUIRE(rfl::json::write(tml_profile->apps.at(0)) == rfl::json::write(pristine_profile->apps.at(0)));
+    REQUIRE(rfl::json::write(tml_profile->apps.at(1)) == rfl::json::write(pristine_profile->apps.at(1)));
     REQUIRE(tml_profile->apps.at(1).video->source == "override DEFAULT SOURCE");
     REQUIRE_FALSE(tml_profile->apps.at(1).video->h264_pipeline.has_value());
     REQUIRE(tml_profile->apps.at(2).id == "test");
