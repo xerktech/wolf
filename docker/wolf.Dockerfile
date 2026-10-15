@@ -41,9 +41,11 @@ RUN <<_GST_WAYLAND_DISPLAY
     #!/bin/bash
     set -e
 
-    git clone https://github.com/games-on-whales/gst-wayland-display
+    # xerktech fork, tag xerk-1740: upstream 016b4fc + the fix for waylanddisplaysrc
+    # releasing Wolf's cached CUDA context once per stream (XERK-1740).
+    git clone https://github.com/xerktech/gst-wayland-display
     cd gst-wayland-display
-    git checkout 016b4fc
+    git checkout 58c55f7d9b9466c2d8b0b78a5d32bf6465fc2189
     # Pinned because it can cause issues when RUST_VERSION isn't the absolute latest
     cargo install cargo-c@0.10.23 --locked
     cargo cinstall --features="cuda" --prefix=/usr/local/lib/x86_64-linux-gnu/ --libdir=/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0
