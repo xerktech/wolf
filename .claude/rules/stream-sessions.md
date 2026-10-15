@@ -26,3 +26,10 @@ paths:
   stream" (real ENet), "streaming: a superseded stream instance ends only its own pipelines".
   - The ENet test client must keep servicing its host after connect, or the server never sees the
     CONNECT (the handshake ack is sent on the next service call).
+- `StreamSession::stream_state` backs the `state` field of `GET /api/v1/sessions`, so a client that
+  missed events (fenrir's wolf-agent after an SSE reconnect) can rebuild the stream from it.
+  - It counts running pipelines, never flags: after a pause, a restart on the same session can start
+    new pipelines before the old ones finish EOS, and a flag cleared on the old exit would read wrong.
+  - A pipeline decrements the atom it captured at start, not the session currently under its id.
+  - Tests: `tests/testWolfAPI.cpp` "Sessions APIs" covers the listing only; the event-driven
+    transitions in `sessions/moonlight.cpp` have no project test.
