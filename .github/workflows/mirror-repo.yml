@@ -3,6 +3,8 @@ name: Repo Mirror
 on: [ push ]
 jobs:
   codeberg:
+    # Forks have no CODEBERG_SSH secret and must not mirror over upstream's repo.
+    if: github.repository == 'games-on-whales/wolf'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
