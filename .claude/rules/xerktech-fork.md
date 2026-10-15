@@ -8,8 +8,8 @@ pods run (`ghcr.io/xerktech/wolf`, XERK-1944).
 - `xerktech` is the fork's long-lived branch: upstream `stable` plus our patches, one commit each.
   - Base work and PRs on `origin/xerktech`, never on `beta` (upstream's default branch, which the
     fork's default still points at) — `gh pr create --base xerktech`.
-  - Squash-merge a PR only when it is one patch; otherwise rebase-merge, so each patch stays its
-    own commit on `xerktech`.
+  - PRs into `xerktech` are squash-merged, so keep one patch per PR: the squash commit is the
+    patch that a rebase carries forward.
 - Upstream every generally useful patch as a PR to games-on-whales/wolf (against `beta`).
   - Fork-only commits carry `(xerktech)` in their subject, e.g. `ci(xerktech): …`; they are never
     upstreamed.
