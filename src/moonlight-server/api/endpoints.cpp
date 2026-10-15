@@ -208,7 +208,7 @@ void UnixSocketServer::endpoint_StreamSessions(const HTTPRequest &req, std::shar
     auto state = StreamStateName::make<"setup">();
     if (stream_state->paused) {
       state = StreamStateName::make<"paused">();
-    } else if (stream_state->video_running && stream_state->audio_running) {
+    } else if (stream_state->video_pipelines > 0 && stream_state->audio_pipelines > 0) {
       state = StreamStateName::make<"streaming">();
     }
     res.sessions.push_back({.session = rfl::Reflector<events::StreamSession>::from(session), .state = state});

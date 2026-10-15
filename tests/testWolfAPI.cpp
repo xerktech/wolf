@@ -457,12 +457,12 @@ TEST_CASE("Sessions APIs", "[API]") {
     return rfl::json::read<StreamSessionListResponse>(response->second).value().sessions[0].state.name();
   };
   stream_state->update([](auto state) {
-    state.video_running = true;
+    state.video_pipelines++;
     return state;
   });
   REQUIRE(listed_state() == "setup");
   stream_state->update([](auto state) {
-    state.audio_running = true;
+    state.audio_pipelines++;
     return state;
   });
   REQUIRE(listed_state() == "streaming");

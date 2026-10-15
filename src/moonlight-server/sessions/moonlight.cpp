@@ -273,7 +273,8 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
 
           // Start streaming
           auto stream_state = update_stream_state(running_sessions, sess->session_id, [](events::StreamState state) {
-            state.video_running = true;
+            state.video_pipelines++;
+            state.paused = false; // a pipeline started after a pause is streaming again
             return state;
           });
           streaming::start_streaming_video(sess,
@@ -284,7 +285,7 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                                            ping_ev->video_socket.get());
           if (stream_state) {
             stream_state->update([](events::StreamState state) {
-              state.video_running = false;
+              state.video_pipelines--;
               return state;
             });
           }
@@ -310,7 +311,8 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
           auto server_name = audio_server_name ? audio_server_name.value() : "";
 
           auto stream_state = update_stream_state(running_sessions, sess->session_id, [](events::StreamState state) {
-            state.audio_running = true;
+            state.audio_pipelines++;
+            state.paused = false; // a pipeline started after a pause is streaming again
             return state;
           });
           streaming::start_streaming_audio(sess,
@@ -322,7 +324,7 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                                            server_name);
           if (stream_state) {
             stream_state->update([](events::StreamState state) {
-              state.audio_running = false;
+              state.audio_pipelines--;
               return state;
             });
           }

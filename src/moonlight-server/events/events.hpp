@@ -416,9 +416,14 @@ using EventsVariant = std::variant<immer::box<PlugDeviceEvent>,
  * can rebuild the stream's state from /api/v1/sessions.
  */
 struct StreamState {
-  bool video_running = false; // the client pinged the video port and its pipeline is running
-  bool audio_running = false; // the client pinged the audio port and its pipeline is running
-  bool paused = false;        // paused, and not started again (VideoSession/AudioSession) since
+  /**
+   * Video/audio pipelines running for this session (they start on the client's first ping).
+   * Counts, not flags: after a pause, a restart on the same session can start a new pipeline
+   * before the old one has finished tearing down.
+   */
+  int video_pipelines = 0;
+  int audio_pipelines = 0;
+  bool paused = false; // paused, and nothing set up or started again since
 };
 
 /**
