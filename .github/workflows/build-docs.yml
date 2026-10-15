@@ -9,7 +9,7 @@ on:
 
 jobs:
   build-docs:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.repository == 'games-on-whales/wolf'
     runs-on: ubuntu-latest
     steps:
       - name: Fire event
