@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <cctype>
 #include <events/events.hpp>
 #include <events/reflectors.hpp>
 #include <fstream>
@@ -127,6 +129,10 @@ std::string generate_app_id(const BaseApp &app) {
   return std::to_string(abs((int32_t)hash));
 }
 
+/**
+ * The app's settings merged with this host's defaults.
+ * The runner is left empty: building one can call out to Docker, which saving the config must not do.
+ */
 events::App parse_app(const BaseApp &app,
                       const std::string &default_app_render_node,
                       const std::string &default_gst_render_node,
@@ -134,17 +140,8 @@ events::App parse_app(const BaseApp &app,
                       const std::string &h264_video_params,
                       const std::string &hevc_video_params,
                       const std::string &av1_video_params,
-                      const BaseAppAudioOverride &default_audio_settings,
-                      const std::shared_ptr<events::EventBusType> &ev_bus) {
+                      const BaseAppAudioOverride &default_audio_settings) {
   auto app_render_node = app.render_node.value_or(default_app_render_node);
-  if (app_render_node != default_gst_render_node) {
-    logs::log(logs::warning,
-              "App {} render node ({}) doesn't match the default GPU ({})",
-              app.title,
-              app_render_node,
-              default_gst_render_node);
-    // TODO: allow user to override gst_render_node
-  }
   auto app_video_settings = app.video.value_or(default_video_settings);
   auto app_audio_settings = app.audio.value_or(default_audio_settings);
 
@@ -181,21 +178,24 @@ events::App parse_app(const BaseApp &app,
                   app_audio_settings.opus_encoder.value_or(default_audio_settings.opus_encoder.value()),
                   app_audio_settings.sink.value_or(default_audio_settings.sink.value())));
 
-  return events::App{.base = {.title = app.title,
-                              .id = app.id.value_or(generate_app_id(app)),
-                              .support_hdr = false,
-                              .icon_png_path = app.icon_png_path},
-                     .video_producer_buffer_caps = app_video_settings.producer_buffer_caps.value_or(
-                         default_video_settings.producer_buffer_caps.value()),
-                     .h264_gst_pipeline = h264_gst_pipeline,
-                     .hevc_gst_pipeline = hevc_gst_pipeline,
-                     .av1_gst_pipeline = av1_gst_pipeline,
-                     .render_node = app_render_node,
+  return events::App{
+      .base = {.title = app.title,
+               .id = app.id.value_or(generate_app_id(app)),
+               .support_hdr = false,
+               .icon_png_path = app.icon_png_path},
+      // A blank caps string would produce an invalid producer pipeline, treat it like a missing one
+      .video_producer_buffer_caps = std::ranges::all_of(app_video_settings.producer_buffer_caps.value_or(""),
+                                                        [](unsigned char c) { return std::isspace(c); })
+                                        ? default_video_settings.producer_buffer_caps.value()
+                                        : *app_video_settings.producer_buffer_caps,
+      .h264_gst_pipeline = h264_gst_pipeline,
+      .hevc_gst_pipeline = hevc_gst_pipeline,
+      .av1_gst_pipeline = av1_gst_pipeline,
+      .render_node = app_render_node,
 
-                     .opus_gst_pipeline = opus_gst_pipeline,
-                     .start_virtual_compositor = app.start_virtual_compositor.value_or(true),
-                     .start_audio_server = app.start_audio_server.value_or(true),
-                     .runner = get_runner(app.runner, ev_bus)};
+      .opus_gst_pipeline = opus_gst_pipeline,
+      .start_virtual_compositor = app.start_virtual_compositor.value_or(true),
+      .start_audio_server = app.start_audio_server.value_or(true)};
 }
 
 Config load_or_default(const std::string &source,
@@ -377,25 +377,35 @@ Config load_or_default(const std::string &source,
                      h264_video_params,
                      hevc_video_params,
                      av1_video_params,
-                     default_base_audio,
-                     ev_bus);
+                     default_base_audio);
   };
 
   /* Get profiles, for each app defined will merge with default settings */
-  auto profiles =
-      cfg.profiles | //
-      ranges::views::transform([&](const Profile &profile) {
-        auto apps =
-            profile.apps | //
-            ranges::views::transform([&](const BaseApp &app) { return immer::box<events::App>{parse_app_fn(app)}; }) |
-            ranges::to<immer::vector<immer::box<events::App>>>();
-        return events::Profile{.id = profile.id,
-                               .name = profile.name.value_or(""),
-                               .icon_png_path = profile.icon_png_path.value_or(""),
-                               .pin = profile.pin,
-                               .apps = std::make_shared<immer::atom<immer::vector<immer::box<events::App>>>>(apps)};
-      }) |
-      ranges::to<ProfilesList>();
+  auto profiles = cfg.profiles | //
+                  ranges::views::transform([&](const Profile &profile) {
+                    auto apps = profile.apps | //
+                                ranges::views::transform([&](const BaseApp &app) {
+                                  auto parsed = parse_app_fn(app);
+                                  if (parsed.render_node != default_gst_render_node) {
+                                    logs::log(logs::warning,
+                                              "App {} render node ({}) doesn't match the default GPU ({})",
+                                              app.title,
+                                              parsed.render_node,
+                                              default_gst_render_node);
+                                    // TODO: allow user to override gst_render_node
+                                  }
+                                  parsed.runner = get_runner(app.runner, ev_bus);
+                                  return immer::box<events::App>{parsed};
+                                }) |
+                                ranges::to<immer::vector<immer::box<events::App>>>();
+                    return events::Profile{
+                        .id = profile.id,
+                        .name = profile.name.value_or(""),
+                        .icon_png_path = profile.icon_png_path.value_or(""),
+                        .pin = profile.pin,
+                        .apps = std::make_shared<immer::atom<immer::vector<immer::box<events::App>>>>(apps)};
+                  }) |
+                  ranges::to<ProfilesList>();
   auto profiles_atom = std::make_shared<immer::atom<ProfilesList>>(profiles);
 
   return Config{.uuid = cfg.uuid,
@@ -471,13 +481,13 @@ void update_client_settings(const Config &cfg, std::size_t client_id, const Pair
   rfl::toml::save(cfg.config_source, tml);
 }
 
-static bool same_app(const events::App &a, const events::App &b) {
+// Ignores the runners, see parse_app()
+static bool same_settings(const events::App &a, const events::App &b) {
   return a.base.title == b.base.title && a.base.id == b.base.id && a.base.icon_png_path == b.base.icon_png_path &&
          a.video_producer_buffer_caps == b.video_producer_buffer_caps && a.h264_gst_pipeline == b.h264_gst_pipeline &&
          a.hevc_gst_pipeline == b.hevc_gst_pipeline && a.av1_gst_pipeline == b.av1_gst_pipeline &&
          a.opus_gst_pipeline == b.opus_gst_pipeline && a.render_node == b.render_node &&
-         a.start_virtual_compositor == b.start_virtual_compositor && a.start_audio_server == b.start_audio_server &&
-         rfl::json::write(a.runner->serialize()) == rfl::json::write(b.runner->serialize());
+         a.start_virtual_compositor == b.start_virtual_compositor && a.start_audio_server == b.start_audio_server;
 }
 
 /**
@@ -487,8 +497,9 @@ static bool same_app(const events::App &a, const events::App &b) {
  * the encoder detected at startup instead of being frozen into the file.
  */
 static BaseApp to_base_app(const Config &cfg, const events::App &app, const std::vector<BaseApp> &existing_apps) {
+  auto runner = app.runner->serialize();
   for (const auto &existing : existing_apps) {
-    if (same_app(cfg.parse_app(existing), app)) {
+    if (rfl::json::write(existing.runner) == rfl::json::write(runner) && same_settings(cfg.parse_app(existing), app)) {
       return existing;
     }
   }
@@ -497,7 +508,7 @@ static BaseApp to_base_app(const Config &cfg, const events::App &app, const std:
                           .icon_png_path = app.base.icon_png_path,
                           .start_virtual_compositor = app.start_virtual_compositor,
                           .start_audio_server = app.start_audio_server,
-                          .runner = app.runner->serialize()};
+                          .runner = runner};
   auto defaults = cfg.parse_app(base_app);
   if (app.base.id != defaults.base.id) {
     base_app.id = app.base.id;

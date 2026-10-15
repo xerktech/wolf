@@ -304,6 +304,9 @@ TEST_CASE("APPs APIs", "[API]") {
     if (!reloaded_apps.at(0)->hevc_gst_pipeline.empty()) { // HEVC encoder available
       REQUIRE(reloaded_apps.at(2)->hevc_gst_pipeline == "hevc");
     }
+    if (!reloaded_apps.at(0)->av1_gst_pipeline.empty()) { // AV1 encoder available
+      REQUIRE(reloaded_apps.at(2)->av1_gst_pipeline == "av1");
+    }
 
     // Apps from the config file keep their entry as written, and defaults aren't frozen into the file
     auto tml = rfl::toml::load<wolf::config::WolfConfig, rfl::DefaultIfMissing>(config.config_source).value();
@@ -317,6 +320,43 @@ TEST_CASE("APPs APIs", "[API]") {
     REQUIRE_FALSE(tml_profile->apps.at(1).video->h264_pipeline.has_value());
     REQUIRE(tml_profile->apps.at(2).id == "test");
     REQUIRE_FALSE(tml_profile->apps.at(2).video->source.has_value());
+  }
+
+  // An app added with this host's default pipelines doesn't get them frozen into the config file
+  {
+    auto firefox = rfl::Reflector<events::App>::from(wolf_apps.at(0));
+    auto defaults_app = rfl::Reflector<events::App>::ReflType{
+        .title = "Defaults app",
+        .id = "defaults",
+        .support_hdr = false,
+        .video_producer_buffer_caps = firefox.video_producer_buffer_caps,
+        .h264_gst_pipeline = firefox.h264_gst_pipeline,
+        .hevc_gst_pipeline = firefox.hevc_gst_pipeline,
+        .av1_gst_pipeline = firefox.av1_gst_pipeline,
+        .render_node = firefox.render_node,
+        .opus_gst_pipeline = firefox.opus_gst_pipeline,
+        .start_virtual_compositor = true,
+        .start_audio_server = true,
+        .runner = firefox.runner};
+    response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/apps/add", rfl::json::write(defaults_app));
+    REQUIRE(response);
+    REQUIRE_THAT(response->second, Equals("{\"success\":true}"));
+
+    auto tml = rfl::toml::load<wolf::config::WolfConfig, rfl::DefaultIfMissing>(config.config_source).value();
+    auto tml_profile = std::find_if(tml.profiles.begin(), tml.profiles.end(), [](const auto &p) {
+      return p.id == events::MOONLIGHT_PROFILE_ID;
+    });
+    REQUIRE(tml_profile->apps.at(3).title == "Defaults app");
+    REQUIRE(tml_profile->apps.at(3).id == "defaults");
+    REQUIRE_FALSE(tml_profile->apps.at(3).video.has_value());
+    REQUIRE_FALSE(tml_profile->apps.at(3).audio.has_value());
+    REQUIRE_FALSE(tml_profile->apps.at(3).render_node.has_value());
+
+    response = req(curl.get(),
+                   HTTPMethod::POST,
+                   "http://localhost/api/v1/apps/delete",
+                   rfl::json::write(AppDeleteRequest{.id = "defaults"}));
+    REQUIRE(response);
   }
 
   // Test that we can remove an app
