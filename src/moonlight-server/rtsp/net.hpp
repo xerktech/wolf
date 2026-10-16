@@ -136,16 +136,18 @@ public:
    * receive_message() until our payload size matches the specified Content-length
    */
   void receive_message(const std::function<void(std::optional<RTSP_PACKET>)> &on_msg_read) {
-    // Set the expiry BEFORE waiting: expires_after() cancels any pending wait, so arming it afterwards
-    // would leave the read without a deadline and a silent client could hold the connection forever.
-    deadline_.expires_after(std::chrono::milliseconds(timeout_millis));
-    deadline_.async_wait([self = shared_from_this()](auto error) {
-      if (!error && self->deadline_.expiry() <= asio::steady_timer::clock_type::now()) { // The deadline has passed
-        logs::log(logs::trace, "[RTSP] deadline over");
-        self->socket_.cancel();
-        self->deadline_.cancel();
-      }
-    });
+    // One deadline for the whole message, armed on its first read only: re-arming it on every read would let a
+    // client trickling a byte at a time hold the connection open indefinitely.
+    // Set the expiry BEFORE waiting: expires_after() cancels any pending wait.
+    if (prev_read_bytes_ == 0) {
+      deadline_.expires_after(std::chrono::milliseconds(timeout_millis));
+      deadline_.async_wait([self = shared_from_this()](auto error) {
+        if (!error && self->deadline_.expiry() <= asio::steady_timer::clock_type::now()) { // The deadline has passed
+          logs::log(logs::trace, "[RTSP] deadline over");
+          self->socket_.cancel();
+        }
+      });
+    }
 
     boost::asio::async_read(
         socket(),
@@ -155,10 +157,17 @@ public:
           if (error_code &&
               error_code != boost::asio::error::operation_aborted) { // it'll be aborted when the deadline expires
             logs::log(logs::error, "[RTSP] error during transmission: {}", error_code.message());
-            self->send_message(rtsp::commands::error_msg(400, "BAD REQUEST"), [](auto bytes) {});
+            self->deadline_.cancel();
+            self->send_message(rtsp::commands::error_msg(400, "BAD REQUEST"), [self](auto bytes) { self->close(); });
             return;
           }
-          self->deadline_.cancel(); // stop the deadline
+          // Hands the (possibly invalid) message over, once it's complete or we've given up on it
+          auto finish = [&self, &on_msg_read](std::optional<RTSP_PACKET> msg) {
+            self->deadline_.cancel();
+            self->prev_read_ = "";
+            self->prev_read_bytes_ = 0;
+            on_msg_read(msg);
+          };
           std::string raw_msg = {std::istreambuf_iterator<char>(&self->streambuf_), {}};
           logs::log(logs::trace, "[RTSP] received message {} bytes \n{}", bytes_transferred, raw_msg);
 
@@ -186,17 +195,13 @@ public:
             auto content_length = utils::to_size_t(total_length_str);
             if (!content_length || *content_length > max_total_msg_size) {
               logs::log(logs::warning, "[RTSP] invalid Content-length: {}", total_length_str);
-              self->prev_read_ = "";
-              self->prev_read_bytes_ = 0;
-              return on_msg_read(std::nullopt);
+              return finish(std::nullopt);
             }
             auto total_length = *content_length + content_lenght_end + 2; // 2 for the \r\n
             if (total_bytes_transferred < total_length) {
               if (error_code == boost::asio::error::operation_aborted) { // timed out before the payload arrived
                 logs::log(logs::warning, "[RTSP] timed out waiting for the message payload");
-                self->prev_read_ = "";
-                self->prev_read_bytes_ = 0;
-                return on_msg_read(std::nullopt);
+                return finish(std::nullopt);
               }
               self->prev_read_ = full_raw_msg;
               self->prev_read_bytes_ += bytes_transferred;
@@ -204,10 +209,7 @@ public:
             }
           }
 
-          auto msg = rtsp::parse(full_raw_msg);
-          self->prev_read_ = "";
-          self->prev_read_bytes_ = 0;
-          on_msg_read(msg);
+          finish(rtsp::parse(full_raw_msg));
         });
   }
 
