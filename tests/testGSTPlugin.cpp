@@ -6,15 +6,14 @@
 
 using Catch::Matchers::Equals;
 
-#include <atomic>
 #include <chrono>
-#include <core/gstreamer.hpp>
-#include <events/events.hpp>
 #include <future>
 #include <gst-plugin/audio.hpp>
 #include <gst-plugin/video.hpp>
 #include <moonlight/fec.hpp>
+#include <streaming/streaming.hpp>
 #include <string>
+#include <thread>
 
 using namespace std::string_literals;
 
@@ -535,61 +534,63 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Audio RTP without encryption", "[GSTPlu
 
 /*
  * A stuck pipeline must not hold the event bus.
- * The bus calls handlers under its lock; if the stop handler blocked on the stuck streaming thread,
+ * The bus calls handlers under its lock; if a stop/pause handler blocked on the stuck streaming thread,
  * every later register/unregister (e.g. starting a new runner) would hang the whole server.
  */
 TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a stuck pipeline doesn't block the event bus", "[GSTPlugin]") {
-  auto pipeline =
-      gst_parse_launch("videotestsrc ! identity name=stuck signal-handoffs=true ! fakesink async=false", nullptr);
-  REQUIRE(pipeline);
+  using namespace wolf::core;
+  using namespace std::chrono_literals;
 
-  // Park the streaming thread inside identity's handoff, holding the source's stream lock
-  struct Stuck {
-    std::promise<void> entered;
-    std::promise<void> release;
-    std::shared_future<void> released = release.get_future().share();
-    std::atomic_bool first = true;
-  } stuck;
-  auto identity = gst_bin_get_by_name(GST_BIN(pipeline), "stuck");
-  g_signal_connect(identity,
-                   "handoff",
-                   G_CALLBACK(+[](GstElement *, GstBuffer *, Stuck *stuck) {
-                     if (stuck->first.exchange(false)) {
-                       stuck->entered.set_value();
-                     }
-                     stuck->released.wait();
-                   }),
-                   &stuck);
-  gst_object_unref(identity);
-  gst_element_set_state(pipeline, GST_STATE_PLAYING);
-  REQUIRE(stuck.entered.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+  // The first buffer passes (so the pipeline is PLAYING), then each buffer parks the streaming thread for 3s
+  auto video_session = [](std::size_t id) {
+    return immer::box<events::VideoSession>(events::VideoSession{
+        .display_mode = {.width = 64, .height = 64, .refreshRate = 30},
+        .gst_pipeline = "videotestsrc is-live=true ! identity sleep-time=3000000 ! fakesink sync=false",
+        .session_id = id,
+        .timeout_ms = 1000,
+        .packet_size = 1024,
+        .fec_percentage = 20,
+        .min_required_fec_packets = 2,
+        .bitrate_kbps = 1000,
+        .slices_per_frame = 1,
+        .client_ip = "127.0.0.1"});
+  };
+  auto audio_session = [](std::size_t id) {
+    return immer::box<events::AudioSession>(events::AudioSession{
+        .gst_pipeline = "audiotestsrc is-live=true ! identity sleep-time=3000000 ! fakesink sync=false",
+        .session_id = id,
+        .client_ip = "127.0.0.1",
+        .packet_duration = 5,
+        .audio_mode = {.channels = 2, .streams = 1, .coupled_streams = 1, .bitrate = 64000}});
+  };
 
-  auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
-  auto stop_handler = event_bus->register_handler<immer::box<wolf::core::events::StopStreamEvent>>(
-      [pipeline](const immer::box<wolf::core::events::StopStreamEvent> &) {
-        wolf::core::gstreamer::send_eos_async(pipeline);
-      });
-
-  auto fired = std::async(std::launch::async, [event_bus]() {
-    event_bus->fire_event(
-        immer::box<wolf::core::events::StopStreamEvent>(wolf::core::events::StopStreamEvent{.session_id = 1}));
-    // Needs the bus write lock, like a runner (un)registering its handlers
-    auto other = event_bus->register_handler<immer::box<wolf::core::events::StopStreamEvent>>([]() {});
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto video_ctx = std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>();
+  auto paused_video = std::async(std::launch::async, [=]() {
+    streaming::start_streaming_video(video_session(1), event_bus, "127.0.0.1", 1, video_ctx, nullptr);
   });
-  auto fire_status = fired.wait_for(std::chrono::seconds(5));
+  auto stopped_video = std::async(std::launch::async, [=]() {
+    streaming::start_streaming_video(video_session(2), event_bus, "127.0.0.1", 1, video_ctx, nullptr);
+  });
+  auto stopped_audio = std::async(std::launch::async, [=]() {
+    streaming::start_streaming_audio(audio_session(3), event_bus, "127.0.0.1", 1, nullptr, "sink", "server");
+  });
+  // All three are now ~1s into a 3s stuck buffer
+  std::this_thread::sleep_for(4s);
 
-  // Unstick the pipeline before asserting, so a failure doesn't leave the test hanging
-  stuck.release.set_value();
-  REQUIRE(fire_status == std::future_status::ready);
+  auto fire_then_register = [event_bus](auto event) {
+    auto start = std::chrono::steady_clock::now();
+    event_bus->fire_event(immer::box<decltype(event)>(event));
+    // Needs the bus write lock, like a runner (un)registering its handlers
+    auto other = event_bus->register_handler<immer::box<events::IDRRequestEvent>>([]() {});
+    return std::chrono::steady_clock::now() - start;
+  };
+  CHECK(fire_then_register(events::PauseStreamEvent{.session_id = 1}) < 1s);
+  CHECK(fire_then_register(events::StopStreamEvent{.session_id = 2}) < 1s);
+  CHECK(fire_then_register(events::StopStreamEvent{.session_id = 3}) < 1s);
 
-  // The EOS still reaches the pipeline once the streaming thread moves on
-  auto bus = gst_element_get_bus(pipeline);
-  auto msg = gst_bus_timed_pop_filtered(bus, 5 * GST_SECOND, GST_MESSAGE_EOS);
-  REQUIRE(msg);
-  gst_message_unref(msg);
-  gst_object_unref(bus);
-
-  stop_handler.unregister();
-  gst_element_set_state(pipeline, GST_STATE_NULL);
-  gst_object_unref(pipeline);
+  // The EOS still reaches each pipeline once its streaming thread moves on, and run_pipeline returns
+  REQUIRE(paused_video.wait_for(10s) == std::future_status::ready);
+  REQUIRE(stopped_video.wait_for(10s) == std::future_status::ready);
+  REQUIRE(stopped_audio.wait_for(10s) == std::future_status::ready);
 }
