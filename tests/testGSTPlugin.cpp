@@ -575,7 +575,10 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a stuck pipeline doesn't block
   auto stopped_audio = std::async(std::launch::async, [=]() {
     streaming::start_streaming_audio(audio_session(3), event_bus, "127.0.0.1", 1, nullptr, "sink", "server");
   });
-  // All three are now ~1s into a 3s stuck buffer
+  auto paused_audio = std::async(std::launch::async, [=]() {
+    streaming::start_streaming_audio(audio_session(4), event_bus, "127.0.0.1", 1, nullptr, "sink", "server");
+  });
+  // All four are now ~1s into a 3s stuck buffer
   std::this_thread::sleep_for(4s);
 
   auto fire_then_register = [event_bus](auto event) {
@@ -588,9 +591,11 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a stuck pipeline doesn't block
   CHECK(fire_then_register(events::PauseStreamEvent{.session_id = 1}) < 1s);
   CHECK(fire_then_register(events::StopStreamEvent{.session_id = 2}) < 1s);
   CHECK(fire_then_register(events::StopStreamEvent{.session_id = 3}) < 1s);
+  CHECK(fire_then_register(events::PauseStreamEvent{.session_id = 4}) < 1s);
 
   // The EOS still reaches each pipeline once its streaming thread moves on, and run_pipeline returns
   REQUIRE(paused_video.wait_for(10s) == std::future_status::ready);
   REQUIRE(stopped_video.wait_for(10s) == std::future_status::ready);
   REQUIRE(stopped_audio.wait_for(10s) == std::future_status::ready);
+  REQUIRE(paused_audio.wait_for(10s) == std::future_status::ready);
 }
