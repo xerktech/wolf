@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <charconv>
 #include <control/control.hpp>
 #include <crypto/crypto.hpp>
 #include <curl/curl.h>
@@ -368,31 +370,78 @@ void appasset(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>
   }
 }
 
-auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
-                        const std::string &client_ip,
-                        const state::PairedClient &current_client,
-                        immer::box<state::AppState> state,
-                        const events::App &run_app) {
-  auto display_mode_str = utils::split(get_header(headers, "mode").value_or("1920x1080x60"), 'x');
-  moonlight::DisplayMode display_mode = {std::stoi(display_mode_str[0].data()),
-                                         std::stoi(display_mode_str[1].data()),
-                                         std::stoi(display_mode_str[2].data()),
-                                         state->config->support_hevc,
-                                         state->config->support_av1};
+/**
+ * Parses a Moonlight launch `mode` value (e.g. "1920x1080x60") into width, height and refresh rate.
+ * Returns std::nullopt unless it is exactly three positive integers separated by 'x'.
+ */
+std::optional<moonlight::DisplayMode> parse_display_mode(std::string_view mode) {
+  std::array<int, 3> values{};
+  const char *pos = mode.data();
+  const char *end = mode.data() + mode.size();
+  for (std::size_t i = 0; i < values.size(); i++) {
+    if (i > 0) {
+      if (pos == end || *pos != 'x') {
+        return std::nullopt;
+      }
+      pos++;
+    }
+    auto [next, ec] = std::from_chars(pos, end, values[i]);
+    if (ec != std::errc{} || values[i] <= 0) {
+      return std::nullopt;
+    }
+    pos = next;
+  }
+  if (pos != end) {
+    return std::nullopt;
+  }
+  return moonlight::DisplayMode{.width = values[0], .height = values[1], .refreshRate = values[2]};
+}
 
-  auto surround_info = std::stoi(get_header(headers, "surroundAudioInfo").value_or("196610"));
+/**
+ * Builds a new session from the client's launch/resume query.
+ * Returns nullptr when the query is malformed (bad `mode` or `surroundAudioInfo`, missing `rikey`/`rikeyid`).
+ */
+std::shared_ptr<events::StreamSession> create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
+                                                          const std::string &client_ip,
+                                                          const state::PairedClient &current_client,
+                                                          immer::box<state::AppState> state,
+                                                          const events::App &run_app) {
+  auto mode = get_header(headers, "mode").value_or("1920x1080x60");
+  auto display_mode = parse_display_mode(mode);
+  if (!display_mode) {
+    logs::log(logs::warning, "[HTTP] Invalid display mode: {}", mode);
+    return nullptr;
+  }
+  display_mode->hevc_supported = state->config->support_hevc;
+  display_mode->av1_supported = state->config->support_av1;
+
+  auto surround_str = get_header(headers, "surroundAudioInfo").value_or("196610");
+  int surround_info = 0;
+  auto [surround_end, surround_ec] =
+      std::from_chars(surround_str.data(), surround_str.data() + surround_str.size(), surround_info);
+  if (surround_ec != std::errc{} || surround_end != surround_str.data() + surround_str.size()) {
+    logs::log(logs::warning, "[HTTP] Invalid surroundAudioInfo: {}", surround_str);
+    return nullptr;
+  }
   int channelCount = surround_info & (0xffff /* last 16 bits */);
+
+  auto rikey = get_header(headers, "rikey");
+  auto rikeyid = get_header(headers, "rikeyid");
+  if (!rikey || !rikeyid) {
+    logs::log(logs::warning, "[HTTP] Missing rikey or rikeyid");
+    return nullptr;
+  }
 
   auto base_session = create_stream_session(state,
                                             run_app,
                                             current_client,
-                                            display_mode,
+                                            display_mode.value(),
                                             channelCount,
-                                            get_header(headers, "rikey").value(),
-                                            get_header(headers, "rikeyid").value());
+                                            rikey.value(),
+                                            rikeyid.value());
 
   base_session->ip = client_ip;
-  return std::move(base_session);
+  return base_session;
 }
 
 std::string get_rtsp_ip_string(const std::string &local_ip, const events::StreamSession &session) {
@@ -430,6 +479,10 @@ void launch(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
 
   auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
   auto new_session = create_run_session(request->parse_query_string(), client_ip, current_client, state, app.value());
+  if (!new_session) {
+    server_error<SimpleWeb::HTTPS>(response);
+    return;
+  }
   state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
   state->running_sessions->update(
       [new_session](const immer::vector<events::StreamSession> &ses_v) { return ses_v.push_back(*new_session); });
@@ -450,6 +503,10 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
   if (old_session) {
     auto new_session =
         create_run_session(request->parse_query_string(), client_ip, current_client, state, *old_session->app);
+    if (!new_session) {
+      server_error<SimpleWeb::HTTPS>(response);
+      return;
+    }
     // Carry over the old session display handle
     new_session->wayland_display = std::move(old_session->wayland_display);
     // Carry over the old session devices, they'll be already plugged into the container
