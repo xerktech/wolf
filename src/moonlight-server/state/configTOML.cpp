@@ -2,9 +2,11 @@
 #include <cctype>
 #include <events/events.hpp>
 #include <events/reflectors.hpp>
+#include <filesystem>
 #include <fstream>
 #include <gst/gstelementfactory.h>
 #include <gst/gstregistry.h>
+#include <mutex>
 #include <platforms/hw.hpp>
 #include <range/v3/view.hpp>
 #include <rfl/json.hpp>
@@ -418,7 +420,69 @@ Config load_or_default(const std::string &source,
                 .parse_app = parse_app_fn};
 }
 
+/**
+ * Serialises every read-modify-write of the config file.
+ * The API serves requests from a thread pool: two unsynchronised saves interleave, and a load can read a
+ * half-written file (XERK-1962).
+ */
+static std::mutex config_file_mutex;
+
+/**
+ * Writes the new contents to a temp file next to the config and renames it over the original, so a reader never
+ * sees a partial file and a failed write leaves the old one intact.
+ * The rename is done on the resolved path so that a symlinked config keeps its link; when it fails
+ * (e.g. the config is a single bind-mounted file) the file is rewritten in place instead.
+ */
+static void write_config_file(const std::string &source, const std::string &content) {
+  std::error_code ec;
+  auto target = std::filesystem::canonical(source, ec);
+  if (ec) {
+    target = source;
+  }
+  auto tmp = target;
+  tmp += ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    out << content;
+    out.close();
+    if (!out) {
+      std::filesystem::remove(tmp, ec);
+      throw std::runtime_error(fmt::format("Unable to write {}", tmp.string()));
+    }
+  }
+  std::filesystem::rename(tmp, target, ec);
+  if (ec) {
+    logs::log(logs::warning,
+              "Unable to replace {} atomically ({}), rewriting it in place",
+              target.string(),
+              ec.message());
+    std::filesystem::remove(tmp, ec);
+    std::ofstream out(target, std::ios::trunc);
+    out << content;
+    out.close();
+    if (!out) {
+      throw std::runtime_error(fmt::format("Unable to write {}", target.string()));
+    }
+  }
+}
+
+/**
+ * Loads the config file, applies update_fn to it and saves it back; the caller must hold config_file_mutex.
+ * A failure is logged, never thrown: the in-memory state has already been updated and must not be torn down
+ * because the file couldn't be persisted.
+ */
+template <typename F> static void update_config_file(const Config &cfg, F &&update_fn) {
+  try {
+    auto tml = rfl::toml::load<WolfConfig, rfl::DefaultIfMissing>(cfg.config_source).value();
+    update_fn(tml);
+    write_config_file(cfg.config_source, rfl::toml::write(tml));
+  } catch (const std::exception &e) {
+    logs::log(logs::error, "Unable to save {}: {}", cfg.config_source, e.what());
+  }
+}
+
 void pair(const Config &cfg, const PairedClient &client) {
+  std::lock_guard lock(config_file_mutex);
   // Update CFG
   cfg.paired_clients->update([&client](const PairedClientList &paired_clients) {
     // Removing the client if already present (see: https://github.com/games-on-whales/wolf/issues/211)
@@ -431,12 +495,11 @@ void pair(const Config &cfg, const PairedClient &client) {
   });
 
   // Update TOML
-  auto tml = rfl::toml::load<WolfConfig, rfl::DefaultIfMissing>(cfg.config_source).value();
-  tml.paired_clients.push_back(client);
-  rfl::toml::save(cfg.config_source, tml);
+  update_config_file(cfg, [&client](WolfConfig &tml) { tml.paired_clients.push_back(client); });
 }
 
 void unpair(const Config &cfg, const PairedClient &client) {
+  std::lock_guard lock(config_file_mutex);
   // Update CFG
   cfg.paired_clients->update([&client](const PairedClientList &paired_clients) {
     return paired_clients                                               //
@@ -447,12 +510,12 @@ void unpair(const Config &cfg, const PairedClient &client) {
   });
 
   // Update TOML
-  auto tml = rfl::toml::load<WolfConfig, rfl::DefaultIfMissing>(cfg.config_source).value();
-  tml.paired_clients.erase(std::remove_if(tml.paired_clients.begin(),
-                                          tml.paired_clients.end(),
-                                          [&client](const auto &v) { return v.client_cert == client.client_cert; }),
-                           tml.paired_clients.end());
-  rfl::toml::save(cfg.config_source, tml);
+  update_config_file(cfg, [&client](WolfConfig &tml) {
+    tml.paired_clients.erase(std::remove_if(tml.paired_clients.begin(),
+                                            tml.paired_clients.end(),
+                                            [&client](const auto &v) { return v.client_cert == client.client_cert; }),
+                             tml.paired_clients.end());
+  });
 }
 
 void update_client_settings(const Config &cfg, std::size_t client_id, const PairedClient &updated_client) {
@@ -464,6 +527,7 @@ void update_client_settings(const Config &cfg, std::size_t client_id, const Pair
     return client;
   };
 
+  std::lock_guard lock(config_file_mutex);
   cfg.paired_clients->update([&](const PairedClientList &paired_clients) {
     return paired_clients |                             //
            ranges::views::transform(update_client_fn) | //
@@ -471,14 +535,11 @@ void update_client_settings(const Config &cfg, std::size_t client_id, const Pair
   });
 
   // Update the TOML file
-  auto tml = rfl::toml::load<WolfConfig, rfl::DefaultIfMissing>(cfg.config_source).value();
-
-  tml.paired_clients = tml.paired_clients |                         //
-                       ranges::views::transform(update_client_fn) | //
-                       ranges::to<std::vector<PairedClient>>();
-
-  // Save back to file
-  rfl::toml::save(cfg.config_source, tml);
+  update_config_file(cfg, [&](WolfConfig &tml) {
+    tml.paired_clients = tml.paired_clients |                         //
+                         ranges::views::transform(update_client_fn) | //
+                         ranges::to<std::vector<PairedClient>>();
+  });
 }
 
 // Ignores the runners, see parse_app()
@@ -549,30 +610,33 @@ static BaseApp to_base_app(const Config &cfg, const events::App &app, const std:
   return base_app;
 }
 
-void update_profiles(const Config &cfg, const ProfilesList &profiles) {
+void update_profiles(const Config &cfg, const std::function<ProfilesList(const ProfilesList &)> &update_fn) {
+  // Held across load and store too, so that concurrent updates apply in turn instead of overwriting each other
+  std::lock_guard lock(config_file_mutex);
+  auto profiles = update_fn(cfg.profiles->load());
   cfg.profiles->store(profiles);
 
-  auto tml = rfl::toml::load<WolfConfig, rfl::DefaultIfMissing>(cfg.config_source).value();
-  tml.profiles = profiles | //
-                 ranges::views::transform([&](const immer::box<events::Profile> &p) {
-                   auto existing = std::find_if(tml.profiles.begin(), tml.profiles.end(), [&](const Profile &tp) {
-                     return tp.id == p->id;
-                   });
-                   auto existing_apps = existing != tml.profiles.end() ? existing->apps : std::vector<BaseApp>{};
-                   return Profile{
-                       .id = p->id,
-                       .name = p->name,
-                       .icon_png_path = p->icon_png_path,
-                       .pin = p->pin,
-                       .apps = p->apps->load().get() | //
-                               ranges::views::transform([&](const immer::box<events::App> &app) {
-                                 return to_base_app(cfg, app, existing_apps);
-                               }) | //
-                               ranges::to_vector,
-                   };
-                 }) | //
-                 ranges::to_vector;
-  rfl::toml::save(cfg.config_source, tml);
+  update_config_file(cfg, [&](WolfConfig &tml) {
+    tml.profiles = profiles | //
+                   ranges::views::transform([&](const immer::box<events::Profile> &p) {
+                     auto existing = std::find_if(tml.profiles.begin(), tml.profiles.end(), [&](const Profile &tp) {
+                       return tp.id == p->id;
+                     });
+                     auto existing_apps = existing != tml.profiles.end() ? existing->apps : std::vector<BaseApp>{};
+                     return Profile{
+                         .id = p->id,
+                         .name = p->name,
+                         .icon_png_path = p->icon_png_path,
+                         .pin = p->pin,
+                         .apps = p->apps->load().get() | //
+                                 ranges::views::transform([&](const immer::box<events::App> &app) {
+                                   return to_base_app(cfg, app, existing_apps);
+                                 }) | //
+                                 ranges::to_vector,
+                     };
+                   }) | //
+                   ranges::to_vector;
+  });
 }
 
 } // namespace state
