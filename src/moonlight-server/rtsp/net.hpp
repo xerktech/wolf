@@ -136,14 +136,18 @@ public:
    * receive_message() until our payload size matches the specified Content-length
    */
   void receive_message(const std::function<void(std::optional<RTSP_PACKET>)> &on_msg_read) {
-    deadline_.async_wait([self = shared_from_this()](auto error) {
-      if (!error && self->deadline_.expiry() <= asio::steady_timer::clock_type::now()) { // The deadline has passed
-        logs::log(logs::trace, "[RTSP] deadline over");
-        self->socket_.cancel();
-        self->deadline_.cancel();
-      }
-    });
-    deadline_.expires_after(std::chrono::milliseconds(timeout_millis));
+    // One deadline for the whole message, armed on its first read only: re-arming it on every read would let a
+    // client trickling a byte at a time hold the connection open indefinitely.
+    // Set the expiry BEFORE waiting: expires_after() cancels any pending wait.
+    if (prev_read_bytes_ == 0) {
+      deadline_.expires_after(std::chrono::milliseconds(timeout_millis));
+      deadline_.async_wait([self = shared_from_this()](auto error) {
+        if (!error && self->deadline_.expiry() <= asio::steady_timer::clock_type::now()) { // The deadline has passed
+          logs::log(logs::trace, "[RTSP] deadline over");
+          self->socket_.cancel();
+        }
+      });
+    }
 
     boost::asio::async_read(
         socket(),
@@ -153,10 +157,21 @@ public:
           if (error_code &&
               error_code != boost::asio::error::operation_aborted) { // it'll be aborted when the deadline expires
             logs::log(logs::error, "[RTSP] error during transmission: {}", error_code.message());
-            self->send_message(rtsp::commands::error_msg(400, "BAD REQUEST"), [](auto bytes) {});
+            self->deadline_.cancel();
+            self->send_message(rtsp::commands::error_msg(400, "BAD REQUEST"), [self](auto bytes) { self->close(); });
             return;
           }
-          self->deadline_.cancel(); // stop the deadline
+          // Hands the (possibly invalid) message over, once it's complete or we've given up on it
+          auto finish = [&self, &on_msg_read](std::optional<RTSP_PACKET> msg) {
+            self->deadline_.cancel();
+            self->prev_read_ = "";
+            self->prev_read_bytes_ = 0;
+            on_msg_read(msg);
+          };
+          // Check the expiry here too, not just the timer's cancel(): if this read had already completed when the
+          // timer fired, the cancel() hit nothing and the message would never time out.
+          bool timed_out = error_code == boost::asio::error::operation_aborted ||
+                           self->deadline_.expiry() <= asio::steady_timer::clock_type::now();
           std::string raw_msg = {std::istreambuf_iterator<char>(&self->streambuf_), {}};
           logs::log(logs::trace, "[RTSP] received message {} bytes \n{}", bytes_transferred, raw_msg);
 
@@ -171,19 +186,37 @@ public:
           if (content_length_pos != std::string::npos) {
             content_length_pos += 16; //"Content-length: "sv.size();
             auto content_lenght_end = full_raw_msg.find("\r\n", content_length_pos);
+            if (content_lenght_end == std::string::npos) {
+              if (timed_out || total_bytes_transferred >= max_total_msg_size) {
+                logs::log(logs::warning, "[RTSP] gave up waiting for the end of the Content-length header");
+                return finish(std::nullopt);
+              }
+              // The header line itself was split across reads, wait for the rest of it
+              self->prev_read_ = full_raw_msg;
+              self->prev_read_bytes_ += bytes_transferred;
+              return self->receive_message(on_msg_read);
+            }
             auto total_length_str = full_raw_msg.substr(content_length_pos, content_lenght_end - content_length_pos);
-            auto total_length = std::stoi(total_length_str) + content_lenght_end + 2; // 2 for the \r\n
+            // The header comes from an unauthenticated peer: reject anything that isn't a plain number, or that
+            // would make us buffer more than max_total_msg_size, instead of throwing or waiting on it forever.
+            auto content_length = utils::to_size_t(total_length_str);
+            if (!content_length || *content_length > max_total_msg_size) {
+              logs::log(logs::warning, "[RTSP] invalid Content-length: {}", total_length_str);
+              return finish(std::nullopt);
+            }
+            auto total_length = *content_length + content_lenght_end + 2; // 2 for the \r\n
             if (total_bytes_transferred < total_length) {
+              if (timed_out) { // the payload didn't arrive in time
+                logs::log(logs::warning, "[RTSP] timed out waiting for the message payload");
+                return finish(std::nullopt);
+              }
               self->prev_read_ = full_raw_msg;
               self->prev_read_bytes_ += bytes_transferred;
               return self->receive_message(on_msg_read);
             }
           }
 
-          auto msg = rtsp::parse(full_raw_msg);
-          self->prev_read_ = "";
-          self->prev_read_bytes_ = 0;
-          on_msg_read(msg);
+          finish(rtsp::parse(full_raw_msg));
         });
   }
 
@@ -213,6 +246,8 @@ protected:
   tcp::socket socket_;
 
   static constexpr auto max_msg_size = 2048;
+  /** Upper bound on a message's declared Content-length; Moonlight's largest (ANNOUNCE) is a few KiB */
+  static constexpr std::size_t max_total_msg_size = 64 * 1024;
   static constexpr auto timeout_millis = 2500;
 
   boost::asio::streambuf streambuf_;
