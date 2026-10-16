@@ -386,7 +386,9 @@ auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
                         const events::App &run_app) {
   // All of these come straight from the client's query string: validate them instead of letting a malformed value
   // throw (or, for a short "mode", index past the end of the split).
-  auto display_mode_str = utils::split(get_header(headers, "mode").value_or("1920x1080x60"), 'x');
+  // split() returns views into its input, so keep the string alive while they're in use
+  auto display_mode_param = get_header(headers, "mode").value_or("1920x1080x60");
+  auto display_mode_str = utils::split(display_mode_param, 'x');
   std::optional<std::size_t> width, height, fps;
   if (display_mode_str.size() == 3) {
     width = utils::to_size_t(display_mode_str[0]);

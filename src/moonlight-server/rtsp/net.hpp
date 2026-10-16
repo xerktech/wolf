@@ -168,6 +168,10 @@ public:
             self->prev_read_bytes_ = 0;
             on_msg_read(msg);
           };
+          // Check the expiry here too, not just the timer's cancel(): if this read had already completed when the
+          // timer fired, the cancel() hit nothing and the message would never time out.
+          bool timed_out = error_code == boost::asio::error::operation_aborted ||
+                           self->deadline_.expiry() <= asio::steady_timer::clock_type::now();
           std::string raw_msg = {std::istreambuf_iterator<char>(&self->streambuf_), {}};
           logs::log(logs::trace, "[RTSP] received message {} bytes \n{}", bytes_transferred, raw_msg);
 
@@ -182,8 +186,11 @@ public:
           if (content_length_pos != std::string::npos) {
             content_length_pos += 16; //"Content-length: "sv.size();
             auto content_lenght_end = full_raw_msg.find("\r\n", content_length_pos);
-            if (content_lenght_end == std::string::npos && error_code != boost::asio::error::operation_aborted &&
-                total_bytes_transferred < max_total_msg_size) {
+            if (content_lenght_end == std::string::npos) {
+              if (timed_out || total_bytes_transferred >= max_total_msg_size) {
+                logs::log(logs::warning, "[RTSP] gave up waiting for the end of the Content-length header");
+                return finish(std::nullopt);
+              }
               // The header line itself was split across reads, wait for the rest of it
               self->prev_read_ = full_raw_msg;
               self->prev_read_bytes_ += bytes_transferred;
@@ -199,7 +206,7 @@ public:
             }
             auto total_length = *content_length + content_lenght_end + 2; // 2 for the \r\n
             if (total_bytes_transferred < total_length) {
-              if (error_code == boost::asio::error::operation_aborted) { // timed out before the payload arrived
+              if (timed_out) { // the payload didn't arrive in time
                 logs::log(logs::warning, "[RTSP] timed out waiting for the message payload");
                 return finish(std::nullopt);
               }

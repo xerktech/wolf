@@ -3,6 +3,7 @@
 
 using Catch::Matchers::Equals;
 
+#include <atomic>
 #include <boost/beast/_experimental/test/stream.hpp>
 #include <crypto/crypto.hpp>
 #include <rtsp/net.hpp>
@@ -703,11 +704,26 @@ TEST_CASE("RTSP waits for a message split across reads, within one deadline", "[
     return reply;
   };
 
-  // The Content-length header line itself is split: wait for the rest of it and the payload
-  auto reply = exchange_in_parts(
-      {"OPTIONS rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 1\r\nContent-length: 1", "0\r\n\r\n0123456789"},
-      std::chrono::milliseconds(200));
-  REQUIRE_THAT(reply, Catch::Matchers::StartsWith("RTSP/1.0 200"));
+  {
+    // The Content-length header line itself is split: nothing must be answered until the rest of it arrives
+    asio::io_context ioc;
+    tcp::socket socket(ioc);
+    tcp::resolver resolver(ioc);
+    asio::connect(socket, resolver.resolve("127.0.0.1", std::to_string(port)));
+    asio::write(socket, asio::buffer("OPTIONS rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 1\r\nContent-length: 1"s));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    REQUIRE(socket.available() == 0);
+    asio::write(socket, asio::buffer("0\r\n\r\n0123456789"s));
+    std::string reply;
+    asio::async_read(socket, asio::dynamic_buffer(reply), [](auto, auto) {});
+    ioc.run_for(std::chrono::seconds(10));
+    REQUIRE_THAT(reply, Catch::Matchers::StartsWith("RTSP/1.0 200"));
+  }
+
+  // ...but not forever: a header line that never ends is rejected once the deadline passes
+  auto reply = exchange_in_parts({"OPTIONS rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 1\r\nContent-length: 1"},
+                                 std::chrono::milliseconds(0));
+  REQUIRE_THAT(reply, Catch::Matchers::StartsWith("RTSP/1.0 400"));
 
   // Trickling the payload doesn't extend the deadline: the whole message must arrive within it
   auto start = std::chrono::steady_clock::now();
@@ -720,4 +736,41 @@ TEST_CASE("RTSP waits for a message split across reads, within one deadline", "[
   // The 400 may be lost to a reset since we keep writing after the server gave up; it must never complete though
   REQUIRE_FALSE(reply.starts_with("RTSP/1.0 200"));
   REQUIRE(std::chrono::steady_clock::now() - start < std::chrono::seconds(8));
+}
+
+TEST_CASE("RTSP deadline holds for many concurrent trickling clients", "[RTSP]") {
+  auto sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto port = 48557;
+  std::thread([sessions, port]() { rtsp::run_server(port, sessions); }).detach();
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  // Keep the RTSP thread busy with many clients trickling payload bytes so that deadlines fire while reads are
+  // completing; each one must still be cut off rather than held open as long as it keeps sending.
+  constexpr int n_clients = 20;
+  std::atomic<int> closed_in_time = 0;
+  std::vector<std::thread> clients;
+  for (int i = 0; i < n_clients; i++) {
+    clients.emplace_back([port, &closed_in_time]() {
+      asio::io_context ioc;
+      tcp::socket socket(ioc);
+      tcp::resolver resolver(ioc);
+      asio::connect(socket, resolver.resolve("127.0.0.1", std::to_string(port)));
+      auto start = std::chrono::steady_clock::now();
+      boost::system::error_code ec;
+      asio::write(socket,
+                  asio::buffer("OPTIONS rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 1\r\nContent-length: 60000\r\n\r\n"s),
+                  ec);
+      while (!ec && std::chrono::steady_clock::now() - start < std::chrono::seconds(8)) {
+        asio::write(socket, asio::buffer("x", 1), ec); // fails once the server has closed the connection
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      if (std::chrono::steady_clock::now() - start < std::chrono::seconds(8)) {
+        closed_in_time++;
+      }
+    });
+  }
+  for (auto &client : clients) {
+    client.join();
+  }
+  REQUIRE(closed_in_time == n_clients);
 }
