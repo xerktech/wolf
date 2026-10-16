@@ -509,8 +509,9 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
       server_error<SimpleWeb::HTTPS>(response);
       return;
     }
-    // Carry over the old session display handle
+    // Carry over the old session display handle, and the producers streaming it
     new_session->wayland_display = std::move(old_session->wayland_display);
+    new_session->producer_name = old_session->producer_name;
     // Carry over the old session devices, they'll be already plugged into the container
     new_session->mouse = std::move(old_session->mouse);
     new_session->keyboard = std::move(old_session->keyboard);

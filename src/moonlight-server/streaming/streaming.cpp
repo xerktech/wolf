@@ -93,6 +93,7 @@ std::pair<std::string, std::string> get_color_params(immer::box<events::VideoSes
 }
 
 void start_video_producer(const std::string &session_id,
+                          const std::string &producer_name,
                           const std::string &buffer_format,
                           const std::string &render_node,
                           const wolf::core::virtual_display::DisplayMode &display_mode,
@@ -100,11 +101,11 @@ void start_video_producer(const std::string &session_id,
                           std::shared_ptr<boost::promise<WaylandDisplayReady>> on_ready,
                           std::shared_ptr<events::EventBusType> event_bus) {
   auto pipeline = fmt::format("waylanddisplaysrc name=wolf_wayland_source render_node={render_node} ! "
-                              "{buffer_format}, width={width}, height={height}, framerate={fps}/1 ! \n"    //
-                              "interpipesink sync=true async=false name={session_id}_video max-buffers=1", //
+                              "{buffer_format}, width={width}, height={height}, framerate={fps}/1 ! \n"       //
+                              "interpipesink sync=true async=false name={producer_name}_video max-buffers=1", //
                               fmt::arg("buffer_format", buffer_format),
                               fmt::arg("render_node", render_node),
-                              fmt::arg("session_id", session_id),
+                              fmt::arg("producer_name", producer_name),
                               fmt::arg("width", display_mode.width),
                               fmt::arg("height", display_mode.height),
                               fmt::arg("fps", display_mode.refreshRate));
@@ -146,6 +147,7 @@ void start_video_producer(const std::string &session_id,
 }
 
 void start_audio_producer(const std::string &session_id,
+                          const std::string &producer_name,
                           const std::shared_ptr<events::EventBusType> &event_bus,
                           int channel_count,
                           const std::string &sink_name,
@@ -168,8 +170,8 @@ void start_audio_producer(const std::string &session_id,
   auto pipeline = fmt::format("pulsesrc device=\"{sink_name}\" server=\"{server_name}\" ! "                           //
                               "audio/x-raw, channels={channels}, channel-mask=(bitmask){channel_mask}, rate=48000 ! " //
                               "queue leaky=downstream max-size-buffers=3 ! "                                          //
-                              "interpipesink name=\"{session_id}_audio\" sync=true async=false max-buffers=3",
-                              fmt::arg("session_id", session_id),
+                              "interpipesink name=\"{producer_name}_audio\" sync=true async=false max-buffers=3",
+                              fmt::arg("producer_name", producer_name),
                               fmt::arg("channels", channel_count),
                               fmt::arg("channel_mask", channel_mask),
                               fmt::arg("sink_name", sink_name),
@@ -195,6 +197,28 @@ void start_audio_producer(const std::string &session_id,
 
     return immer::array<immer::box<events::EventBusHandlers>>{std::move(stop_handler), std::move(stop_lobby_handler)};
   });
+}
+
+void listen_to_producer(GstElement *pipeline,
+                        std::size_t session_id,
+                        const std::string &producer_name,
+                        const std::string &kind) {
+  if (producer_name.empty()) {
+    return;
+  }
+  auto pipe_name = fmt::format("interpipesrc_{}_{}", session_id, kind);
+  auto src = gst_bin_get_by_name(GST_BIN(pipeline), pipe_name.c_str());
+  if (!src) {
+    return;
+  }
+  gchar *listen_to = nullptr;
+  g_object_get(src, "listen-to", &listen_to, nullptr);
+  if (listen_to && fmt::format("{}_{}", session_id, kind) == listen_to) {
+    auto own = fmt::format("{}_{}", producer_name, kind);
+    g_object_set(src, "listen-to", own.c_str(), nullptr);
+  }
+  g_free(listen_to);
+  gst_object_unref(src);
 }
 
 namespace custom_sink {
@@ -375,6 +399,7 @@ static void configure_appsink(GstElement *appsink, UDPSink *udp_sink) {
  * Start VIDEO pipeline
  */
 void start_streaming_video(immer::box<events::VideoSession> video_session,
+                           const std::string &producer_name,
                            const std::shared_ptr<events::EventBusType> &event_bus,
                            std::string client_ip,
                            unsigned short client_port,
@@ -413,7 +438,8 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
       }});
   std::shared_ptr<NeedContextData> ctx_data_ptr = std::make_shared<NeedContextData>(
       NeedContextData{.device_path = video_session->render_node, .gst_context = video_context});
-  run_pipeline(pipeline, [video_session, event_bus, udp_sink, ctx_data_ptr](auto pipeline) {
+  run_pipeline(pipeline, [video_session, producer_name, event_bus, udp_sink, ctx_data_ptr](auto pipeline) {
+    listen_to_producer(pipeline.get(), video_session->session_id, producer_name, "video");
     if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
       logs::log(logs::debug, "Setting up wolf_udp_sink");
       g_assert(GST_IS_APP_SINK(app_sink_el));
@@ -513,6 +539,7 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
  * Start AUDIO pipeline
  */
 void start_streaming_audio(immer::box<events::AudioSession> audio_session,
+                           const std::string &producer_name,
                            const std::shared_ptr<events::EventBusType> &event_bus,
                            std::string client_ip,
                            unsigned short client_port,
@@ -543,7 +570,9 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
       .socket = audio_socket,
       .client_endpoint = std::make_shared<udp::endpoint>(boost::asio::ip::make_address(client_ip), client_port)});
 
-  run_pipeline(pipeline, [audio_session, session_id = audio_session->session_id, udp_sink, event_bus](auto pipeline) {
+  auto session_id = audio_session->session_id;
+  run_pipeline(pipeline, [audio_session, session_id, producer_name, udp_sink, event_bus](auto pipeline) {
+    listen_to_producer(pipeline.get(), session_id, producer_name, "audio");
     if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
       logs::log(logs::debug, "Setting up wolf_udp_sink");
       g_assert(GST_IS_APP_SINK(app_sink_el));
