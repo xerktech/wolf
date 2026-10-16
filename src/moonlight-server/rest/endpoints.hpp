@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <charconv>
 #include <control/control.hpp>
 #include <crypto/crypto.hpp>
@@ -11,6 +10,7 @@
 #include <functional>
 #include <helpers/utils.hpp>
 #include <immer/vector_transient.hpp>
+#include <limits>
 #include <moonlight/control.hpp>
 #include <moonlight/protocol.hpp>
 #include <platforms/hw.hpp>
@@ -371,77 +371,53 @@ void appasset(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>
 }
 
 /**
- * Parses a Moonlight launch `mode` value (e.g. "1920x1080x60") into width, height and refresh rate.
- * Returns std::nullopt unless it is exactly three positive integers separated by 'x'.
+ * Moonlight sends rikeyid as a signed 32-bit decimal (printf "%d"), so it can be negative; other clients may send it
+ * unsigned. Only the low 32 bits are used (see derive_iv()), so accept any 64-bit decimal.
  */
-std::optional<moonlight::DisplayMode> parse_display_mode(std::string_view mode) {
-  std::array<int, 3> values{};
-  const char *pos = mode.data();
-  const char *end = mode.data() + mode.size();
-  for (std::size_t i = 0; i < values.size(); i++) {
-    if (i > 0) {
-      if (pos == end || *pos != 'x') {
-        return std::nullopt;
-      }
-      pos++;
-    }
-    auto [next, ec] = std::from_chars(pos, end, values[i]);
-    if (ec != std::errc{} || values[i] <= 0) {
-      return std::nullopt;
-    }
-    pos = next;
-  }
-  if (pos != end) {
-    return std::nullopt;
-  }
-  return moonlight::DisplayMode{.width = values[0], .height = values[1], .refreshRate = values[2]};
+inline bool is_rikeyid(std::string_view str) {
+  std::int64_t value = 0;
+  auto [end, ec] = std::from_chars(str.data(), str.data() + str.size(), value);
+  return ec == std::errc{} && end == str.data() + str.size();
 }
 
-/**
- * Builds a new session from the client's launch/resume query.
- * Returns nullptr when the query is malformed (bad `mode` or `surroundAudioInfo`, missing `rikey`/`rikeyid`).
- */
-std::shared_ptr<events::StreamSession> create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
-                                                          const std::string &client_ip,
-                                                          const state::PairedClient &current_client,
-                                                          immer::box<state::AppState> state,
-                                                          const events::App &run_app) {
-  auto mode = get_header(headers, "mode").value_or("1920x1080x60");
-  auto display_mode = parse_display_mode(mode);
-  if (!display_mode) {
-    logs::log(logs::warning, "[HTTP] Invalid display mode: {}", mode);
-    return nullptr;
+auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
+                        const std::string &client_ip,
+                        const state::PairedClient &current_client,
+                        immer::box<state::AppState> state,
+                        const events::App &run_app) {
+  // All of these come straight from the client's query string: validate them instead of letting a malformed value
+  // throw (or, for a short "mode", index past the end of the split).
+  // split() returns views into its input, so keep the string alive while they're in use
+  auto display_mode_param = get_header(headers, "mode").value_or("1920x1080x60");
+  auto display_mode_str = utils::split(display_mode_param, 'x');
+  std::optional<std::size_t> width, height, fps;
+  if (display_mode_str.size() == 3) {
+    width = utils::to_size_t(display_mode_str[0]);
+    height = utils::to_size_t(display_mode_str[1]);
+    fps = utils::to_size_t(display_mode_str[2]);
   }
-  display_mode->hevc_supported = state->config->support_hevc;
-  display_mode->av1_supported = state->config->support_av1;
-
-  auto surround_str = get_header(headers, "surroundAudioInfo").value_or("196610");
-  int surround_info = 0;
-  auto [surround_end, surround_ec] =
-      std::from_chars(surround_str.data(), surround_str.data() + surround_str.size(), surround_info);
-  if (surround_ec != std::errc{} || surround_end != surround_str.data() + surround_str.size()) {
-    logs::log(logs::warning, "[HTTP] Invalid surroundAudioInfo: {}", surround_str);
-    return nullptr;
-  }
-  int channelCount = surround_info & (0xffff /* last 16 bits */);
-
+  constexpr std::size_t max_int = std::numeric_limits<int>::max();
+  auto surround_info = utils::to_size_t(get_header(headers, "surroundAudioInfo").value_or("196610"));
   auto rikey = get_header(headers, "rikey");
   auto rikeyid = get_header(headers, "rikeyid");
-  if (!rikey || !rikeyid) {
-    logs::log(logs::warning, "[HTTP] Missing rikey or rikeyid");
-    return nullptr;
+  if (!width || !height || !fps || *width > max_int || *height > max_int || *fps > max_int || !surround_info ||
+      !rikey || !rikeyid || !is_rikeyid(*rikeyid)) {
+    logs::log(logs::warning, "[HTTPS] Invalid launch parameters from {}", client_ip);
+    return std::shared_ptr<events::StreamSession>{};
   }
+  moonlight::DisplayMode display_mode = {static_cast<int>(*width),
+                                         static_cast<int>(*height),
+                                         static_cast<int>(*fps),
+                                         state->config->support_hevc,
+                                         state->config->support_av1};
 
-  auto base_session = create_stream_session(state,
-                                            run_app,
-                                            current_client,
-                                            display_mode.value(),
-                                            channelCount,
-                                            rikey.value(),
-                                            rikeyid.value());
+  int channelCount = static_cast<int>(*surround_info & (0xffff /* last 16 bits */));
+
+  auto base_session =
+      create_stream_session(state, run_app, current_client, display_mode, channelCount, rikey.value(), rikeyid.value());
 
   base_session->ip = client_ip;
-  return base_session;
+  return std::move(base_session);
 }
 
 std::string get_rtsp_ip_string(const std::string &local_ip, const events::StreamSession &session) {

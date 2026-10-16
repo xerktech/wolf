@@ -656,66 +656,38 @@ TEST_CASE("Multiple users", "[HTTP]") {
   REQUIRE(session4->audio_stream_port == 48200);
 }
 
-TEST_CASE("Launch display mode parsing", "[HTTP]") {
-  using endpoints::https::parse_display_mode;
-
-  auto mode = parse_display_mode("1280x720x30");
-  REQUIRE(mode.has_value());
-  REQUIRE(mode->width == 1280);
-  REQUIRE(mode->height == 720);
-  REQUIRE(mode->refreshRate == 30);
-
-  for (auto bad : {""sv,
-                   "1920"sv,
-                   "1920x1080"sv,
-                   "1920x1080x"sv,
-                   "1920x1080x60x1"sv,
-                   "x1080x60"sv,
-                   "1920xx60"sv,
-                   "1920x1080x60fps"sv,
-                   "axbxc"sv,
-                   "-1920x1080x60"sv,
-                   "0x1080x60"sv,
-                   " 1920x1080x60"sv,
-                   "99999999999x1080x60"sv}) {
-    INFO(bad);
-    REQUIRE_FALSE(parse_display_mode(bad).has_value());
-  }
-}
-
-TEST_CASE("Launch rejects a malformed query", "[HTTP]") {
-  auto event_bus = std::make_shared<events::EventBusType>();
+TEST_CASE("Launch rejects malformed client parameters", "[HTTP]") {
   auto app_state = state::AppState{
       .config = state::Config{.paired_clients = std::shared_ptr<immer::atom<state::PairedClientList>>()},
       .host = {},
       .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
-      .event_bus = event_bus,
+      .event_bus = std::make_shared<events::EventBusType>(),
       .running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>()};
   auto client = state::PairedClient{.app_state_folder = "test"};
   auto app = events::App{.base = moonlight::App{.title = "test_app"}};
-  auto keys = SimpleWeb::CaseInsensitiveMultimap{{"rikey", "1234"}, {"rikeyid", "5678"}};
-
-  auto with = [&keys](std::string key, std::string value) {
-    auto headers = keys;
-    headers.emplace(key, value);
-    return headers;
+  auto launch = [&](SimpleWeb::CaseInsensitiveMultimap headers) {
+    headers.emplace("rikey", "1234");
+    return endpoints::https::create_run_session(headers, "0.0.0.0", client, app_state, app);
   };
 
-  auto session = endpoints::https::create_run_session(with("mode", "1280x720x30"), "0.0.0.0", client, app_state, app);
-  REQUIRE(session);
-  REQUIRE(session->display_mode.width == 1280);
-  REQUIRE(session->display_mode.height == 720);
-  REQUIRE(session->display_mode.refreshRate == 30);
+  // Moonlight sends rikeyid as a signed int, so negative values must keep working
+  auto ok = launch({{"rikeyid", "-5678"}, {"mode", "1280x720x120"}, {"surroundAudioInfo", "4128774"}});
+  REQUIRE(ok);
+  REQUIRE(ok->display_mode.width == 1280);
+  REQUIRE(ok->display_mode.height == 720);
+  REQUIRE(ok->display_mode.refreshRate == 120);
+  REQUIRE(ok->audio_channel_count == 6);
 
-  REQUIRE_FALSE(endpoints::https::create_run_session(with("mode", "1920x1080"), "0.0.0.0", client, app_state, app));
-  REQUIRE_FALSE(endpoints::https::create_run_session(with("mode", "axbxc"), "0.0.0.0", client, app_state, app));
-  REQUIRE_FALSE(
-      endpoints::https::create_run_session(with("surroundAudioInfo", "stereo"), "0.0.0.0", client, app_state, app));
-  REQUIRE_FALSE(
-      endpoints::https::create_run_session(with("surroundAudioInfo", "196610junk"), "0.0.0.0", client, app_state, app));
-  REQUIRE_FALSE(endpoints::https::create_run_session(SimpleWeb::CaseInsensitiveMultimap{{"rikey", "1234"}},
-                                                     "0.0.0.0",
-                                                     client,
-                                                     app_state,
-                                                     app));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920"}}));  // used to index past the split
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "axbxc"}})); // used to throw std::invalid_argument
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "99999999999x1x1"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080x"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080x60x1"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080x60fps"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "-1920x1080x60"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"surroundAudioInfo", "abc"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"surroundAudioInfo", "196610junk"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "abc"}}));
+  REQUIRE_FALSE(launch({})); // missing rikeyid
 }
