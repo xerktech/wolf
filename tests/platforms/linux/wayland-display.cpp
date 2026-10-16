@@ -7,6 +7,8 @@
 #include <catch2/matchers/catch_matchers_vector.hpp>
 #include <control/input_handler.hpp>
 #include <core/virtual-display.hpp>
+#include <cstring>
+#include <vector>
 
 using Catch::Matchers::Contains;
 using Catch::Matchers::Equals;
@@ -123,6 +125,32 @@ TEST_CASE("Wayland virtual inputs", "[WAYLAND]") {
     REQUIRE(k_ev.has_value());
     REQUIRE(k_ev->keycode == 42);
     REQUIRE(!k_ev->pressed);
+  }
+
+  { // UTF8 text: heap buffers of exactly the received size, so reading past them shows up under ASan
+    auto utf8_pkt = pkts::UTF8_TEXT_PACKET{.text = "abcd"};
+    utf8_pkt.type = pkts::UTF8_TEXT;
+
+    // data_size claims 4 bytes of text but only 2 were received: must be dropped without typing anything
+    utf8_pkt.data_size = boost::endian::native_to_big(4 + 4);
+    std::vector<char> short_buf(sizeof(pkts::INPUT_PKT) + 2);
+    std::memcpy(short_buf.data(), &utf8_pkt, short_buf.size());
+    control::handle_input(session, {}, reinterpret_cast<pkts::INPUT_PKT *>(short_buf.data()), short_buf.size());
+    wl_display_roundtrip(wd.get());
+    REQUIRE(!kb_events_q->pop().has_value());
+
+    // data_size matches the 1 byte of text received: typed as CTRL+SHIFT+U+61
+    utf8_pkt.data_size = boost::endian::native_to_big(4 + 1);
+    std::vector<char> exact_buf(sizeof(pkts::INPUT_PKT) + 1);
+    std::memcpy(exact_buf.data(), &utf8_pkt, exact_buf.size());
+    control::handle_input(session, {}, reinterpret_cast<pkts::INPUT_PKT *>(exact_buf.data()), exact_buf.size());
+    wl_display_roundtrip(wd.get());
+    auto k_ev = kb_events_q->pop();
+    REQUIRE(k_ev.has_value());
+    REQUIRE(k_ev->keycode == 29); // LEFTCTRL
+    REQUIRE(k_ev->pressed);
+    while (kb_events_q->pop().has_value()) {
+    }
   }
 
   // Mouse tests: scroll
