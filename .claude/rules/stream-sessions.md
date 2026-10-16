@@ -6,6 +6,7 @@ paths:
   - src/moonlight-server/rest/endpoints.hpp
   - src/moonlight-server/events/events.hpp
   - tests/testControl.cpp
+  - tests/testWolfAPI.cpp
 ---
 
 # Stream sessions and stream instances
@@ -31,5 +32,8 @@ paths:
   - It counts running pipelines, never flags: after a pause, a restart on the same session can start
     new pipelines before the old ones finish EOS, and a flag cleared on the old exit would read wrong.
   - A pipeline decrements the atom it captured at start, not the session currently under its id.
-  - Tests: `tests/testWolfAPI.cpp` "Sessions APIs" covers the listing only; the event-driven
-    transitions in `sessions/moonlight.cpp` have no project test.
+  - The pause/start/pipeline bookkeeping lives in `setup_stream_pipeline_handlers`, separate from
+    the compositor/runner handlers, so a test can drive it with fake pipelines (`StreamPipelines`).
+  - Tests: `tests/testWolfAPI.cpp` "Sessions API: the listed state follows the stream's events"
+    (pause → API start mid-teardown, resume + `EndSupersededStreamEvent`); "Sessions APIs" covers
+    the listing only.
