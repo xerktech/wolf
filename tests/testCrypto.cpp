@@ -109,6 +109,16 @@ TEST_CASE("AES gcm", "[Crypto]") {
   // OpenSSL would read 16 bytes from a shorter tag
   REQUIRE_THROWS_AS(crypto::aes_decrypt_gcm(encrypted2, key, tag2.substr(0, 8), iv, iv.size(), false),
                     std::runtime_error);
+
+  SECTION("Tampered tag is rejected") {
+    tag2[0] ^= 1;
+    REQUIRE_THROWS_AS(crypto::aes_decrypt_gcm(encrypted2, key, tag2, iv, iv.size(), false), std::runtime_error);
+  }
+
+  SECTION("Tampered ciphertext is rejected") {
+    encrypted2[0] ^= 1;
+    REQUIRE_THROWS_AS(crypto::aes_decrypt_gcm(encrypted2, key, tag2, iv, iv.size(), false), std::runtime_error);
+  }
 }
 
 TEST_CASE("AES cbc", "[Crypto]") {
