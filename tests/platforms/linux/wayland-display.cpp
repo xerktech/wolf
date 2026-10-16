@@ -46,7 +46,7 @@ TEST_CASE("Wayland virtual inputs", "[WAYLAND]") {
   { // First move the mouse, this way our virtual window will get into focus
     auto mv_packet = pkts::MOUSE_MOVE_REL_PACKET{.delta_x = 10, .delta_y = 20};
     mv_packet.type = pkts::MOUSE_MOVE_REL;
-    control::handle_input(session, {}, &mv_packet);
+    control::handle_input(session, {}, &mv_packet, sizeof(mv_packet));
     wl_display_roundtrip(wd.get());
 
     auto m_ev = mouse_events_q->pop();
@@ -78,7 +78,7 @@ TEST_CASE("Wayland virtual inputs", "[WAYLAND]") {
   {
     auto press_A_key = pkts::KEYBOARD_PACKET{.key_code = boost::endian::native_to_little((short)0x41)};
     press_A_key.type = pkts::KEY_PRESS;
-    control::handle_input(session, {}, &press_A_key);
+    control::handle_input(session, {}, &press_A_key, sizeof(press_A_key));
     wl_display_roundtrip(wd.get());
 
     auto k_ev = kb_events_q->pop();
@@ -90,7 +90,7 @@ TEST_CASE("Wayland virtual inputs", "[WAYLAND]") {
   {
     auto release_A_key = pkts::KEYBOARD_PACKET{.key_code = boost::endian::native_to_little((short)0x41)};
     release_A_key.type = pkts::KEY_RELEASE;
-    control::handle_input(session, {}, &release_A_key);
+    control::handle_input(session, {}, &release_A_key, sizeof(release_A_key));
     wl_display_roundtrip(wd.get());
 
     auto k_ev = kb_events_q->pop();
@@ -103,7 +103,7 @@ TEST_CASE("Wayland virtual inputs", "[WAYLAND]") {
     auto press_SHIFT_A =
         pkts::KEYBOARD_PACKET{.key_code = boost::endian::native_to_little((short)0x41), .modifiers = pkts::SHIFT};
     press_SHIFT_A.type = pkts::KEY_PRESS;
-    control::handle_input(session, {}, &press_SHIFT_A);
+    control::handle_input(session, {}, &press_SHIFT_A, sizeof(press_SHIFT_A));
     wl_display_roundtrip(wd.get());
 
     auto k_ev = kb_events_q->pop();
@@ -130,7 +130,7 @@ TEST_CASE("Wayland virtual inputs", "[WAYLAND]") {
     short scroll_amt = 10;
     auto scroll_packet = pkts::MOUSE_SCROLL_PACKET{.scroll_amt1 = boost::endian::native_to_big(scroll_amt)};
     scroll_packet.type = pkts::MOUSE_SCROLL;
-    control::handle_input(session, {}, &scroll_packet);
+    control::handle_input(session, {}, &scroll_packet, sizeof(scroll_packet));
     wl_display_roundtrip(wd.get());
 
     // Compositor sends: axis_source, axis, axis_value120, axis_relative_direction (v9), frame.
