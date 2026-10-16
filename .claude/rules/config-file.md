@@ -18,6 +18,10 @@ paths:
 - The atomic replace copies the file's mode and owner onto the temp file and falls back to an
   in-place rewrite when it can't (unwritable dir, bind-mounted file, foreign owner): don't drop
   either, config.toml holds paired-client certs.
+  - Never fall back in place when writing the content failed (disk full): truncating the
+    original would leave Wolf unable to boot.
+  - The temp file is unlinked and opened `O_EXCL | O_NOFOLLOW`: a planted symlink or FIFO at
+    `<config>.tmp` must not be followed.
 - A failed save is logged, not thrown: an exception from an API handler terminates Wolf.
 - Tests: `tests/testMoonlight.cpp` "LocalState concurrent updates".
 

@@ -167,6 +167,21 @@ TEST_CASE("LocalState concurrent updates", "[LocalState]") {
       state::pair(cfg, {.client_cert = "concurrent-cert-" + std::to_string(i)});
     });
   }
+  // Partial settings updates to the same client, each setting a different field: all of them must stick
+  auto client_id = state::get_client_id(*cfg.paired_clients->load()->front());
+  auto settings_update = [&cfg, client_id](auto &&set_field) {
+    return std::thread([&cfg, client_id, set_field]() {
+      state::update_client_settings(cfg, client_id, [&set_field](const state::PairedClient &client) {
+        auto updated = client;
+        set_field(updated.settings);
+        return updated;
+      });
+    });
+  };
+  threads.push_back(settings_update([](auto &s) { s.run_uid = 4242; }));
+  threads.push_back(settings_update([](auto &s) { s.run_gid = 4343; }));
+  threads.push_back(settings_update([](auto &s) { s.mouse_acceleration = 4.25f; }));
+  threads.push_back(settings_update([](auto &s) { s.v_scroll_acceleration = 4.5f; }));
   for (auto &t : threads) {
     t.join();
   }
@@ -184,6 +199,20 @@ TEST_CASE("LocalState concurrent updates", "[LocalState]") {
       return client->client_cert == cert;
     }));
   }
+
+  auto check_settings = [client_id](const state::Config &c) {
+    auto clients = c.paired_clients->load();
+    auto client = std::find_if(clients->begin(), clients->end(), [client_id](const auto &cl) {
+      return state::get_client_id(*cl) == client_id;
+    });
+    REQUIRE(client != clients->end());
+    REQUIRE((*client)->settings.run_uid == 4242);
+    REQUIRE((*client)->settings.run_gid == 4343);
+    REQUIRE((*client)->settings.mouse_acceleration == 4.25f);
+    REQUIRE((*client)->settings.v_scroll_acceleration == 4.5f);
+  };
+  check_settings(cfg);
+  check_settings(reloaded);
 
   // Replacing the file must keep its permissions and leave no temp file behind
   REQUIRE((std::filesystem::status(cfg_file).permissions() & std::filesystem::perms::all) ==

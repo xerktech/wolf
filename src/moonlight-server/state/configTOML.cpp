@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cstring>
 #include <events/events.hpp>
 #include <events/reflectors.hpp>
 #include <fcntl.h>
@@ -451,7 +452,10 @@ static bool write_all(int fd, const std::string &content) {
 
 /**
  * Writes content to a temp file next to target, with target's mode and owner, and renames it over target.
- * Returns false (leaving target untouched) when any step fails, including when the owner can't be kept.
+ * Returns false, leaving target untouched, when the file can't be replaced this way: the temp file can't be created,
+ * target's owner can't be kept, or the rename is refused (e.g. target is a single bind-mounted file).
+ * Throws, also leaving target untouched, when writing the content itself fails (e.g. the disk is full): rewriting
+ * target in place would then truncate it.
  */
 static bool replace_atomically(const std::filesystem::path &target, const std::string &content) {
   struct stat st {};
@@ -460,26 +464,37 @@ static bool replace_atomically(const std::filesystem::path &target, const std::s
   }
   auto tmp = target;
   tmp += ".tmp";
-  int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, st.st_mode & 07777);
+  // A leftover (or planted) temp file is removed and never opened: O_EXCL | O_NOFOLLOW only create a new file
+  ::unlink(tmp.c_str());
+  int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, st.st_mode & 07777);
   if (fd < 0) {
     return false;
   }
   // fchmod because open() applies the umask; fchown fails when we may not give the file its owner back
-  bool ok = ::fchmod(fd, st.st_mode & 07777) == 0 && ::fchown(fd, st.st_uid, st.st_gid) == 0 &&
-            write_all(fd, content) && ::fsync(fd) == 0;
-  ok = (::close(fd) == 0) && ok;
-  if (ok && ::rename(tmp.c_str(), target.c_str()) == 0) {
-    return true;
+  if (::fchmod(fd, st.st_mode & 07777) != 0 || ::fchown(fd, st.st_uid, st.st_gid) != 0) {
+    ::close(fd);
+    ::unlink(tmp.c_str());
+    return false;
   }
-  ::unlink(tmp.c_str());
-  return false;
+  bool written = write_all(fd, content) && ::fsync(fd) == 0;
+  written = (::close(fd) == 0) && written;
+  if (!written) {
+    auto error = errno;
+    ::unlink(tmp.c_str());
+    throw std::runtime_error(fmt::format("Unable to write {}: {}", tmp.string(), std::strerror(error)));
+  }
+  if (::rename(tmp.c_str(), target.c_str()) != 0) {
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  return true;
 }
 
 /**
  * Saves content to the config file without a reader ever seeing a partial file: it is written to a temp file and
  * renamed over the original (on the resolved path, so a symlinked config keeps its link).
- * When that isn't possible (the directory isn't writable, the config is a single bind-mounted file, or the file's
- * owner couldn't be kept) the file is rewritten in place instead.
+ * When the file can't be replaced (the directory isn't writable, the config is a single bind-mounted file, or the
+ * file's owner couldn't be kept) it is rewritten in place instead.
  */
 static void write_config_file(const std::string &source, const std::string &content) {
   std::error_code ec;
