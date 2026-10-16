@@ -711,6 +711,8 @@ TEST_CASE("Launch rejects a malformed query", "[HTTP]") {
   REQUIRE_FALSE(endpoints::https::create_run_session(with("mode", "axbxc"), "0.0.0.0", client, app_state, app));
   REQUIRE_FALSE(
       endpoints::https::create_run_session(with("surroundAudioInfo", "stereo"), "0.0.0.0", client, app_state, app));
+  REQUIRE_FALSE(
+      endpoints::https::create_run_session(with("surroundAudioInfo", "196610junk"), "0.0.0.0", client, app_state, app));
   REQUIRE_FALSE(endpoints::https::create_run_session(SimpleWeb::CaseInsensitiveMultimap{{"rikey", "1234"}},
                                                      "0.0.0.0",
                                                      client,
