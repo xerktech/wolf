@@ -824,6 +824,125 @@ TEST_CASE("Sessions API: the listed state follows the stream's events", "[API]")
   REQUIRE(stream_state->audio_pipelines == 0);
 }
 
+TEST_CASE("utils::to_size_t", "[API]") {
+  REQUIRE(utils::to_size_t("0") == 0);
+  REQUIRE(utils::to_size_t("10594003729173467913") == 10594003729173467913ULL);
+  REQUIRE(utils::to_size_t("18446744073709551615") == 18446744073709551615ULL);
+  REQUIRE_FALSE(utils::to_size_t(""));
+  REQUIRE_FALSE(utils::to_size_t("abc"));
+  REQUIRE_FALSE(utils::to_size_t("123abc"));
+  REQUIRE_FALSE(utils::to_size_t(" 123"));
+  REQUIRE_FALSE(utils::to_size_t("-1"));
+  REQUIRE_FALSE(utils::to_size_t("18446744073709551616")); // out of range
+}
+
+TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .running_sessions = running_sessions});
+
+  auto runtime_dir = api_runtime_dir();
+  auto socket_path = api_socket_path();
+  std::thread server_thread([app_state, runtime_dir]() { wolf::api::start_server(runtime_dir, app_state); });
+  server_thread.detach();
+  std::this_thread::sleep_for(std::chrono::milliseconds(42)); // Wait for the server to start
+
+  auto curl = curl_ptr(curl_easy_init(), ::curl_easy_cleanup);
+  curl_easy_setopt(curl.get(), CURLOPT_UNIX_SOCKET_PATH, socket_path.c_str());
+  curl_easy_setopt(curl.get(), CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
+
+  for (const std::string bad_id : {"not-a-number", "", "-1", "99999999999999999999999"}) {
+    auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
+        .client_ip = "127.0.0.1",
+        .app_id = "304556286", // test cfg file
+        .client_id = bad_id,
+    };
+    auto response =
+        req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
+    REQUIRE(response);
+    REQUIRE_THAT(response->second, ContainsSubstring("Invalid client_id"));
+
+    response = req(curl.get(),
+                   HTTPMethod::POST,
+                   "http://localhost/api/v1/clients/settings",
+                   rfl::json::write(UpdateClientSettingsRequest{.client_id = bad_id}));
+    REQUIRE(response);
+    REQUIRE(response->first == 400);
+
+    response = req(curl.get(),
+                   HTTPMethod::POST,
+                   "http://localhost/api/v1/unpair/client",
+                   rfl::json::write(UnpairClientRequest{.client_id = bad_id}));
+    REQUIRE(response);
+    REQUIRE(response->first == 404);
+
+    auto expect_invalid_session = [&](std::string_view endpoint, const std::string &body) {
+      auto res = req(curl.get(), HTTPMethod::POST, std::string("http://localhost") + endpoint.data(), body);
+      REQUIRE(res);
+      REQUIRE(res->first == 400);
+      REQUIRE_THAT(res->second, ContainsSubstring("Invalid session_id"));
+    };
+    expect_invalid_session("/api/v1/sessions/start", rfl::json::write(StreamSessionStartRequest{.session_id = bad_id}));
+    expect_invalid_session("/api/v1/sessions/pause", rfl::json::write(StreamSessionPauseRequest{.session_id = bad_id}));
+    expect_invalid_session("/api/v1/sessions/stop", rfl::json::write(StreamSessionStopRequest{.session_id = bad_id}));
+    expect_invalid_session(
+        "/api/v1/sessions/input",
+        rfl::json::write(StreamSessionHandleInputRequest{.session_id = bad_id, .input_packet_hex = "00"}));
+    expect_invalid_session("/api/v1/runners/start",
+                           rfl::json::write(RunnerStartRequest{.stop_stream_when_over = false,
+                                                               .runner = wolf::config::AppCMD{.run_cmd = "true"},
+                                                               .session_id = bad_id}));
+  }
+
+  { // A numeric but unknown session_id used to dereference an empty optional in sessions/start
+    auto response = req(curl.get(),
+                        HTTPMethod::POST,
+                        "http://localhost/api/v1/sessions/start",
+                        rfl::json::write(StreamSessionStartRequest{.session_id = "12345"}));
+    REQUIRE(response);
+    REQUIRE(response->first == 500);
+    REQUIRE_THAT(response->second, ContainsSubstring("Invalid session_id"));
+  }
+
+  { // runners/start on a real session replies (it used to close the connection without an answer)
+    auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
+        .client_ip = "127.0.0.1",
+        .app_id = "304556286",               // test cfg file
+        .client_id = "10594003729173467913", // test cfg file
+    };
+    auto response =
+        req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
+    REQUIRE(response);
+    auto created = rfl::json::read<StreamSessionCreated>(response->second).value();
+    response = req(curl.get(),
+                   HTTPMethod::POST,
+                   "http://localhost/api/v1/runners/start",
+                   rfl::json::write(RunnerStartRequest{.stop_stream_when_over = false,
+                                                       .runner = wolf::config::AppCMD{.run_cmd = "true"},
+                                                       .session_id = created.session_id}));
+    REQUIRE(response);
+    REQUIRE(response->first == 200);
+    REQUIRE_THAT(response->second, Equals("{\"success\":true}"));
+  }
+
+  // A non-numeric Content-Length used to abort the whole server
+  auto response =
+      req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", "{}", {"Content-Length: abc"});
+  REQUIRE(response);
+  REQUIRE(response->first == 400);
+
+  // The server is still alive
+  response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/sessions");
+  REQUIRE(response);
+  REQUIRE(response->first == 200);
+}
+
 TEST_CASE("Session APIs without app_id or client_id", "[API]") {
   auto event_bus = std::make_shared<events::EventBusType>();
   auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();

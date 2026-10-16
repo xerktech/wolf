@@ -305,7 +305,13 @@ void UnixSocketServer::endpoint_StreamSessionStart(const HTTPRequest &req, std::
   auto start_req = rfl::json::read<StreamSessionStartRequest>(req.body);
   if (start_req) {
     auto sessions = state_->app_state->running_sessions->load();
-    auto session_id = std::stoul(start_req.value().session_id);
+    auto parsed_session_id = utils::to_size_t(start_req.value().session_id);
+    if (!parsed_session_id) {
+      logs::log(logs::warning, "[API] Invalid session_id: {}", start_req.value().session_id);
+      send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Invalid session_id"}));
+      return;
+    }
+    auto session_id = *parsed_session_id;
     if (auto session = state::get_session_by_id(sessions.get(), session_id)) {
       auto video_session = start_req.value().video_session;
       video_session.session_id = session_id; // Can't be JSON encoded
@@ -321,7 +327,7 @@ void UnixSocketServer::endpoint_StreamSessionStart(const HTTPRequest &req, std::
       auto res = GenericSuccessResponse{.success = true};
       send_http(socket, 200, rfl::json::write(res));
     } else {
-      logs::log(logs::warning, "[API] Invalid session_id: {}", session.value().session_id);
+      logs::log(logs::warning, "[API] Invalid session_id: {}", start_req.value().session_id);
       auto res = GenericErrorResponse{.error = "Invalid session_id"};
       send_http(socket, 500, rfl::json::write(res));
     }
@@ -336,7 +342,13 @@ void UnixSocketServer::endpoint_StreamSessionPause(const HTTPRequest &req, std::
   auto session = rfl::json::read<StreamSessionPauseRequest>(req.body);
   if (session) {
     auto sessions = state_->app_state->running_sessions->load();
-    auto session_id = std::stoul(session.value().session_id);
+    auto parsed_session_id = utils::to_size_t(session.value().session_id);
+    if (!parsed_session_id) {
+      logs::log(logs::warning, "[API] Invalid session_id: {}", session.value().session_id);
+      send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Invalid session_id"}));
+      return;
+    }
+    auto session_id = *parsed_session_id;
     if (state::get_session_by_id(sessions.get(), session_id)) {
       this->state_->app_state->event_bus->fire_event(
           immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = session_id}));
@@ -358,7 +370,13 @@ void UnixSocketServer::endpoint_StreamSessionStop(const HTTPRequest &req, std::s
   auto session = rfl::json::read<StreamSessionStopRequest>(req.body);
   if (session) {
     auto sessions = state_->app_state->running_sessions->load();
-    auto session_id = std::stoul(session.value().session_id);
+    auto parsed_session_id = utils::to_size_t(session.value().session_id);
+    if (!parsed_session_id) {
+      logs::log(logs::warning, "[API] Invalid session_id: {}", session.value().session_id);
+      send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Invalid session_id"}));
+      return;
+    }
+    auto session_id = *parsed_session_id;
     if (state::get_session_by_id(sessions.get(), session_id)) {
       this->state_->app_state->event_bus->fire_event(
           immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session_id}));
@@ -381,7 +399,13 @@ void UnixSocketServer::endpoint_StreamSessionHandleInput(const HTTPRequest &req,
   auto input_request = rfl::json::read<StreamSessionHandleInputRequest>(req.body);
   if (input_request) {
     auto sessions = state_->app_state->running_sessions->load();
-    auto session_id = std::stoul(input_request.value().session_id);
+    auto parsed_session_id = utils::to_size_t(input_request.value().session_id);
+    if (!parsed_session_id) {
+      logs::log(logs::warning, "[API] Invalid session_id: {}", input_request.value().session_id);
+      send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Invalid session_id"}));
+      return;
+    }
+    auto session_id = *parsed_session_id;
     if (auto session = state::get_session_by_id(sessions.get(), session_id)) {
       auto hex_pkt = input_request.value().input_packet_hex.get();
       auto pkt_parsed = crypto::hex_to_str(hex_pkt);
@@ -531,8 +555,13 @@ void UnixSocketServer::endpoint_LobbyStop(const wolf::api::HTTPRequest &req, std
 void UnixSocketServer::endpoint_RunnerStart(const wolf::api::HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto event = rfl::json::read<RunnerStartRequest>(req.body);
   if (event) {
-    auto session = state::get_session_by_id(this->state_->app_state->running_sessions->load(),
-                                            std::stoul(event.value().session_id));
+    auto session_id = utils::to_size_t(event.value().session_id);
+    if (!session_id) {
+      logs::log(logs::warning, "[API] Invalid session_id: {}", event.value().session_id);
+      send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Invalid session_id"}));
+      return;
+    }
+    auto session = state::get_session_by_id(this->state_->app_state->running_sessions->load(), *session_id);
     if (!session) {
       logs::log(logs::warning, "[API] Invalid session_id: {}", event.value().session_id);
       auto res = GenericErrorResponse{.error = "Invalid session_id"};
@@ -545,6 +574,7 @@ void UnixSocketServer::endpoint_RunnerStart(const wolf::api::HTTPRequest &req, s
         events::StartRunner{.stop_stream_when_over = event.value().stop_stream_when_over,
                             .runner = runner,
                             .stream_session = std::make_shared<events::StreamSession>(*session)}));
+    send_http(socket, 200, rfl::json::write(GenericSuccessResponse{.success = true}));
   } else {
     logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, event.error().what());
     auto res = GenericErrorResponse{.error = event.error().what()};
@@ -561,10 +591,8 @@ void UnixSocketServer::endpoint_UpdateClientSettings(const HTTPRequest &req, std
   }
 
   const auto &payload = payload_result.value();
-  std::size_t client_id;
-  try {
-    client_id = std::stoull(payload.client_id.value());
-  } catch (const std::exception &e) {
+  auto client_id = utils::to_size_t(payload.client_id.value());
+  if (!client_id) {
     auto res = GenericErrorResponse{.error = "Invalid client_id"};
     send_http(socket, 400, rfl::json::write(res));
     return;
@@ -591,7 +619,7 @@ void UnixSocketServer::endpoint_UpdateClientSettings(const HTTPRequest &req, std
         }};
   };
 
-  if (!update_client_settings(this->state_->app_state->config, client_id, merge_fn)) {
+  if (!update_client_settings(this->state_->app_state->config, *client_id, merge_fn)) {
     auto res = GenericErrorResponse{.error = "Client not found"};
     send_http(socket, 404, rfl::json::write(res));
     return;
