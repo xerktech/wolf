@@ -497,7 +497,7 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
           if (ev->session_id == video_session->session_id &&
               ev->rtp_secret_payload == video_session->rtp_secret_payload) {
             logs::log(logs::debug, "[GSTREAMER] Stopping superseded video pipeline: {}", ev->session_id);
-            gst_element_send_event(pipeline.get(), gst_event_new_eos());
+            gstreamer::send_eos_async(pipeline.get());
           }
         });
 
@@ -605,7 +605,7 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
           if (ev->session_id == audio_session->session_id &&
               ev->rtp_secret_payload == audio_session->rtp_secret_payload) {
             logs::log(logs::debug, "[GSTREAMER] Stopping superseded audio pipeline: {}", ev->session_id);
-            gst_element_send_event(pipeline.get(), gst_event_new_eos());
+            gstreamer::send_eos_async(pipeline.get());
           }
         });
 
