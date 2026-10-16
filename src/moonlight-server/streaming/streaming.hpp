@@ -31,7 +31,12 @@ struct WaylandDisplayReady {
   gstreamer::gst_element_ptr wayland_plugin;
 };
 
+/**
+ * `session_id` (a moonlight session_id or a lobby id) is what its stop events name; `producer_name` names its
+ * interpipesink.
+ */
 void start_video_producer(const std::string &session_id,
+                          const std::string &producer_name,
                           const std::string &buffer_format,
                           const std::string &render_node,
                           const wolf::core::virtual_display::DisplayMode &display_mode,
@@ -40,12 +45,27 @@ void start_video_producer(const std::string &session_id,
                           std::shared_ptr<events::EventBusType> event_bus);
 
 void start_audio_producer(const std::string &session_id,
+                          const std::string &producer_name,
                           const std::shared_ptr<events::EventBusType> &event_bus,
                           int channel_count,
                           const std::string &sink_name,
                           const std::string &server_name);
 
+/**
+ * Points `pipeline`'s interpipesrc `interpipesrc_<session_id>_<kind>` from `<session_id>_<kind>` to
+ * `<producer_name>_<kind>`. A custom listen-to, or an empty producer_name, is left alone.
+ */
+void listen_to_producer(GstElement *pipeline,
+                        std::size_t session_id,
+                        const std::string &producer_name,
+                        const std::string &kind);
+
+/**
+ * `producer_name` is the interpipe producer the stream's configured interpipesrc should listen to in place of
+ * `<session_id>_video` (see StreamSession::producer_name); empty keeps the configured listen-to.
+ */
 void start_streaming_video(immer::box<events::VideoSession> video_session,
+                           const std::string &producer_name,
                            const std::shared_ptr<events::EventBusType> &event_bus,
                            std::string client_ip,
                            unsigned short client_port,
@@ -53,6 +73,7 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
                            std::shared_ptr<udp::socket> video_socket);
 
 void start_streaming_audio(immer::box<events::AudioSession> audio_session,
+                           const std::string &producer_name,
                            const std::shared_ptr<events::EventBusType> &event_bus,
                            std::string client_ip,
                            unsigned short client_port,

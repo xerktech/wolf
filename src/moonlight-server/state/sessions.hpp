@@ -116,8 +116,27 @@ inline std::shared_ptr<events::StreamSession> create_stream_session(immer::box<s
       .video_stream_port = static_cast<unsigned short>(get_port(VIDEO_PING_PORT)),
       .audio_stream_port = static_cast<unsigned short>(get_port(AUDIO_PING_PORT)),
       .control_stream_port = static_cast<unsigned short>(get_port(CONTROL_PORT))};
+  session.producer_name = fmt::format("{}_{:08x}", session.session_id, uints(generator));
 
   return std::make_shared<events::StreamSession>(session);
+}
+
+/**
+ * The name of `session`'s interpipe producers: its own producer_name, or (for a session built without one) its id.
+ */
+inline std::string producer_name(const events::StreamSession &session) {
+  return session.producer_name.empty() ? std::to_string(session.session_id) : session.producer_name;
+}
+
+/**
+ * Whether stream instance `session` is the one running under its session_id.
+ * False once a stop removed it, or a /resume replaced it with a new instance
+ * under the same session_id (told apart, as in control.cpp, by the ENet secret).
+ */
+inline bool is_running_instance(const immer::vector<events::StreamSession> &sessions,
+                                const events::StreamSession &session) {
+  auto running = get_session_by_id(sessions, session.session_id);
+  return running && running->enet_secret_payload == session.enet_secret_payload;
 }
 
 inline immer::vector<events::StreamSession> remove_session(const immer::vector<events::StreamSession> &sessions,
