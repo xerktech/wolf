@@ -341,7 +341,15 @@ void UnixSocketServer::sse_keepalive(const boost::system::error_code &e) {
     return;
   }
   cleanup_sockets();
-  sse_broadcast(":keepalive\n\n");
+  // Only idle connections need a keepalive. Queued behind a large backlog, it would also count towards
+  // MAX_WRITE_QUEUE_BYTES and drop a subscriber that is still reading.
+  // The timer runs on the io_context thread, which owns the sockets and their write queues.
+  static const auto keepalive = std::make_shared<const std::string>(":keepalive\n\n");
+  for (const auto &socket : state_->sockets) {
+    if (socket->write_queue.empty()) {
+      queue_write(socket, keepalive);
+    }
+  }
   state_->sse_keepalive_timer.expires_after(SSE_KEEPALIVE_INTERVAL);
   state_->sse_keepalive_timer.async_wait([this](auto e) { sse_keepalive(e); });
 }

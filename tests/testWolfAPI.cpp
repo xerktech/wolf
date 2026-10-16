@@ -31,6 +31,30 @@ std::string api_socket_path() {
 }
 
 /**
+ * Start the API server and wait until it accepts connections.
+ * Servers started by earlier tests keep running: their socket file is removed first, so that we can't reach one of
+ * them instead of the new server.
+ */
+void start_api_server(const immer::box<state::AppState> &app_state) {
+  auto socket_path = api_socket_path();
+  std::filesystem::remove(socket_path);
+  std::thread([app_state, runtime_dir = api_runtime_dir()]() {
+    wolf::api::start_server(runtime_dir, app_state);
+  }).detach();
+  for (int attempt = 0; attempt < 500; attempt++) {
+    boost::asio::io_context ctx;
+    boost::asio::local::stream_protocol::socket probe(ctx);
+    boost::system::error_code ec;
+    probe.connect(boost::asio::local::stream_protocol::endpoint(socket_path), ec);
+    if (!ec) {
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  FAIL("The API server didn't start");
+}
+
+/**
  * Perform a HTTP request using curl
  */
 std::optional<std::pair<long /* response_code */, std::string /* raw message */>>
@@ -124,9 +148,7 @@ TEST_CASE("Pair APIs", "[API]") {
   auto runtime_dir = api_runtime_dir();
   auto socket_path = api_socket_path();
   // Start the server
-  std::thread server_thread([app_state, runtime_dir]() { wolf::api::start_server(runtime_dir, app_state); });
-  server_thread.detach();
-  std::this_thread::sleep_for(std::chrono::milliseconds(42)); // Wait for the server to start
+  start_api_server(app_state);
 
   auto curl = curl_ptr(curl_easy_init(), ::curl_easy_cleanup);
 
@@ -234,9 +256,7 @@ TEST_CASE("APPs APIs", "[API]") {
   auto runtime_dir = api_runtime_dir();
   auto socket_path = api_socket_path();
   // Start the server
-  std::thread server_thread([app_state, runtime_dir]() { wolf::api::start_server(runtime_dir, app_state); });
-  server_thread.detach();
-  std::this_thread::sleep_for(std::chrono::milliseconds(42)); // Wait for the server to start
+  start_api_server(app_state);
 
   auto curl = curl_ptr(curl_easy_init(), ::curl_easy_cleanup);
 
@@ -438,9 +458,7 @@ TEST_CASE("Profile APIs", "[API]") {
   auto runtime_dir = api_runtime_dir();
   auto socket_path = api_socket_path();
   // Start the server
-  std::thread server_thread([app_state, runtime_dir]() { wolf::api::start_server(runtime_dir, app_state); });
-  server_thread.detach();
-  std::this_thread::sleep_for(std::chrono::milliseconds(42)); // Wait for the server to start
+  start_api_server(app_state);
 
   auto curl = curl_ptr(curl_easy_init(), ::curl_easy_cleanup);
 
@@ -521,9 +539,7 @@ TEST_CASE("Sessions APIs", "[API]") {
   auto runtime_dir = api_runtime_dir();
   auto socket_path = api_socket_path();
   // Start the server
-  std::thread server_thread([app_state, runtime_dir]() { wolf::api::start_server(runtime_dir, app_state); });
-  server_thread.detach();
-  std::this_thread::sleep_for(std::chrono::milliseconds(42)); // Wait for the server to start
+  start_api_server(app_state);
 
   auto curl = curl_ptr(curl_easy_init(), ::curl_easy_cleanup);
 
@@ -822,9 +838,7 @@ TEST_CASE("Session APIs without app_id or client_id", "[API]") {
   auto runtime_dir = api_runtime_dir();
   auto socket_path = api_socket_path();
   // Start the server
-  std::thread server_thread([app_state, runtime_dir]() { wolf::api::start_server(runtime_dir, app_state); });
-  server_thread.detach();
-  std::this_thread::sleep_for(std::chrono::milliseconds(42)); // Wait for the server to start
+  start_api_server(app_state);
 
   auto curl = curl_ptr(curl_easy_init(), ::curl_easy_cleanup);
 
@@ -1144,9 +1158,7 @@ TEST_CASE("SSE APIs", "[API]") {
   auto runtime_dir = api_runtime_dir();
   auto socket_path = api_socket_path();
   // Start the server
-  std::thread server_thread([app_state, runtime_dir]() { wolf::api::start_server(runtime_dir, app_state); });
-  server_thread.detach();
-  std::this_thread::sleep_for(std::chrono::milliseconds(42)); // Wait for the server to start
+  start_api_server(app_state);
 
   auto curl = curl_ptr(curl_easy_init(), ::curl_easy_cleanup);
 
@@ -1183,9 +1195,7 @@ TEST_CASE("SSE APIs large events", "[API]") {
 
   auto runtime_dir = api_runtime_dir();
   auto socket_path = api_socket_path();
-  std::thread server_thread([app_state, runtime_dir]() { wolf::api::start_server(runtime_dir, app_state); });
-  server_thread.detach();
-  std::this_thread::sleep_for(std::chrono::milliseconds(42)); // Wait for the server to start
+  start_api_server(app_state);
 
   boost::asio::io_context client_ctx;
   boost::asio::local::stream_protocol::socket client(client_ctx);
