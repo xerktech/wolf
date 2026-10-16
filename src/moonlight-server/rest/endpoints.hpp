@@ -9,6 +9,7 @@
 #include <functional>
 #include <helpers/utils.hpp>
 #include <immer/vector_transient.hpp>
+#include <limits>
 #include <moonlight/control.hpp>
 #include <moonlight/protocol.hpp>
 #include <platforms/hw.hpp>
@@ -388,28 +389,51 @@ void appasset(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>
   }
 }
 
+/**
+ * Moonlight sends rikeyid as a signed 32-bit decimal (printf "%d"), so it can be negative; other clients may send it
+ * unsigned. Only the low 32 bits are used (see derive_iv()), so accept any 64-bit decimal.
+ */
+inline bool is_rikeyid(std::string_view str) {
+  std::int64_t value = 0;
+  auto [end, ec] = std::from_chars(str.data(), str.data() + str.size(), value);
+  return ec == std::errc{} && end == str.data() + str.size();
+}
+
 auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
                         const std::string &client_ip,
                         const state::PairedClient &current_client,
                         immer::box<state::AppState> state,
                         const events::App &run_app) {
-  auto display_mode_str = utils::split(get_header(headers, "mode").value_or("1920x1080x60"), 'x');
-  moonlight::DisplayMode display_mode = {std::stoi(display_mode_str[0].data()),
-                                         std::stoi(display_mode_str[1].data()),
-                                         std::stoi(display_mode_str[2].data()),
+  // All of these come straight from the client's query string: validate them instead of letting a malformed value
+  // throw (or, for a short "mode", index past the end of the split).
+  // split() returns views into its input, so keep the string alive while they're in use
+  auto display_mode_param = get_header(headers, "mode").value_or("1920x1080x60");
+  auto display_mode_str = utils::split(display_mode_param, 'x');
+  std::optional<std::size_t> width, height, fps;
+  if (display_mode_str.size() == 3) {
+    width = utils::to_size_t(display_mode_str[0]);
+    height = utils::to_size_t(display_mode_str[1]);
+    fps = utils::to_size_t(display_mode_str[2]);
+  }
+  constexpr std::size_t max_int = std::numeric_limits<int>::max();
+  auto surround_info = utils::to_size_t(get_header(headers, "surroundAudioInfo").value_or("196610"));
+  auto rikey = get_header(headers, "rikey");
+  auto rikeyid = get_header(headers, "rikeyid");
+  if (!width || !height || !fps || *width > max_int || *height > max_int || *fps > max_int || !surround_info ||
+      !rikey || !rikeyid || !is_rikeyid(*rikeyid)) {
+    logs::log(logs::warning, "[HTTPS] Invalid launch parameters from {}", client_ip);
+    return std::shared_ptr<events::StreamSession>{};
+  }
+  moonlight::DisplayMode display_mode = {static_cast<int>(*width),
+                                         static_cast<int>(*height),
+                                         static_cast<int>(*fps),
                                          state->config->support_hevc,
                                          state->config->support_av1};
 
-  auto surround_info = std::stoi(get_header(headers, "surroundAudioInfo").value_or("196610"));
-  int channelCount = surround_info & (0xffff /* last 16 bits */);
+  int channelCount = static_cast<int>(*surround_info & (0xffff /* last 16 bits */));
 
-  auto base_session = create_stream_session(state,
-                                            run_app,
-                                            current_client,
-                                            display_mode,
-                                            channelCount,
-                                            get_header(headers, "rikey").value(),
-                                            get_header(headers, "rikeyid").value());
+  auto base_session =
+      create_stream_session(state, run_app, current_client, display_mode, channelCount, rikey.value(), rikeyid.value());
 
   base_session->ip = client_ip;
   return std::move(base_session);
@@ -450,6 +474,10 @@ void launch(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
 
   auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
   auto new_session = create_run_session(request->parse_query_string(), client_ip, current_client, state, app.value());
+  if (!new_session) {
+    server_error<SimpleWeb::HTTPS>(response);
+    return;
+  }
   state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
   state->running_sessions->update(
       [new_session](const immer::vector<events::StreamSession> &ses_v) { return ses_v.push_back(*new_session); });
@@ -470,6 +498,10 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
   if (old_session) {
     auto new_session =
         create_run_session(request->parse_query_string(), client_ip, current_client, state, *old_session->app);
+    if (!new_session) {
+      server_error<SimpleWeb::HTTPS>(response);
+      return;
+    }
     // Carry over the old session display handle
     new_session->wayland_display = std::move(old_session->wayland_display);
     // Carry over the old session devices, they'll be already plugged into the container

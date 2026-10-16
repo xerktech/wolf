@@ -771,3 +771,33 @@ TEST_CASE("Multiple users", "[HTTP]") {
   REQUIRE(session4->video_stream_port == 48100);
   REQUIRE(session4->audio_stream_port == 48200);
 }
+
+TEST_CASE("Launch rejects malformed client parameters", "[HTTP]") {
+  auto app_state = state::AppState{
+      .config = state::Config{.paired_clients = std::shared_ptr<immer::atom<state::PairedClientList>>()},
+      .host = {},
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .event_bus = std::make_shared<events::EventBusType>(),
+      .running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>()};
+  auto client = state::PairedClient{.app_state_folder = "test"};
+  auto app = events::App{.base = moonlight::App{.title = "test_app"}};
+  auto launch = [&](SimpleWeb::CaseInsensitiveMultimap headers) {
+    headers.emplace("rikey", "1234");
+    return endpoints::https::create_run_session(headers, "0.0.0.0", client, app_state, app);
+  };
+
+  // Moonlight sends rikeyid as a signed int, so negative values must keep working
+  auto ok = launch({{"rikeyid", "-5678"}, {"mode", "1280x720x120"}, {"surroundAudioInfo", "4128774"}});
+  REQUIRE(ok);
+  REQUIRE(ok->display_mode.width == 1280);
+  REQUIRE(ok->display_mode.height == 720);
+  REQUIRE(ok->display_mode.refreshRate == 120);
+  REQUIRE(ok->audio_channel_count == 6);
+
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920"}}));  // used to index past the split
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "axbxc"}})); // used to throw std::invalid_argument
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "99999999999x1x1"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"surroundAudioInfo", "abc"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "abc"}}));
+  REQUIRE_FALSE(launch({})); // missing rikeyid
+}
