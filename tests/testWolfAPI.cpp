@@ -2,6 +2,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <curl/curl.h>
+#include <cstdlib>
 #include <filesystem>
 #include <future>
 #include <helpers/tsqueue.hpp>
@@ -648,10 +649,15 @@ TEST_CASE("Sessions API: the listed state follows the stream's events", "[API]")
   auto fake = FakePipelines{.ev_bus = event_bus, .teardown = teardown};
   auto pipeline_handlers = sessions::setup_stream_pipeline_handlers(event_bus, running_sessions, fake.pipelines());
 
-  // Each run (one per SECTION) gets its own socket: the previous run's server is still listening on its own
-  static int run = 0;
-  auto runtime_dir = (std::filesystem::path(api_runtime_dir()) / fmt::format("stream-state-{}", run++)).string();
-  std::filesystem::create_directories(runtime_dir);
+  // Each run (one per SECTION) gets its own socket: the previous run's server is still listening on its own.
+  // Kept short under /tmp, whatever XDG_RUNTIME_DIR is, so the socket path fits in sockaddr_un.
+  char runtime_dir_template[] = "/tmp/wolf-test-XXXXXX";
+  REQUIRE(mkdtemp(runtime_dir_template));
+  auto runtime_dir = std::string(runtime_dir_template);
+  auto remove_runtime_dir = std::shared_ptr<void>(nullptr, [runtime_dir](void *) {
+    std::error_code ec;
+    std::filesystem::remove_all(runtime_dir, ec);
+  });
   auto socket_path = (std::filesystem::path(runtime_dir) / "wolf.sock").string();
   std::thread server_thread([app_state, runtime_dir]() { wolf::api::start_server(runtime_dir, app_state); });
   server_thread.detach();
