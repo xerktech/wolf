@@ -648,24 +648,35 @@ TEST_CASE("Sessions API: the listed state follows the stream's events", "[API]")
   auto fake = FakePipelines{.ev_bus = event_bus, .teardown = teardown};
   auto pipeline_handlers = sessions::setup_stream_pipeline_handlers(event_bus, running_sessions, fake.pipelines());
 
-  auto runtime_dir = api_runtime_dir();
-  auto socket_path = api_socket_path();
+  // Each run (one per SECTION) gets its own socket: the previous run's server is still listening on its own
+  static int run = 0;
+  auto runtime_dir = (std::filesystem::path(api_runtime_dir()) / fmt::format("stream-state-{}", run++)).string();
+  std::filesystem::create_directories(runtime_dir);
+  auto socket_path = (std::filesystem::path(runtime_dir) / "wolf.sock").string();
   std::thread server_thread([app_state, runtime_dir]() { wolf::api::start_server(runtime_dir, app_state); });
   server_thread.detach();
-  std::this_thread::sleep_for(std::chrono::milliseconds(42)); // Wait for the server to start
 
   auto curl = curl_ptr(curl_easy_init(), ::curl_easy_cleanup);
   curl_easy_setopt(curl.get(), CURLOPT_UNIX_SOCKET_PATH, socket_path.c_str());
   curl_easy_setopt(curl.get(), CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
+
+  // Wait for the server to start
+  auto response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/sessions");
+  for (int i = 0; i < 250 && !response; i++) {
+    std::this_thread::sleep_for(20ms);
+    response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/sessions");
+  }
+  REQUIRE(response);
 
   auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
       .client_ip = "127.0.0.1",
       .app_id = "304556286",               // test cfg file
       .client_id = "10594003729173467913", // test cfg file
   };
-  auto response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
+  response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
   REQUIRE(response);
   REQUIRE_THAT(response->second, ContainsSubstring("{\"success\":true,\"session_id\":"));
+  REQUIRE(running_sessions->load()->size() == 1);
   auto session_id = running_sessions->load()->front().session_id;
 
   auto listed_state = [&]() {
@@ -706,6 +717,9 @@ TEST_CASE("Sessions API: the listed state follows the stream's events", "[API]")
   REQUIRE(listed_state() == "setup");
   setup(1);
   REQUIRE(listed_state() == "setup"); // until the client's first ping
+  // A pause before the first ping, with no pipeline to end yet, doesn't hold the stream paused once it starts
+  event_bus->fire_event(immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = session_id}));
+  REQUIRE(listed_state() == "paused");
   ping_until_started(1, 2);
   REQUIRE(listed_state() == "streaming");
 
@@ -722,6 +736,7 @@ TEST_CASE("Sessions API: the listed state follows the stream's events", "[API]")
         req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/start", rfl::json::write(start_request));
     REQUIRE(response);
     REQUIRE_THAT(response->second, Equals("{\"success\":true}"));
+    REQUIRE(listed_state() != "paused"); // set up again, before its first ping
     ping_until_started(2, 4);
     REQUIRE(*fake.ended == 0);
     REQUIRE(listed_state() == "streaming");
@@ -756,6 +771,11 @@ TEST_CASE("Sessions API: the listed state follows the stream's events", "[API]")
   event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session_id}));
   std::this_thread::sleep_for(teardown + 300ms);
   REQUIRE(*fake.ended == *fake.started);
+  REQUIRE(listed_state() == "setup");
+  // Every pipeline counted itself out, which the listed state alone can't tell once either count is 0
+  auto stream_state = running_sessions->load()->front().stream_state->load();
+  REQUIRE(stream_state->video_pipelines == 0);
+  REQUIRE(stream_state->audio_pipelines == 0);
 }
 
 TEST_CASE("Session APIs without app_id or client_id", "[API]") {
