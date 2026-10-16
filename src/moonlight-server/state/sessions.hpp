@@ -120,6 +120,17 @@ inline std::shared_ptr<events::StreamSession> create_stream_session(immer::box<s
   return std::make_shared<events::StreamSession>(session);
 }
 
+/**
+ * Whether stream instance `session` is the one running under its session_id.
+ * False once a stop removed it, or a /resume replaced it with a new instance
+ * under the same session_id (told apart, as in control.cpp, by the ENet secret).
+ */
+inline bool is_running_instance(const immer::vector<events::StreamSession> &sessions,
+                                const events::StreamSession &session) {
+  auto running = get_session_by_id(sessions, session.session_id);
+  return running && running->enet_secret_payload == session.enet_secret_payload;
+}
+
 inline immer::vector<events::StreamSession> remove_session(const immer::vector<events::StreamSession> &sessions,
                                                            const events::StreamSession &session) {
   return sessions                                                                                           //

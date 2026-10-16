@@ -313,10 +313,24 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
 
           // Runner process ended
           if (run_session->stop_stream_when_over) {
-            run_session->stream_session->wayland_display->store(nullptr);
+            const auto &stream = *run_session->stream_session;
+            stream.wayland_display->store(nullptr);
 
-            app_state->event_bus->fire_event(immer::box<events::StopStreamEvent>(
-                events::StopStreamEvent{.session_id = run_session->stream_session->session_id}));
+            // A stop usually ended the runner, and its StopStreamEvent already removed this stream.
+            // A /resume may then have added a new instance under the same session_id within
+            // milliseconds; a StopStreamEvent now would end that one (XERK-1964). So only stop the
+            // stream while this instance is still the running one, and end just a replaced
+            // instance's own pipelines.
+            auto running = *app_state->running_sessions->load();
+            if (state::is_running_instance(running, stream)) {
+              app_state->event_bus->fire_event(
+                  immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = stream.session_id}));
+            } else if (state::get_session_by_id(running, stream.session_id)) {
+              logs::log(logs::debug, "[STREAM_SESSION] Runner of superseded stream {} ended", stream.session_id);
+              app_state->event_bus->fire_event(immer::box<events::EndSupersededStreamEvent>(
+                  events::EndSupersededStreamEvent{.session_id = stream.session_id,
+                                                   .rtp_secret_payload = stream.rtp_secret_payload}));
+            }
           }
         }).detach();
       }));

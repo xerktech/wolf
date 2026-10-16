@@ -21,10 +21,14 @@ paths:
     resume. `control.cpp` treats it as superseded: it fires `EndSupersededStreamEvent` (keyed by
     `rtp_secret_payload`) instead of a pause.
   - On ENet connect the newest peer owns the session; older peers of the same session are dropped.
+  - A stop's runner exits milliseconds after the stop, often after a /resume re-added the
+    session_id. The runner-exit path fires `StopStreamEvent` only while its own instance is the
+    running one (`state::is_running_instance`), else `EndSupersededStreamEvent` (XERK-1964).
 - `PauseStreamEvent` is also broadcast on the API event stream; external tools (fenrir) read it as
   "this client's stream paused". Don't overload it with per-instance semantics.
 - Tests: `tests/testControl.cpp` — "control: a dead client's late pause doesn't end its resumed
   stream" (real ENet), "streaming: a superseded stream instance ends only its own pipelines".
+  - "sessions: a stopped or replaced stream instance is no longer the running one".
   - The ENet test client must keep servicing its host after connect, or the server never sees the
     CONNECT (the handshake ack is sent on the next service call).
 - `StreamSession::stream_state` backs the `state` field of `GET /api/v1/sessions`, so a client that

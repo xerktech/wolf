@@ -6,6 +6,7 @@ using Catch::Matchers::Equals;
 #include <control/control.hpp>
 #include <moonlight/control.hpp>
 #include <mutex>
+#include <state/sessions.hpp>
 #include <streaming/streaming.hpp>
 #include <thread>
 using namespace moonlight::control;
@@ -185,6 +186,26 @@ struct TestENetClient {
   }
 };
 } // namespace
+
+TEST_CASE("sessions: a stopped or replaced stream instance is no longer the running one") {
+  using wolf::core::events::StreamSession;
+  StreamSession stopped_stream{.session_id = 42};
+  stopped_stream.enet_secret_payload = 1;
+  StreamSession resumed_stream = stopped_stream;
+  resumed_stream.enet_secret_payload = 2;
+  StreamSession other_client{.session_id = 7};
+  other_client.enet_secret_payload = 1;
+
+  REQUIRE(state::is_running_instance(immer::vector<StreamSession>{other_client, stopped_stream}, stopped_stream));
+
+  // Its runner exits after the stop removed it: nothing to stop
+  REQUIRE_FALSE(state::is_running_instance(immer::vector<StreamSession>{other_client}, stopped_stream));
+
+  // ... or after a /resume added a new instance under the same session_id: that one must not be stopped
+  immer::vector<StreamSession> resumed{other_client, resumed_stream};
+  REQUIRE_FALSE(state::is_running_instance(resumed, stopped_stream));
+  REQUIRE(state::is_running_instance(resumed, resumed_stream));
+}
 
 TEST_CASE("control: a dead client's late pause doesn't end its resumed stream", "[ENET]") {
   using wolf::core::events::StreamSession;
