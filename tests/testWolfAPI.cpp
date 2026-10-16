@@ -1159,9 +1159,12 @@ TEST_CASE("SSE APIs", "[API]") {
   std::this_thread::sleep_for(std::chrono::milliseconds(42)); // Wait for the SSE client to start
 
   // Test out one of the events
-  event_bus->fire_event(events::IDRRequestEvent{.session_id = 42});
-
-  auto event = queue->pop();
+  // The subscriber is registered asynchronously: an event fired before that reaches nobody, so retry until one lands
+  std::optional<SSEEvent> event;
+  for (int attempt = 0; attempt < 50 && !event; attempt++) {
+    event_bus->fire_event(events::IDRRequestEvent{.session_id = 42});
+    event = queue->pop();
+  }
   REQUIRE(event.has_value());
   REQUIRE_THAT(event->event, Equals("wolf::core::events::IDRRequestEvent"));
   REQUIRE_THAT(event->data, Equals("{\"session_id\":\"42\"}"));
