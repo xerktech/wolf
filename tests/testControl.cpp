@@ -8,6 +8,7 @@ using Catch::Matchers::Equals;
 #include <cstring>
 #include <moonlight/control.hpp>
 #include <mutex>
+#include <state/sessions.hpp>
 #include <streaming/streaming.hpp>
 #include <thread>
 #include <vector>
@@ -295,6 +296,26 @@ struct TestENetClient {
 };
 } // namespace
 
+TEST_CASE("sessions: a stopped or replaced stream instance is no longer the running one") {
+  using wolf::core::events::StreamSession;
+  StreamSession stopped_stream{.session_id = 42};
+  stopped_stream.enet_secret_payload = 1;
+  StreamSession resumed_stream = stopped_stream;
+  resumed_stream.enet_secret_payload = 2;
+  StreamSession other_client{.session_id = 7};
+  other_client.enet_secret_payload = 1;
+
+  REQUIRE(state::is_running_instance(immer::vector<StreamSession>{other_client, stopped_stream}, stopped_stream));
+
+  // Its runner exits after the stop removed it: nothing to stop
+  REQUIRE_FALSE(state::is_running_instance(immer::vector<StreamSession>{other_client}, stopped_stream));
+
+  // ... or after a /resume added a new instance under the same session_id: that one must not be stopped
+  immer::vector<StreamSession> resumed{other_client, resumed_stream};
+  REQUIRE_FALSE(state::is_running_instance(resumed, stopped_stream));
+  REQUIRE(state::is_running_instance(resumed, resumed_stream));
+}
+
 TEST_CASE("control: a dead client's late pause doesn't end its resumed stream", "[ENET]") {
   using wolf::core::events::StreamSession;
   constexpr int port = 47998;
@@ -369,6 +390,13 @@ TEST_CASE("control: a dead client's late pause doesn't end its resumed stream", 
   resumed_client.service(200ms);
   REQUIRE(resumed_client.disconnected);
   REQUIRE(ended() == std::vector<char>{1, 1});
+
+  // Once the stream is stopped, its client's late pause fires nothing: a /resume may be about to reuse the id
+  running_sessions->store(immer::vector<StreamSession>{});
+  reconnected_client.send_termination(new_key);
+  reconnected_client.service(200ms);
+  REQUIRE(pauses == 1);
+  REQUIRE(ended() == std::vector<char>{1, 1});
 }
 
 TEST_CASE("streaming: a superseded stream instance ends only its own pipelines", "[GSTREAMER]") {
@@ -387,6 +415,7 @@ TEST_CASE("streaming: a superseded stream instance ends only its own pipelines",
     auto ended = std::make_shared<std::atomic_bool>(false);
     std::thread([=, &io] {
       streaming::start_streaming_video(video,
+                                       "",
                                        event_bus,
                                        "127.0.0.1",
                                        9,
@@ -402,6 +431,7 @@ TEST_CASE("streaming: a superseded stream instance ends only its own pipelines",
     auto ended = std::make_shared<std::atomic_bool>(false);
     std::thread([=, &io] {
       streaming::start_streaming_audio(audio,
+                                       "",
                                        event_bus,
                                        "127.0.0.1",
                                        9,
@@ -682,4 +712,33 @@ TEST_CASE("control: a replayed encrypted packet is dropped", "[ENET]") {
   v1_client.send_idr(old_key, 7, ControlEncryption::V1);
   v1_client.service(200ms);
   REQUIRE(idr_requests == 7);
+}
+
+TEST_CASE("streaming: a stream listens to its own instance's producers", "[GSTREAMER]") {
+  auto listen_to = [](const std::string &configured, const std::string &producer_name) {
+    auto desc = fmt::format("interpipesrc name=interpipesrc_42_video listen-to={} ! fakesink", configured);
+    auto pipeline = gst_parse_launch(desc.c_str(), nullptr);
+    REQUIRE(pipeline);
+    streaming::listen_to_producer(pipeline, 42, producer_name, "video");
+    auto src = gst_bin_get_by_name(GST_BIN(pipeline), "interpipesrc_42_video");
+    gchar *value = nullptr;
+    g_object_get(src, "listen-to", &value, nullptr);
+    std::string result = value ? value : "";
+    g_free(value);
+    gst_object_unref(src);
+    gst_object_unref(pipeline);
+    return result;
+  };
+
+  REQUIRE(listen_to("42_video", "42_0badcafe") == "42_0badcafe_video");
+  // A custom source, or no known producer, keeps the configured one
+  REQUIRE(listen_to("some-lobby_video", "42_0badcafe") == "some-lobby_video");
+  REQUIRE(listen_to("42_video", "") == "42_video");
+}
+
+TEST_CASE("sessions: a session built without a producer name keeps its id's producers") {
+  wolf::core::events::StreamSession session{.session_id = 42};
+  REQUIRE(state::producer_name(session) == "42");
+  session.producer_name = "42_0badcafe";
+  REQUIRE(state::producer_name(session) == "42_0badcafe");
 }

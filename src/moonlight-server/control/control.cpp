@@ -165,9 +165,16 @@ void end_superseded_stream(const events::StreamSession &peer_session,
 void pause_stream(const state::SessionsAtoms &running_sessions,
                   const events::StreamSession &peer_session,
                   const std::shared_ptr<events::EventBusType> &event_bus) {
-  if (is_superseded_stream(*running_sessions->load(), peer_session)) {
+  // One snapshot for both checks, so a /resume landing between them can't turn a superseded stream into a pause
+  auto running = running_sessions->load();
+  if (is_superseded_stream(*running, peer_session)) {
     logs::log(logs::debug, "[ENET] Ending superseded stream of session: {}", peer_session.session_id);
     end_superseded_stream(peer_session, event_bus);
+    return;
+  }
+  if (!state::get_session_by_id(*running, peer_session.session_id)) {
+    // Already stopped. A /resume may be about to add a new stream under the same session_id: a pause would end it.
+    logs::log(logs::debug, "[ENET] Not pausing stopped stream of session: {}", peer_session.session_id);
     return;
   }
   event_bus->fire_event(immer::box<PauseStreamEvent>(PauseStreamEvent{.session_id = peer_session.session_id}));

@@ -56,7 +56,7 @@ void leave_lobby(const std::shared_ptr<events::EventBusType> &ev_bus,
   // Switch audio/video gstreamer stream producers
   ev_bus->fire_event(immer::box<events::SwitchStreamProducerEvents>{
       events::SwitchStreamProducerEvents{.session_id = session.session_id,
-                                         .interpipe_src_id = std::to_string(session.session_id)}});
+                                         .interpipe_src_id = state::producer_name(session)}});
 
   if (lobby.stop_when_everyone_leaves && lobby.connected_sessions->load()->size() == 0) {
     // Nobody left in the lobby, and it's set to stop when everyone leaves
@@ -96,6 +96,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
 
           std::thread([lobby, lobby_settings, ev_bus, on_ready, gst_context = app_state->gst_context]() {
             streaming::start_video_producer(lobby->id,
+                                            lobby->id,
                                             lobby_settings->video_settings.video_producer_buffer_caps,
                                             lobby_settings->video_settings.wayland_render_node,
                                             {.width = lobby_settings->video_settings.width,
@@ -181,6 +182,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
             std::thread([lobby, audio_server = audio_server->server, ev_bus, channel_count]() {
               auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, lobby->id);
               streaming::start_audio_producer(lobby->id,
+                                              lobby->id,
                                               ev_bus,
                                               channel_count,
                                               sink_name,
