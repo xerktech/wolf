@@ -1,4 +1,5 @@
 #include <api/api.hpp>
+#include <helpers/utils.hpp>
 
 namespace wolf::api {
 
@@ -438,7 +439,12 @@ void UnixSocketServer::start_connection(std::shared_ptr<UnixSocket> socket) {
 
         // Get the body payload
         if (req.headers.contains("Content-Length")) {
-          auto content_length = std::stoul(req.headers.find("Content-Length")->second);
+          auto parsed_content_length = utils::to_size_t(req.headers.find("Content-Length")->second);
+          if (!parsed_content_length) {
+            send_http(socket, 400, "Invalid Content-Length");
+            return;
+          }
+          auto content_length = *parsed_content_length;
           std::size_t num_additional_bytes = request_buf->size() - bytes_transferred;
           if (content_length > request_buf->max_size()) {
             send_http(socket, 413, "Payload Too Large");

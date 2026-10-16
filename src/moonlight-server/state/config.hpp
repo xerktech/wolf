@@ -7,6 +7,7 @@
 #include <events/events.hpp>
 #include <functional>
 #include <helpers/logger.hpp>
+#include <helpers/utils.hpp>
 #include <runners/docker.hpp>
 #include <runners/process.hpp>
 #include <state/data-structures.hpp>
@@ -80,14 +81,16 @@ inline std::size_t get_client_id(const PairedClient &current_client) {
  * Returns the first PairedClient with the given client_id
  */
 inline std::optional<PairedClient> get_client_by_id(const Config &cfg, const std::string &client_id) {
+  auto client_id_num = utils::to_size_t(client_id);
+  if (!client_id_num) {
+    return std::nullopt;
+  }
   auto paired_clients = cfg.paired_clients->load();
-  auto client_id_num = std::stoull(client_id);
 
   auto search_result = std::find_if(paired_clients->begin(),
                                     paired_clients->end(),
-                                    [client_id_num](const immer::box<PairedClient> &pair_client) -> bool {
-                                      auto id = get_client_id(*pair_client);
-                                      return id == client_id_num;
+                                    [id = *client_id_num](const immer::box<PairedClient> &pair_client) -> bool {
+                                      return get_client_id(*pair_client) == id;
                                     });
 
   if (search_result != paired_clients->end()) {
