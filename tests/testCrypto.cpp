@@ -105,6 +105,10 @@ TEST_CASE("AES gcm", "[Crypto]") {
 
   auto [encrypted2, tag2] = crypto::aes_encrypt_gcm(msg, key, iv, (int)iv.size(), false);
   REQUIRE(crypto::aes_decrypt_gcm(encrypted2, key, tag2, iv, iv.size(), false) == msg);
+
+  // OpenSSL would read 16 bytes from a shorter tag
+  REQUIRE_THROWS_AS(crypto::aes_decrypt_gcm(encrypted2, key, tag2.substr(0, 8), iv, iv.size(), false),
+                    std::runtime_error);
 }
 
 TEST_CASE("AES cbc", "[Crypto]") {
