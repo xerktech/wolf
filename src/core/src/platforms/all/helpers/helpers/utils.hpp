@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <boost/endian.hpp>
 #include <boost/json.hpp>
+#include <charconv>
 #include <helpers/logger.hpp>
 #include <optional>
 #include <range/v3/view.hpp>
@@ -55,6 +56,20 @@ inline std::vector<std::string_view> split(std::string_view str, char separator)
  */
 inline std::string to_string(std::string_view str) {
   return {str.begin(), str.end()};
+}
+
+/**
+ * Parses the whole string as an unsigned decimal number (e.g. a client or session ID).
+ * Unlike std::stoull this never throws: empty, non-numeric, signed, partially numeric or out of range
+ * input returns std::nullopt.
+ */
+inline std::optional<std::size_t> to_size_t(std::string_view str) noexcept {
+  std::size_t value = 0;
+  auto [end, ec] = std::from_chars(str.data(), str.data() + str.size(), value);
+  if (ec != std::errc{} || end != str.data() + str.size()) {
+    return std::nullopt;
+  }
+  return value;
 }
 
 inline const char *get_env(const char *tag, const char *def = nullptr) noexcept {
