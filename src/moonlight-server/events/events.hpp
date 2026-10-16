@@ -461,6 +461,13 @@ struct StreamSession {
   std::size_t session_id;
   std::string ip;
 
+  /**
+   * Names this stream's interpipe producers (`<producer_name>_video` / `_audio`); see state::producer_name.
+   * The session_id repeats across /resume, and a new stream added right after the old one's stop would otherwise
+   * reuse the old producers' names while they are still shutting down. A resume of the same stream keeps it.
+   */
+  std::string producer_name;
+
   unsigned short video_stream_port;
   unsigned short audio_stream_port;
   unsigned short control_stream_port;

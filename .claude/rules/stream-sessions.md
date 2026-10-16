@@ -24,11 +24,21 @@ paths:
   - A stop's runner exits milliseconds after the stop, often after a /resume re-added the
     session_id. The runner-exit path fires `StopStreamEvent` only while its own instance is the
     running one (`state::is_running_instance`), else `EndSupersededStreamEvent` (XERK-1964).
+  - A dead peer that times out after its stream was stopped (none listed under its id) fires
+    nothing: a /resume may be about to add a stream under the same id.
+- Interpipe nodes are global, so producers are named by `StreamSession::producer_name`
+  (`state::producer_name`), not the session_id: a stream added ~15 ms after the old one's stop
+  would otherwise attach to, and collide with, its still-dying producers (no video, then segfaults).
+  - It is random per `create_stream_session`; Moonlight's own /resume keeps the producers
+    (wayland display) running, so it carries the name over.
+  - Consumers get it from the running session; `listen_to_producer` rewrites the configured
+    `listen-to=<session_id>_<kind>` before the pipeline plays. Lobby leave switches back to it.
 - `PauseStreamEvent` is also broadcast on the API event stream; external tools (fenrir) read it as
   "this client's stream paused". Don't overload it with per-instance semantics.
 - Tests: `tests/testControl.cpp` — "control: a dead client's late pause doesn't end its resumed
   stream" (real ENet), "streaming: a superseded stream instance ends only its own pipelines".
   - "sessions: a stopped or replaced stream instance is no longer the running one".
+  - "streaming: a stream listens to its own instance's producers".
   - The ENet test client must keep servicing its host after connect, or the server never sees the
     CONNECT (the handshake ack is sent on the next service call).
 - `StreamSession::stream_state` backs the `state` field of `GET /api/v1/sessions`, so a client that

@@ -567,16 +567,16 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a stuck pipeline doesn't block
   auto event_bus = std::make_shared<events::EventBusType>();
   auto video_ctx = std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>();
   auto paused_video = std::async(std::launch::async, [=]() {
-    streaming::start_streaming_video(video_session(1), event_bus, "127.0.0.1", 1, video_ctx, nullptr);
+    streaming::start_streaming_video(video_session(1), "", event_bus, "127.0.0.1", 1, video_ctx, nullptr);
   });
   auto stopped_video = std::async(std::launch::async, [=]() {
-    streaming::start_streaming_video(video_session(2), event_bus, "127.0.0.1", 1, video_ctx, nullptr);
+    streaming::start_streaming_video(video_session(2), "", event_bus, "127.0.0.1", 1, video_ctx, nullptr);
   });
   auto stopped_audio = std::async(std::launch::async, [=]() {
-    streaming::start_streaming_audio(audio_session(3), event_bus, "127.0.0.1", 1, nullptr, "sink", "server");
+    streaming::start_streaming_audio(audio_session(3), "", event_bus, "127.0.0.1", 1, nullptr, "sink", "server");
   });
   auto paused_audio = std::async(std::launch::async, [=]() {
-    streaming::start_streaming_audio(audio_session(4), event_bus, "127.0.0.1", 1, nullptr, "sink", "server");
+    streaming::start_streaming_audio(audio_session(4), "", event_bus, "127.0.0.1", 1, nullptr, "sink", "server");
   });
   // All four are now ~1s into a 3s stuck buffer
   std::this_thread::sleep_for(4s);

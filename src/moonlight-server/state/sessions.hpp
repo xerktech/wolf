@@ -116,8 +116,16 @@ inline std::shared_ptr<events::StreamSession> create_stream_session(immer::box<s
       .video_stream_port = static_cast<unsigned short>(get_port(VIDEO_PING_PORT)),
       .audio_stream_port = static_cast<unsigned short>(get_port(AUDIO_PING_PORT)),
       .control_stream_port = static_cast<unsigned short>(get_port(CONTROL_PORT))};
+  session.producer_name = fmt::format("{}_{:08x}", session.session_id, uints(generator));
 
   return std::make_shared<events::StreamSession>(session);
+}
+
+/**
+ * The name of `session`'s interpipe producers: its own producer_name, or (for a session built without one) its id.
+ */
+inline std::string producer_name(const events::StreamSession &session) {
+  return session.producer_name.empty() ? std::to_string(session.session_id) : session.producer_name;
 }
 
 /**

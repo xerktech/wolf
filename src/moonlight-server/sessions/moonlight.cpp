@@ -132,6 +132,15 @@ setup_stream_pipeline_handlers(const std::shared_ptr<events::EventBusType> &ev_b
   return handlers.persistent();
 }
 
+/**
+ * The producers a stream's pipelines listen to: those of the session running under its id ("" if none, leaving the
+ * pipeline's configured listen-to).
+ */
+static std::string running_producer_name(const state::SessionsAtoms &running_sessions, std::size_t session_id) {
+  auto session = state::get_session_by_id(*running_sessions->load(), session_id);
+  return session ? state::producer_name(*session) : "";
+}
+
 immer::vector<immer::box<events::EventBusHandlers>>
 setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                          const std::string &runtime_dir,
@@ -189,6 +198,7 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
           // Start Gstreamer producer pipeline
           std::thread([session, on_ready, gst_context = app_state->gst_context]() {
             streaming::start_video_producer(std::to_string(session->session_id),
+                                            state::producer_name(*session),
                                             session->app->video_producer_buffer_caps,
                                             session->app->render_node,
                                             {.width = session->display_mode.width,
@@ -240,6 +250,7 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
           std::thread([session, audio_server = audio_server->server]() {
             auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, session->session_id);
             streaming::start_audio_producer(std::to_string(session->session_id),
+                                            state::producer_name(*session),
                                             session->event_bus,
                                             session->audio_channel_count,
                                             sink_name,
@@ -340,10 +351,12 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
       app_state->running_sessions,
       StreamPipelines{
           .video =
-              [ev_bus = app_state->event_bus, gst_context = app_state->gst_context](
-                  const immer::box<events::VideoSession> &sess,
-                  const immer::box<events::RTPVideoPingEvent> &ping_ev) {
+              [ev_bus = app_state->event_bus,
+               gst_context = app_state->gst_context,
+               running_sessions = app_state->running_sessions](const immer::box<events::VideoSession> &sess,
+                                                               const immer::box<events::RTPVideoPingEvent> &ping_ev) {
                 streaming::start_streaming_video(sess,
+                                                 running_producer_name(running_sessions, sess->session_id),
                                                  ev_bus,
                                                  ping_ev->client_ip,
                                                  ping_ev->client_port,
@@ -351,13 +364,15 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                                                  ping_ev->video_socket.get());
               },
           .audio =
-              [ev_bus = app_state->event_bus, audio_server](const immer::box<events::AudioSession> &sess,
-                                                            const immer::box<events::RTPAudioPingEvent> &ping_ev) {
+              [ev_bus = app_state->event_bus, audio_server, running_sessions = app_state->running_sessions](
+                  const immer::box<events::AudioSession> &sess,
+                  const immer::box<events::RTPAudioPingEvent> &ping_ev) {
                 auto audio_server_name = audio_server ? audio::get_server_name(audio_server->server)
                                                       : std::optional<std::string>();
                 auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, sess->session_id);
                 auto server_name = audio_server_name ? audio_server_name.value() : "";
                 streaming::start_streaming_audio(sess,
+                                                 running_producer_name(running_sessions, sess->session_id),
                                                  ev_bus,
                                                  ping_ev->client_ip,
                                                  ping_ev->client_port,
