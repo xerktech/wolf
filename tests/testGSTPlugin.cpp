@@ -85,6 +85,9 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Encrypt GstBuffer", "[GSTPlugin]") {
   auto iv_str = derive_iv(aes_iv, cur_seq_number);
 
   REQUIRE_THAT(iv_str, Equals("\000\274aN\000\000\000\000\000\000\000\000\000\000\000\000"s));
+  // Negative rikeyids (Moonlight sends a signed int) wrap like std::stoul did; garbage must not throw
+  REQUIRE_THAT(derive_iv("-1", 0), Equals("\377\377\377\377\000\000\000\000\000\000\000\000\000\000\000\000"s));
+  REQUIRE_NOTHROW(derive_iv("abc", 0));
 
   auto encrypted = encrypt_payload(aes_key, iv_str, payload);
   auto encrypted_str = get_str_from_buf(encrypted);

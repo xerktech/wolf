@@ -2,6 +2,7 @@
 
 #include <array>
 #include <boost/endian/conversion.hpp>
+#include <charconv>
 #include <crypto/crypto.hpp>
 #include <cstdint>
 #include <gst/base/gstbasetransform.h>
@@ -110,7 +111,11 @@ static void gst_copy_timestamps(GstBuffer *src, GstBuffer *dest) {
  */
 static std::string derive_iv(const std::string &aes_iv, int cur_seq_number) {
   auto iv = std::array<std::uint8_t, 16>{};
-  std::uint32_t input_iv = std::stoul(aes_iv);
+  // Runs on a GStreamer streaming thread, where a throw would abort Wolf: parse without exceptions.
+  // Only the low 32 bits matter and the value may be negative (Moonlight sends rikeyid as a signed int).
+  std::int64_t parsed_iv = 0;
+  std::from_chars(aes_iv.data(), aes_iv.data() + aes_iv.size(), parsed_iv);
+  auto input_iv = static_cast<std::uint32_t>(parsed_iv);
   *(std::uint32_t *)iv.data() = boost::endian::native_to_big(input_iv + cur_seq_number);
   return {iv.begin(), iv.end()};
 }
