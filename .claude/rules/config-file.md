@@ -23,7 +23,8 @@ paths:
   - The temp file is unlinked and opened `O_EXCL | O_NOFOLLOW`: a planted symlink or FIFO at
     `<config>.tmp` must not be followed.
 - A failed save is logged, not thrown: an exception from an API handler terminates Wolf.
-- Tests: `tests/testMoonlight.cpp` "LocalState concurrent updates".
+- Tests: `tests/testMoonlight.cpp` "LocalState concurrent updates" (lost updates, mode, planted
+  temp symlink/FIFO).
 
 # Running wolf locally to drive the API
 

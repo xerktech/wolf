@@ -11,11 +11,13 @@ using Catch::Matchers::Equals;
 
 #include <crypto/crypto.hpp>
 #include <filesystem>
+#include <fstream>
 #include <moonlight/protocol.hpp>
 #include <range/v3/view.hpp>
 #include <rest/helpers.hpp>
 #include <state/config.hpp>
 #include <streaming/streaming.hpp>
+#include <sys/stat.h>
 #include <thread>
 
 using namespace moonlight;
@@ -218,6 +220,21 @@ TEST_CASE("LocalState concurrent updates", "[LocalState]") {
   REQUIRE((std::filesystem::status(cfg_file).permissions() & std::filesystem::perms::all) ==
           (std::filesystem::perms::owner_read | std::filesystem::perms::owner_write));
   REQUIRE(!std::filesystem::exists(cfg_file + ".tmp"));
+
+  // A symlink or FIFO planted at the temp path must be neither followed nor blocked on
+  const std::string victim = "config.test.VICTIM";
+  { std::ofstream(victim) << "untouched"; }
+  std::filesystem::create_symlink(victim, cfg_file + ".tmp");
+  state::pair(cfg, {.client_cert = "planted-symlink"});
+  REQUIRE(std::filesystem::is_regular_file(std::filesystem::symlink_status(cfg_file)));
+  REQUIRE(std::filesystem::file_size(victim) == std::string("untouched").size());
+  std::filesystem::remove(victim);
+
+  REQUIRE(::mkfifo((cfg_file + ".tmp").c_str(), 0600) == 0);
+  state::pair(cfg, {.client_cert = "planted-fifo"});
+  REQUIRE(state::load_or_default(cfg_file, event_bus, running_sessions).paired_clients->load()->size() ==
+          initial_clients + n_threads + 2);
+  REQUIRE(!std::filesystem::exists(std::filesystem::symlink_status(cfg_file + ".tmp")));
   std::filesystem::remove(cfg_file);
 }
 
