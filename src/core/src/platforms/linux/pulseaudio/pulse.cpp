@@ -210,21 +210,27 @@ std::shared_ptr<VSink> create_virtual_sink(const std::shared_ptr<Server> &server
                                     device.sink_name,
                                     device.mode.channels,
                                     fmt::join(device.mode.speakers, ","));
+    auto vsink_ref = new std::shared_ptr<VSink>(vsink); // released by the callback below
     auto operation = pa_context_load_module(
         server->ctx,
         "module-null-sink",
         channel_spec.c_str(),
         [](pa_context *c, uint32_t idx, void *data) {
-          auto result = (VSink *)data;
+          // Owns a reference: delete_virtual_sink() no longer waits for this callback, so the session may already
+          // have dropped its last reference to the VSink by the time PulseAudio replies.
+          std::unique_ptr<std::shared_ptr<VSink>> result((std::shared_ptr<VSink> *)data);
           logs::log(logs::debug, "[PULSE] Created virtual sink: {}", idx);
-          result->sink_idx.set_value(idx);
-          if (result->unload_on_load) { // delete_virtual_sink() ran before the module was loaded
+          (*result)->sink_idx.set_value(idx);
+          if ((*result)->unload_on_load) { // delete_virtual_sink() ran before the module was loaded
             unload_sink(c, idx);
           }
         },
-        vsink.get());
+        vsink_ref);
     if (operation) {
       pa_operation_unref(operation);
+    } else { // The callback will never run
+      logs::log(logs::warning, "[PULSE] Unable to create virtual sink: {}", pa_strerror(pa_context_errno(server->ctx)));
+      delete vsink_ref;
     }
   });
 
