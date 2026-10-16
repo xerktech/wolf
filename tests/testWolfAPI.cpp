@@ -833,7 +833,7 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
                    "http://localhost/api/v1/clients/settings",
                    rfl::json::write(UpdateClientSettingsRequest{.client_id = bad_id}));
     REQUIRE(response);
-    REQUIRE(response->first == 404);
+    REQUIRE(response->first == 400);
 
     response = req(curl.get(),
                    HTTPMethod::POST,
