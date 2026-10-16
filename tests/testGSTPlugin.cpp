@@ -6,6 +6,11 @@
 
 using Catch::Matchers::Equals;
 
+#include <atomic>
+#include <chrono>
+#include <core/gstreamer.hpp>
+#include <events/events.hpp>
+#include <future>
 #include <gst-plugin/audio.hpp>
 #include <gst-plugin/video.hpp>
 #include <moonlight/fec.hpp>
@@ -526,4 +531,65 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Audio RTP without encryption", "[GSTPlu
     auto rtp_payload = gst_buffer_copy_content(first_pkt, sizeof(audio::AudioRTPHeaders));
     REQUIRE_THAT(std::string(rtp_payload.begin(), rtp_payload.end()), Equals(payload_str));
   }
+}
+
+/*
+ * A stuck pipeline must not hold the event bus.
+ * The bus calls handlers under its lock; if the stop handler blocked on the stuck streaming thread,
+ * every later register/unregister (e.g. starting a new runner) would hang the whole server.
+ */
+TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a stuck pipeline doesn't block the event bus", "[GSTPlugin]") {
+  auto pipeline =
+      gst_parse_launch("videotestsrc ! identity name=stuck signal-handoffs=true ! fakesink async=false", nullptr);
+  REQUIRE(pipeline);
+
+  // Park the streaming thread inside identity's handoff, holding the source's stream lock
+  struct Stuck {
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::shared_future<void> released = release.get_future().share();
+    std::atomic_bool first = true;
+  } stuck;
+  auto identity = gst_bin_get_by_name(GST_BIN(pipeline), "stuck");
+  g_signal_connect(identity,
+                   "handoff",
+                   G_CALLBACK(+[](GstElement *, GstBuffer *, Stuck *stuck) {
+                     if (stuck->first.exchange(false)) {
+                       stuck->entered.set_value();
+                     }
+                     stuck->released.wait();
+                   }),
+                   &stuck);
+  gst_object_unref(identity);
+  gst_element_set_state(pipeline, GST_STATE_PLAYING);
+  REQUIRE(stuck.entered.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+
+  auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
+  auto stop_handler = event_bus->register_handler<immer::box<wolf::core::events::StopStreamEvent>>(
+      [pipeline](const immer::box<wolf::core::events::StopStreamEvent> &) {
+        wolf::core::gstreamer::send_eos_async(pipeline);
+      });
+
+  auto fired = std::async(std::launch::async, [event_bus]() {
+    event_bus->fire_event(
+        immer::box<wolf::core::events::StopStreamEvent>(wolf::core::events::StopStreamEvent{.session_id = 1}));
+    // Needs the bus write lock, like a runner (un)registering its handlers
+    auto other = event_bus->register_handler<immer::box<wolf::core::events::StopStreamEvent>>([]() {});
+  });
+  auto fire_status = fired.wait_for(std::chrono::seconds(5));
+
+  // Unstick the pipeline before asserting, so a failure doesn't leave the test hanging
+  stuck.release.set_value();
+  REQUIRE(fire_status == std::future_status::ready);
+
+  // The EOS still reaches the pipeline once the streaming thread moves on
+  auto bus = gst_element_get_bus(pipeline);
+  auto msg = gst_bus_timed_pop_filtered(bus, 5 * GST_SECOND, GST_MESSAGE_EOS);
+  REQUIRE(msg);
+  gst_message_unref(msg);
+  gst_object_unref(bus);
+
+  stop_handler.unregister();
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  gst_object_unref(pipeline);
 }
