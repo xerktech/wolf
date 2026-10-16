@@ -706,7 +706,13 @@ TEST_CASE("Launch rejects malformed client parameters", "[HTTP]") {
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920"}}));  // used to index past the split
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "axbxc"}})); // used to throw std::invalid_argument
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "99999999999x1x1"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080x"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080x60x1"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080x60fps"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "-1920x1080x60"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"surroundAudioInfo", "abc"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"surroundAudioInfo", "196610junk"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "abc"}}));
   REQUIRE_FALSE(launch({})); // missing rikeyid
 }

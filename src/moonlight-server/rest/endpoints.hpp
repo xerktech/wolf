@@ -1,5 +1,6 @@
 #pragma once
 
+#include <charconv>
 #include <control/control.hpp>
 #include <crypto/crypto.hpp>
 #include <curl/curl.h>
@@ -457,7 +458,13 @@ void launch(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
   log_req<SimpleWeb::HTTPS>(request);
 
   SimpleWeb::CaseInsensitiveMultimap headers = request->parse_query_string();
-  auto app = state::get_moonlight_app_by_id(state->config, get_header(headers, "appid").value());
+  auto app_id = get_header(headers, "appid");
+  if (!app_id) {
+    logs::log(logs::warning, "[HTTP] Wrong request, missing app_id");
+    server_error<SimpleWeb::HTTPS>(response);
+    return;
+  }
+  auto app = state::get_moonlight_app_by_id(state->config, app_id.value());
   if (!app) {
     logs::log(logs::warning, "[HTTP] Requested wrong app_id: not found");
     server_error<SimpleWeb::HTTPS>(response);
