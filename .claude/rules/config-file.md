@@ -11,10 +11,15 @@ paths:
   - Every load-modify-save of the file goes through `update_config_file` under `config_file_mutex`.
   - Never call `rfl::toml::save` directly: it truncates in place, so a concurrent load reads a
     torn or empty file.
-- `update_profiles` takes a function of the current profiles, run under that mutex.
-  - Endpoints must build the new list from the argument, never from a `profiles->load()` taken
-    earlier, or concurrent requests overwrite each other's changes.
+- `update_profiles` / `update_client_settings` take a function of the current value, run under
+  that mutex.
+  - Endpoints must build the new value from the argument, never from a snapshot taken earlier,
+    or concurrent requests overwrite each other's changes.
+- The atomic replace copies the file's mode and owner onto the temp file and falls back to an
+  in-place rewrite when it can't (unwritable dir, bind-mounted file, foreign owner): don't drop
+  either, config.toml holds paired-client certs.
 - A failed save is logged, not thrown: an exception from an API handler terminates Wolf.
+- Tests: `tests/testMoonlight.cpp` "LocalState concurrent updates".
 
 # Running wolf locally to drive the API
 

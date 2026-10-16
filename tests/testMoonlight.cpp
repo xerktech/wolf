@@ -10,11 +10,13 @@
 using Catch::Matchers::Equals;
 
 #include <crypto/crypto.hpp>
+#include <filesystem>
 #include <moonlight/protocol.hpp>
 #include <range/v3/view.hpp>
 #include <rest/helpers.hpp>
 #include <state/config.hpp>
 #include <streaming/streaming.hpp>
+#include <thread>
 
 using namespace moonlight;
 using namespace state;
@@ -139,6 +141,55 @@ TEST_CASE("LocalState pairing information", "[LocalState]") {
     state::unpair(cfg, {another_cert});
     REQUIRE_THAT(cfg.paired_clients->load().get(), Catch::Matchers::SizeIs(0));
   }
+}
+
+TEST_CASE("LocalState concurrent updates", "[LocalState]") {
+  // The API applies config updates from a thread pool; none of them may be lost or tear the file (XERK-1962)
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  const std::string cfg_file = "config.test.CONCURRENT.toml";
+  std::filesystem::copy_file("config.test.toml", cfg_file, std::filesystem::copy_options::overwrite_existing);
+  std::filesystem::permissions(cfg_file, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+  auto cfg = state::load_or_default(cfg_file, event_bus, running_sessions);
+  auto initial_profiles = cfg.profiles->load()->size();
+  auto initial_clients = cfg.paired_clients->load()->size();
+
+  constexpr int n_threads = 16;
+  std::vector<std::thread> threads;
+  for (int i = 0; i < n_threads; i++) {
+    threads.emplace_back([&cfg, i]() {
+      state::update_profiles(cfg, [i](const state::ProfilesList &profiles) {
+        return profiles.push_back(
+            events::Profile{.id = "concurrent-" + std::to_string(i),
+                            .name = "Concurrent " + std::to_string(i),
+                            .apps = std::make_shared<immer::atom<immer::vector<immer::box<events::App>>>>()});
+      });
+      state::pair(cfg, {.client_cert = "concurrent-cert-" + std::to_string(i)});
+    });
+  }
+  for (auto &t : threads) {
+    t.join();
+  }
+
+  REQUIRE(cfg.profiles->load()->size() == initial_profiles + n_threads);
+  REQUIRE(cfg.paired_clients->load()->size() == initial_clients + n_threads);
+
+  auto reloaded = state::load_or_default(cfg_file, event_bus, running_sessions);
+  REQUIRE(reloaded.profiles->load()->size() == initial_profiles + n_threads);
+  REQUIRE(reloaded.paired_clients->load()->size() == initial_clients + n_threads);
+  auto reloaded_clients = reloaded.paired_clients->load();
+  for (int i = 0; i < n_threads; i++) {
+    auto cert = "concurrent-cert-" + std::to_string(i);
+    REQUIRE(std::any_of(reloaded_clients->begin(), reloaded_clients->end(), [&cert](const auto &client) {
+      return client->client_cert == cert;
+    }));
+  }
+
+  // Replacing the file must keep its permissions and leave no temp file behind
+  REQUIRE((std::filesystem::status(cfg_file).permissions() & std::filesystem::perms::all) ==
+          (std::filesystem::perms::owner_read | std::filesystem::perms::owner_write));
+  REQUIRE(!std::filesystem::exists(cfg_file + ".tmp"));
+  std::filesystem::remove(cfg_file);
 }
 
 TEST_CASE("Mocked serverinfo", "[MoonlightProtocol]") {

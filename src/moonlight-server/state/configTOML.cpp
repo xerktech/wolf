@@ -1,7 +1,9 @@
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <events/events.hpp>
 #include <events/reflectors.hpp>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <gst/gstelementfactory.h>
@@ -12,6 +14,8 @@
 #include <rfl/json.hpp>
 #include <rfl/toml.hpp>
 #include <state/config.hpp>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace state {
 
@@ -428,10 +432,54 @@ Config load_or_default(const std::string &source,
 static std::mutex config_file_mutex;
 
 /**
- * Writes the new contents to a temp file next to the config and renames it over the original, so a reader never
- * sees a partial file and a failed write leaves the old one intact.
- * The rename is done on the resolved path so that a symlinked config keeps its link; when it fails
- * (e.g. the config is a single bind-mounted file) the file is rewritten in place instead.
+ * Writes all of content to fd, returns false on any error
+ */
+static bool write_all(int fd, const std::string &content) {
+  std::size_t written = 0;
+  while (written < content.size()) {
+    auto n = ::write(fd, content.data() + written, content.size() - written);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    written += static_cast<std::size_t>(n);
+  }
+  return true;
+}
+
+/**
+ * Writes content to a temp file next to target, with target's mode and owner, and renames it over target.
+ * Returns false (leaving target untouched) when any step fails, including when the owner can't be kept.
+ */
+static bool replace_atomically(const std::filesystem::path &target, const std::string &content) {
+  struct stat st {};
+  if (::stat(target.c_str(), &st) != 0) {
+    return false;
+  }
+  auto tmp = target;
+  tmp += ".tmp";
+  int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, st.st_mode & 07777);
+  if (fd < 0) {
+    return false;
+  }
+  // fchmod because open() applies the umask; fchown fails when we may not give the file its owner back
+  bool ok = ::fchmod(fd, st.st_mode & 07777) == 0 && ::fchown(fd, st.st_uid, st.st_gid) == 0 &&
+            write_all(fd, content) && ::fsync(fd) == 0;
+  ok = (::close(fd) == 0) && ok;
+  if (ok && ::rename(tmp.c_str(), target.c_str()) == 0) {
+    return true;
+  }
+  ::unlink(tmp.c_str());
+  return false;
+}
+
+/**
+ * Saves content to the config file without a reader ever seeing a partial file: it is written to a temp file and
+ * renamed over the original (on the resolved path, so a symlinked config keeps its link).
+ * When that isn't possible (the directory isn't writable, the config is a single bind-mounted file, or the file's
+ * owner couldn't be kept) the file is rewritten in place instead.
  */
 static void write_config_file(const std::string &source, const std::string &content) {
   std::error_code ec;
@@ -439,30 +487,15 @@ static void write_config_file(const std::string &source, const std::string &cont
   if (ec) {
     target = source;
   }
-  auto tmp = target;
-  tmp += ".tmp";
-  {
-    std::ofstream out(tmp, std::ios::trunc);
-    out << content;
-    out.close();
-    if (!out) {
-      std::filesystem::remove(tmp, ec);
-      throw std::runtime_error(fmt::format("Unable to write {}", tmp.string()));
-    }
+  if (replace_atomically(target, content)) {
+    return;
   }
-  std::filesystem::rename(tmp, target, ec);
-  if (ec) {
-    logs::log(logs::warning,
-              "Unable to replace {} atomically ({}), rewriting it in place",
-              target.string(),
-              ec.message());
-    std::filesystem::remove(tmp, ec);
-    std::ofstream out(target, std::ios::trunc);
-    out << content;
-    out.close();
-    if (!out) {
-      throw std::runtime_error(fmt::format("Unable to write {}", target.string()));
-    }
+  logs::log(logs::debug, "Unable to replace {} atomically, rewriting it in place", target.string());
+  std::ofstream out(target, std::ios::trunc);
+  out << content;
+  out.close();
+  if (!out) {
+    throw std::runtime_error(fmt::format("Unable to write {}", target.string()));
   }
 }
 
@@ -518,7 +551,19 @@ void unpair(const Config &cfg, const PairedClient &client) {
   });
 }
 
-void update_client_settings(const Config &cfg, std::size_t client_id, const PairedClient &updated_client) {
+bool update_client_settings(const Config &cfg,
+                            std::size_t client_id,
+                            const std::function<PairedClient(const PairedClient &)> &update_fn) {
+  // Held from reading the current client to saving, so concurrent updates apply in turn
+  std::lock_guard lock(config_file_mutex);
+  auto paired_clients = cfg.paired_clients->load();
+  auto current = std::find_if(paired_clients->begin(), paired_clients->end(), [&](const auto &client) {
+    return get_client_id(*client) == client_id;
+  });
+  if (current == paired_clients->end()) {
+    return false;
+  }
+  auto updated_client = update_fn(**current);
 
   auto update_client_fn = [&](immer::box<PairedClient> client) -> immer::box<PairedClient> {
     if (get_client_id(client) == client_id) {
@@ -527,7 +572,6 @@ void update_client_settings(const Config &cfg, std::size_t client_id, const Pair
     return client;
   };
 
-  std::lock_guard lock(config_file_mutex);
   cfg.paired_clients->update([&](const PairedClientList &paired_clients) {
     return paired_clients |                             //
            ranges::views::transform(update_client_fn) | //
@@ -540,6 +584,7 @@ void update_client_settings(const Config &cfg, std::size_t client_id, const Pair
                          ranges::views::transform(update_client_fn) | //
                          ranges::to<std::vector<PairedClient>>();
   });
+  return true;
 }
 
 // Ignores the runners, see parse_app()
