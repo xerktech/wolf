@@ -132,15 +132,6 @@ setup_stream_pipeline_handlers(const std::shared_ptr<events::EventBusType> &ev_b
   return handlers.persistent();
 }
 
-/**
- * The producers a stream's pipelines listen to: those of the session running under its id ("" if none, leaving the
- * pipeline's configured listen-to).
- */
-static std::string running_producer_name(const state::SessionsAtoms &running_sessions, std::size_t session_id) {
-  auto session = state::get_session_by_id(*running_sessions->load(), session_id);
-  return session ? state::producer_name(*session) : "";
-}
-
 immer::vector<immer::box<events::EventBusHandlers>>
 setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                          const std::string &runtime_dir,
@@ -358,32 +349,41 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
           .video =
               [ev_bus = app_state->event_bus,
                gst_context = app_state->gst_context,
-               running_sessions = app_state->running_sessions](const immer::box<events::VideoSession> &sess,
-                                                               const immer::box<events::RTPVideoPingEvent> &ping_ev) {
-                streaming::start_streaming_video(sess,
-                                                 running_producer_name(running_sessions, sess->session_id),
-                                                 ev_bus,
-                                                 ping_ev->client_ip,
-                                                 ping_ev->client_port,
-                                                 gst_context,
-                                                 ping_ev->video_socket.get());
+               running_sessions = app_state->running_sessions,
+               lobbies = app_state->lobbies](const immer::box<events::VideoSession> &sess,
+                                             const immer::box<events::RTPVideoPingEvent> &ping_ev) {
+                streaming::start_streaming_video(
+                    sess,
+                    [=] {
+                      return state::stream_producer_name(*running_sessions->load(), *lobbies->load(), sess->session_id);
+                    },
+                    ev_bus,
+                    ping_ev->client_ip,
+                    ping_ev->client_port,
+                    gst_context,
+                    ping_ev->video_socket.get());
               },
           .audio =
-              [ev_bus = app_state->event_bus, audio_server, running_sessions = app_state->running_sessions](
-                  const immer::box<events::AudioSession> &sess,
-                  const immer::box<events::RTPAudioPingEvent> &ping_ev) {
+              [ev_bus = app_state->event_bus,
+               audio_server,
+               running_sessions = app_state->running_sessions,
+               lobbies = app_state->lobbies](const immer::box<events::AudioSession> &sess,
+                                             const immer::box<events::RTPAudioPingEvent> &ping_ev) {
                 auto audio_server_name = audio_server ? audio::get_server_name(audio_server->server)
                                                       : std::optional<std::string>();
                 auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, sess->session_id);
                 auto server_name = audio_server_name ? audio_server_name.value() : "";
-                streaming::start_streaming_audio(sess,
-                                                 running_producer_name(running_sessions, sess->session_id),
-                                                 ev_bus,
-                                                 ping_ev->client_ip,
-                                                 ping_ev->client_port,
-                                                 ping_ev->audio_socket.get(),
-                                                 sink_name,
-                                                 server_name);
+                streaming::start_streaming_audio(
+                    sess,
+                    [=] {
+                      return state::stream_producer_name(*running_sessions->load(), *lobbies->load(), sess->session_id);
+                    },
+                    ev_bus,
+                    ping_ev->client_ip,
+                    ping_ev->client_port,
+                    ping_ev->audio_socket.get(),
+                    sink_name,
+                    server_name);
               }});
   for (const auto &handler : pipeline_handlers) {
     handlers.push_back(handler);

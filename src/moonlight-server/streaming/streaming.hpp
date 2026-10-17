@@ -74,11 +74,24 @@ void listen_to_producer(GstElement *pipeline,
                         const std::string &kind);
 
 /**
- * `producer_name` is the interpipe producer the stream's configured interpipesrc should listen to in place of
- * `<session_id>_video` (see StreamSession::producer_name); empty keeps the configured listen-to.
+ * Points `pipeline`'s interpipesrc `consumer_name` at `producer_name()` (see listen_to_producer) and switches it on
+ * every SwitchStreamProducerEvents for `session_id` until the returned handler is dropped. `producer_name` is called
+ * only once the switch handler is registered, so a lobby join that happens meanwhile is not lost.
+ */
+events::EventBusHandlers follow_producer(const gstreamer::gst_element_ptr &pipeline,
+                                         const std::string &consumer_name,
+                                         std::size_t session_id,
+                                         const std::string &kind,
+                                         const std::function<std::string()> &producer_name,
+                                         const std::shared_ptr<events::EventBusType> &event_bus);
+
+/**
+ * `producer_name` returns the interpipe producer the stream's configured interpipesrc should listen to in place of
+ * `<session_id>_video`: the session's own (see StreamSession::producer_name) or the lobby it has joined; empty keeps
+ * the configured listen-to (see follow_producer).
  */
 void start_streaming_video(immer::box<events::VideoSession> video_session,
-                           const std::string &producer_name,
+                           const std::function<std::string()> &producer_name,
                            const std::shared_ptr<events::EventBusType> &event_bus,
                            std::string client_ip,
                            unsigned short client_port,
@@ -86,7 +99,7 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
                            std::shared_ptr<udp::socket> video_socket);
 
 void start_streaming_audio(immer::box<events::AudioSession> audio_session,
-                           const std::string &producer_name,
+                           const std::function<std::string()> &producer_name,
                            const std::shared_ptr<events::EventBusType> &event_bus,
                            std::string client_ip,
                            unsigned short client_port,

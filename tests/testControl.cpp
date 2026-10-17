@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 using Catch::Matchers::Equals;
@@ -6,6 +7,7 @@ using Catch::Matchers::Equals;
 #include <control/control.hpp>
 #include <control/input_handler.hpp>
 #include <cstring>
+#include <future>
 #include <moonlight/control.hpp>
 #include <mutex>
 #include <set>
@@ -415,13 +417,14 @@ TEST_CASE("streaming: a superseded stream instance ends only its own pipelines",
     video.rtp_secret_payload = rtp_secret(secret);
     auto ended = std::make_shared<std::atomic_bool>(false);
     std::thread([=, &io] {
-      streaming::start_streaming_video(video,
-                                       "",
-                                       event_bus,
-                                       "127.0.0.1",
-                                       9,
-                                       std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>(),
-                                       std::make_shared<boost::asio::ip::udp::socket>(io, boost::asio::ip::udp::v4()));
+      streaming::start_streaming_video(
+          video,
+          [] { return std::string(); },
+          event_bus,
+          "127.0.0.1",
+          9,
+          std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>(),
+          std::make_shared<boost::asio::ip::udp::socket>(io, boost::asio::ip::udp::v4()));
       *ended = true;
     }).detach();
     return ended;
@@ -431,14 +434,15 @@ TEST_CASE("streaming: a superseded stream instance ends only its own pipelines",
     audio.rtp_secret_payload = rtp_secret(secret);
     auto ended = std::make_shared<std::atomic_bool>(false);
     std::thread([=, &io] {
-      streaming::start_streaming_audio(audio,
-                                       "",
-                                       event_bus,
-                                       "127.0.0.1",
-                                       9,
-                                       std::make_shared<boost::asio::ip::udp::socket>(io, boost::asio::ip::udp::v4()),
-                                       "sink",
-                                       "");
+      streaming::start_streaming_audio(
+          audio,
+          [] { return std::string(); },
+          event_bus,
+          "127.0.0.1",
+          9,
+          std::make_shared<boost::asio::ip::udp::socket>(io, boost::asio::ip::udp::v4()),
+          "sink",
+          "");
       *ended = true;
     }).detach();
     return ended;
@@ -518,23 +522,25 @@ TEST_CASE("streaming: a resumed stream keeps receiving after the superseded one 
     audio.rtp_secret_payload = rtp_secret(secret);
     auto send_socket = std::make_shared<boost::asio::ip::udp::socket>(io, boost::asio::ip::udp::v4());
     std::thread([=] {
-      streaming::start_streaming_video(video,
-                                       "42_cafe",
-                                       event_bus,
-                                       "127.0.0.1",
-                                       video_client->local_endpoint().port(),
-                                       std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>(),
-                                       send_socket);
+      streaming::start_streaming_video(
+          video,
+          [] { return std::string("42_cafe"); },
+          event_bus,
+          "127.0.0.1",
+          video_client->local_endpoint().port(),
+          std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>(),
+          send_socket);
     }).detach();
     std::thread([=] {
-      streaming::start_streaming_audio(audio,
-                                       "42_cafe",
-                                       event_bus,
-                                       "127.0.0.1",
-                                       audio_client->local_endpoint().port(),
-                                       send_socket,
-                                       "sink",
-                                       "");
+      streaming::start_streaming_audio(
+          audio,
+          [] { return std::string("42_cafe"); },
+          event_bus,
+          "127.0.0.1",
+          audio_client->local_endpoint().port(),
+          send_socket,
+          "sink",
+          "");
     }).detach();
   };
   // The sizes of the datagrams that reach `socket` over the next 500 ms
@@ -689,6 +695,68 @@ TEST_CASE("streaming: a stream listens to its own instance's producers", "[GSTRE
   // A custom source, or no known producer, keeps the configured one
   REQUIRE(listen_to("some-lobby_video", "42_0badcafe") == "some-lobby_video");
   REQUIRE(listen_to("42_video", "") == "42_video");
+}
+
+TEST_CASE("streaming: a lobby join while a stream starts is not lost", "[GSTREAMER]") {
+  using namespace wolf::core;
+  std::string kind = GENERATE("video", "audio");
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto src_name = fmt::format("interpipesrc_42_{}", kind);
+  gstreamer::gst_element_ptr pipeline(
+      gst_parse_launch(fmt::format("interpipesrc name={} listen-to=42_{} ! fakesink", src_name, kind).c_str(), nullptr),
+      [](GstElement *el) { gst_object_unref(el); });
+  REQUIRE(pipeline);
+  auto listen_to = [&] {
+    auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), src_name.c_str());
+    gchar *value = nullptr;
+    g_object_get(src, "listen-to", &value, nullptr);
+    std::string result = value ? value : "";
+    g_free(value);
+    gst_object_unref(src);
+    return result;
+  };
+  auto switch_to = [&](const std::string &producer) {
+    event_bus->fire_event(immer::box<events::SwitchStreamProducerEvents>(
+        events::SwitchStreamProducerEvents{.session_id = 42, .interpipe_src_id = producer}));
+  };
+
+  std::future<void> join;
+  auto handler = streaming::follow_producer(
+      pipeline,
+      src_name,
+      42,
+      kind,
+      [&] {
+        // The join lands right after the stream read its producer: the switch it fires must reach this pipeline
+        join = std::async(std::launch::async, [&] { switch_to("some-lobby"); });
+        join.wait_for(200ms);
+        return std::string("42_0badcafe");
+      },
+      event_bus);
+  join.wait();
+  REQUIRE(listen_to() == "some-lobby_" + kind);
+
+  switch_to("42_0badcafe");
+  REQUIRE(listen_to() == "42_0badcafe_" + kind);
+}
+
+TEST_CASE("sessions: a stream whose session joined a lobby listens to the lobby's producers") {
+  using namespace wolf::core;
+  events::StreamSession session{.session_id = 42};
+  session.producer_name = "42_0badcafe";
+  immer::vector<events::StreamSession> sessions{session};
+  events::Lobby lobby{.id = "some-lobby"};
+  immer::vector<events::Lobby> lobbies{lobby};
+
+  REQUIRE(state::stream_producer_name(sessions, lobbies, 42) == "42_0badcafe");
+  REQUIRE(state::stream_producer_name(sessions, lobbies, 7) == "");
+
+  // Joined before the stream's pipelines start (e.g. during a /resume overlap): they must start on the lobby
+  lobby.connected_sessions->update([](auto ids) { return ids.push_back(immer::box<std::string>{"42"}); });
+  REQUIRE(state::stream_producer_name(sessions, lobbies, 42) == "some-lobby");
+
+  lobby.connected_sessions->store({});
+  REQUIRE(state::stream_producer_name(sessions, lobbies, 42) == "42_0badcafe");
 }
 
 TEST_CASE("streaming: each stream instance names its own consumer") {

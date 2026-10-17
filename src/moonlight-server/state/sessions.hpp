@@ -129,6 +129,20 @@ inline std::string producer_name(const events::StreamSession &session) {
 }
 
 /**
+ * The producers the stream of `session_id` listens to: those of the lobby it has joined, else those of the session
+ * running under its id ("" if none, leaving the pipeline's configured listen-to).
+ */
+inline std::string stream_producer_name(const immer::vector<events::StreamSession> &sessions,
+                                        const immer::vector<events::Lobby> &lobbies,
+                                        std::size_t session_id) {
+  if (auto lobby = get_lobby_by_connected_session(lobbies, std::to_string(session_id))) {
+    return lobby->id;
+  }
+  auto session = get_session_by_id(sessions, session_id);
+  return session ? producer_name(*session) : "";
+}
+
+/**
  * Whether stream instance `session` is the one running under its session_id.
  * False once a stop removed it, or a /resume replaced it with a new instance
  * under the same session_id (told apart, as in control.cpp, by the ENet secret).
