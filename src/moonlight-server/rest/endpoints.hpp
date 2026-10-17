@@ -269,7 +269,8 @@ void pair(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTP>::Res
     return;
   }
 
-  auto client_cache_it = state->pairing_cache->load()->find(cache_key);
+  auto pairing_cache = state->pairing_cache->load(); // find() points into this snapshot: keep it alive
+  auto client_cache_it = pairing_cache->find(cache_key);
   if (client_cache_it == nullptr) {
     send_xml<SimpleWeb::HTTP>(
         response,

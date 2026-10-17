@@ -30,7 +30,8 @@ void UnixSocketServer::endpoint_PendingPairRequest(const HTTPRequest &req, std::
 void UnixSocketServer::endpoint_Pair(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto event = rfl::json::read<PairRequest>(req.body);
   if (event) {
-    if (auto pair_request = state_->app_state->pairing_atom->load()->find(event.value().pair_secret)) {
+    auto pairing = state_->app_state->pairing_atom->load(); // find() points into this snapshot: keep it alive
+    if (auto pair_request = pairing->find(event.value().pair_secret)) {
       pair_request->get().user_pin->set_value(event.value().pin.value()); // Resolve the promise
       state_->app_state->pairing_atom->update(
           [pair_secret = event.value().pair_secret](auto pairing_map) { return pairing_map.erase(pair_secret); });
