@@ -68,7 +68,9 @@ static void shutdown_handler(int signum) {
     auto stack_file = backtrace_file_src();
     safe_dump_stacktrace_to(stack_file);
   }
-  exit(signum);
+  // _exit, not exit: exit() isn't async-signal-safe and runs atexit handlers/static destructors, which after a crash
+  // (often inside a driver) can crash again or deadlock on a lock the crashed thread holds, hanging until SIGKILL.
+  _exit(signum);
 }
 
 /**
