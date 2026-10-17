@@ -279,6 +279,41 @@ TEST_CASE("Wayland socket wait", "[Sessions]") {
   }
 }
 
+TEST_CASE("Encoder video_params fall back to the embedded default", "[LocalState]") {
+  constexpr char const *default_toml =
+#include <state/default/config.include.toml>
+      ;
+  auto embedded =
+      rfl::toml::read<wolf::config::WolfConfig, rfl::DefaultIfMissing>(default_toml).value().gstreamer.video;
+  auto params = [&](const GstEncoder &encoder, const GstVideoCfg &user_cfg, bool zero_copy) {
+    return state::encoder_video_params(encoder, user_cfg, embedded.h264_encoders, embedded.defaults, zero_copy);
+  };
+
+  // A config.toml generated before XERK-2026: x264 without params and no defaults.x264
+  auto old_x264 = GstEncoder{.plugin_name = "x264", .check_elements = {"x264enc"}, .encoder_pipeline = "x264enc"};
+  auto embedded_x264 = std::find_if(embedded.h264_encoders.begin(), embedded.h264_encoders.end(), [](const auto &e) {
+    return e.plugin_name == "x264";
+  });
+  REQUIRE(embedded_x264 != embedded.h264_encoders.end());
+  REQUIRE_THAT(params(old_x264, GstVideoCfg{}, false), Equals(embedded_x264->video_params.value()));
+  REQUIRE_THAT(params(old_x264, GstVideoCfg{}, true), Equals(embedded_x264->video_params_zero_copy.value()));
+
+  // The fallback also covers plugins whose params live in the embedded [gstreamer.video.defaults]
+  auto old_va = GstEncoder{.plugin_name = "va", .check_elements = {"vah264enc"}, .encoder_pipeline = "vah264enc"};
+  REQUIRE_THAT(params(old_va, GstVideoCfg{}, true), Equals(embedded.defaults.at("va").video_params_zero_copy));
+
+  // The user's own params always win, inline or via their defaults
+  auto custom = old_x264;
+  custom.video_params = "custom";
+  REQUIRE_THAT(params(custom, GstVideoCfg{}, false), Equals("custom"));
+  auto user_defaults = GstVideoCfg{.defaults = {{"x264", {.video_params = "mine", .video_params_zero_copy = "mine0"}}}};
+  REQUIRE_THAT(params(old_x264, user_defaults, true), Equals("mine0"));
+
+  // A plugin the embedded config doesn't know stays empty
+  auto unknown = GstEncoder{.plugin_name = "coreelements", .check_elements = {"identity"}};
+  REQUIRE(params(unknown, GstVideoCfg{}, false).empty());
+}
+
 TEST_CASE("Mocked serverinfo", "[MoonlightProtocol]") {
   auto event_bus = std::make_shared<events::EventBusType>();
   auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();

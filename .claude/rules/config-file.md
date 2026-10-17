@@ -37,6 +37,10 @@ paths:
   - Tests: `tests/testMoonlight.cpp` "Default config: every encoder has video_params".
 - Only `config_version <= 6` is migrated on load: a fix to the defaults never reaches an existing
   v7 config.toml without a version bump.
+  - Exception: an encoder whose params resolve to "" falls back at load to the same `plugin_name`
+    in the embedded default (`encoder_video_params`, XERK-2043), so pre-XERK-2026 v7 configs
+    stream. Keep the default's encoders complete; that's what the fallback serves.
+  - Tests: `tests/testMoonlight.cpp` "Encoder video_params fall back to the embedded default".
 
 # Running wolf locally to drive the API
 
