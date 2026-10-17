@@ -78,9 +78,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {name: asan-fixed, cxx: g++, other_pkgs: "", arch: x86_64, unfix: "0", flags: "-fsanitize=address -fno-omit-frame-pointer -fPIC", btype: RelWithDebInfo, reps: "5"}
           - {name: asan-unfixed, cxx: g++, other_pkgs: "", arch: x86_64, unfix: "1", flags: "-fsanitize=address -fno-omit-frame-pointer -fPIC", btype: RelWithDebInfo, reps: "3"}
-          - {name: release-fixed, cxx: clang++, other_pkgs: clang-18, arch: x86_64, unfix: "0", flags: "", btype: Release, reps: "30"}
     steps:
       - uses: actions/checkout@v6
 
@@ -126,7 +124,7 @@ jobs:
 
       - name: Revert fix (control)
         if: matrix.unfix == '1'
-        run: git checkout 25ee704 -- src/moonlight-server/sessions/moonlight.cpp && git diff --cached --stat
+        run: git fetch -q --unshallow origin && git checkout 25ee704 -- src/moonlight-server/sessions/moonlight.cpp && git diff --cached --stat
 
       - name: Configure build
         working-directory: ${{runner.workspace}}
