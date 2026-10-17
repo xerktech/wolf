@@ -6,6 +6,7 @@ using Catch::Matchers::Equals;
 #include <control/control.hpp>
 #include <control/input_handler.hpp>
 #include <cstring>
+#include <future>
 #include <moonlight/control.hpp>
 #include <mutex>
 #include <state/sessions.hpp>
@@ -569,6 +570,46 @@ TEST_CASE("streaming: a stream listens to its own instance's producers", "[GSTRE
   // A custom source, or no known producer, keeps the configured one
   REQUIRE(listen_to("some-lobby_video", "42_0badcafe") == "some-lobby_video");
   REQUIRE(listen_to("42_video", "") == "42_video");
+}
+
+TEST_CASE("streaming: a lobby join while a stream starts is not lost", "[GSTREAMER]") {
+  using namespace wolf::core;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  gstreamer::gst_element_ptr pipeline(
+      gst_parse_launch("interpipesrc name=interpipesrc_42_video listen-to=42_video ! fakesink", nullptr),
+      [](GstElement *el) { gst_object_unref(el); });
+  REQUIRE(pipeline);
+  auto listen_to = [&] {
+    auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), "interpipesrc_42_video");
+    gchar *value = nullptr;
+    g_object_get(src, "listen-to", &value, nullptr);
+    std::string result = value ? value : "";
+    g_free(value);
+    gst_object_unref(src);
+    return result;
+  };
+  auto switch_to = [&](const std::string &producer) {
+    event_bus->fire_event(immer::box<events::SwitchStreamProducerEvents>(
+        events::SwitchStreamProducerEvents{.session_id = 42, .interpipe_src_id = producer}));
+  };
+
+  std::future<void> join;
+  auto handler = streaming::follow_producer(
+      pipeline,
+      42,
+      "video",
+      [&] {
+        // The join lands right after the stream read its producer: the switch it fires must reach this pipeline
+        join = std::async(std::launch::async, [&] { switch_to("some-lobby"); });
+        join.wait_for(200ms);
+        return std::string("42_0badcafe");
+      },
+      event_bus);
+  join.wait();
+  REQUIRE(listen_to() == "some-lobby_video");
+
+  switch_to("42_0badcafe");
+  REQUIRE(listen_to() == "42_0badcafe_video");
 }
 
 TEST_CASE("sessions: a stream whose session joined a lobby listens to the lobby's producers") {

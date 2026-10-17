@@ -61,10 +61,20 @@ void listen_to_producer(GstElement *pipeline,
                         const std::string &kind);
 
 /**
+ * Points `pipeline`'s interpipesrc at `producer_name()` (see listen_to_producer) and switches it on every
+ * SwitchStreamProducerEvents for `session_id` until the returned handler is dropped. `producer_name` is called only
+ * once the switch handler is registered, so a lobby join that happens meanwhile is not lost.
+ */
+events::EventBusHandlers follow_producer(const gstreamer::gst_element_ptr &pipeline,
+                                         std::size_t session_id,
+                                         const std::string &kind,
+                                         const std::function<std::string()> &producer_name,
+                                         const std::shared_ptr<events::EventBusType> &event_bus);
+
+/**
  * `producer_name` returns the interpipe producer the stream's configured interpipesrc should listen to in place of
  * `<session_id>_video`: the session's own (see StreamSession::producer_name) or the lobby it has joined; empty keeps
- * the configured listen-to. It is called once the pipeline listens for SwitchStreamProducerEvents, so a join that
- * happens while the stream starts is not lost.
+ * the configured listen-to (see follow_producer).
  */
 void start_streaming_video(immer::box<events::VideoSession> video_session,
                            const std::function<std::string()> &producer_name,
