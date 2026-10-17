@@ -257,6 +257,16 @@ void run() {
 
   logs::log(logs::info, "Received shutdown signal, stopping all sessions and lobbies");
 
+  // Runner threads remove these after the app exits, which can be after we _Exit below; collect them so the
+  // shutdown can remove leftovers itself (deleting a sink twice is a no-op).
+  std::vector<std::shared_ptr<audio::VSink>> audio_sinks;
+  for (const auto &lobby : local_state->lobbies->load().get()) {
+    audio_sinks.push_back(lobby.audio_sink->load());
+  }
+  for (const auto &session : local_state->running_sessions->load().get()) {
+    audio_sinks.push_back(session.audio_sink->load());
+  }
+
   // Stop lobbies first: each one makes its connected sessions leave gracefully.
   for (const auto &lobby : local_state->lobbies->load().get()) {
     local_state->event_bus->fire_event(
@@ -275,6 +285,17 @@ void run() {
        i < 100 && (!local_state->running_sessions->load().get().empty() || !local_state->lobbies->load().get().empty());
        i++) {
     std::this_thread::sleep_for(100ms);
+  }
+
+  if (audio_server && audio_server->server) {
+    for (const auto &sink : audio_sinks) {
+      if (sink) {
+        audio::delete_virtual_sink(audio_server->server, sink);
+      }
+    }
+    if (!audio::flush(audio_server->server, 2s)) {
+      logs::log(logs::warning, "PulseAudio didn't confirm virtual sink removal before shutdown");
+    }
   }
 
   logs::log(logs::info, "Graceful shutdown complete");
