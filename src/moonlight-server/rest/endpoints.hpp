@@ -416,8 +416,8 @@ auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
     height = utils::to_size_t(display_mode_str[1]);
     fps = utils::to_size_t(display_mode_str[2]);
   }
-  // A zero size or fps would reach the virtual display and encoder as is, and a huge one could ask them for an
-  // enormous allocation: bound them well past anything a real display or client uses.
+  // A zero size or fps would reach the virtual display and encoder as is, and INT_MAX-sized values ask them for
+  // impossible allocations: cap them generously above any real display or client (8K is 7680x4320).
   constexpr std::size_t max_size = 16384, max_fps = 1000;
   auto surround_info = utils::to_size_t(get_header(headers, "surroundAudioInfo").value_or("196610"));
   auto rikey = get_header(headers, "rikey");
