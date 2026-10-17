@@ -6,6 +6,7 @@
 #include <atomic>
 #include <boost/thread.hpp>
 #include <boost/thread/future.hpp>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
@@ -73,6 +74,12 @@ void queue_op(const std::shared_ptr<Server> &server, const std::function<void()>
 std::shared_ptr<VSink> create_virtual_sink(const std::shared_ptr<Server> &server, const AudioDevice &device);
 
 void delete_virtual_sink(const std::shared_ptr<Server> &server, const std::shared_ptr<VSink> &vsink);
+
+/**
+ * Waits (up to timeout) until PulseAudio has handled every request sent so far on this connection.
+ * Returns false on timeout.
+ */
+bool flush(const std::shared_ptr<Server> &server, std::chrono::milliseconds timeout);
 
 void disconnect(const std::shared_ptr<Server> &server);
 

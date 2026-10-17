@@ -7,12 +7,15 @@
 #include <core/docker.hpp>
 #include <core/gstreamer.hpp>
 #include <csignal>
+#include <cstdio>
+#include <cstdlib>
 #include <exceptions/exceptions.h>
 #include <filesystem>
 #include <immer/array_transient.hpp>
 #include <immer/map_transient.hpp>
 #include <immer/vector_transient.hpp>
 #include <introspect/introspect.hpp>
+#include <iostream>
 #include <mdns_cpp/logger.hpp>
 #include <mdns_cpp/mdns.hpp>
 #include <memory>
@@ -254,18 +257,28 @@ void run() {
 
   logs::log(logs::info, "Received shutdown signal, stopping all sessions and lobbies");
 
+  // Runner threads remove these after the app exits, which can be after we _Exit below; collect them so the
+  // shutdown can remove leftovers itself (deleting a sink twice is a no-op).
+  // Hold the snapshots: iterating `load().get()` directly frees the list mid-loop once a Stop handler swaps it.
+  const auto lobbies = local_state->lobbies->load();
+  const auto sessions = local_state->running_sessions->load();
+  std::vector<std::shared_ptr<audio::VSink>> audio_sinks;
+  for (const auto &lobby : lobbies.get()) {
+    audio_sinks.push_back(lobby.audio_sink->load());
+  }
+  for (const auto &session : sessions.get()) {
+    audio_sinks.push_back(session.audio_sink->load());
+  }
+
   // Stop lobbies first: each one makes its connected sessions leave gracefully.
-  // Hold each snapshot while iterating it: the box from a range-for over load() dies before the loop body runs,
-  // and every event fired below updates the atom, which frees the previous one.
-  auto lobbies = local_state->lobbies->load();
   for (const auto &lobby : lobbies.get()) {
     local_state->event_bus->fire_event(
         immer::box<events::StopLobbyEvent>(events::StopLobbyEvent{.lobby_id = lobby.id}));
   }
 
-  // Then stop any remaining standalone streams.
-  auto sessions = local_state->running_sessions->load();
-  for (const auto &session : sessions.get()) {
+  // Then stop any remaining standalone streams (re-read: leaving a lobby already stopped its sessions).
+  const auto remaining_sessions = local_state->running_sessions->load();
+  for (const auto &session : remaining_sessions.get()) {
     local_state->event_bus->fire_event(
         immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session.session_id}));
   }
@@ -278,7 +291,26 @@ void run() {
     std::this_thread::sleep_for(100ms);
   }
 
+  if (audio_server && audio_server->server) {
+    for (const auto &sink : audio_sinks) {
+      if (sink) {
+        audio::delete_virtual_sink(audio_server->server, sink);
+      }
+    }
+    if (!audio::flush(audio_server->server, 2s)) {
+      logs::log(logs::warning, "PulseAudio didn't confirm virtual sink removal before shutdown");
+    }
+  }
+
   logs::log(logs::info, "Graceful shutdown complete");
+
+  // Leave without unwinding run()'s locals or running static destructors/atexit handlers: detached pipeline threads
+  // can still be tearing down their EGL context (gst-wayland-display's renderer), and a normal exit() unloads the
+  // NVIDIA driver's state underneath them -> SIGSEGV in eglcore and a stale backtrace.dump on every shutdown.
+  std::clog.flush();
+  std::cout.flush();
+  std::fflush(nullptr);
+  std::_Exit(EXIT_SUCCESS);
 }
 
 int main(int argc, char *argv[]) try {
