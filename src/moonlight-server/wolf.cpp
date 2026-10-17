@@ -7,12 +7,15 @@
 #include <core/docker.hpp>
 #include <core/gstreamer.hpp>
 #include <csignal>
+#include <cstdio>
+#include <cstdlib>
 #include <exceptions/exceptions.h>
 #include <filesystem>
 #include <immer/array_transient.hpp>
 #include <immer/map_transient.hpp>
 #include <immer/vector_transient.hpp>
 #include <introspect/introspect.hpp>
+#include <iostream>
 #include <mdns_cpp/logger.hpp>
 #include <mdns_cpp/mdns.hpp>
 #include <memory>
@@ -275,6 +278,14 @@ void run() {
   }
 
   logs::log(logs::info, "Graceful shutdown complete");
+
+  // Leave without unwinding run()'s locals or running static destructors/atexit handlers: detached pipeline threads
+  // can still be tearing down their EGL context (gst-wayland-display's renderer), and a normal exit() unloads the
+  // NVIDIA driver's state underneath them -> SIGSEGV in eglcore and a stale backtrace.dump on every pod shutdown.
+  std::clog.flush();
+  std::cout.flush();
+  std::fflush(nullptr);
+  std::_Exit(EXIT_SUCCESS);
 }
 
 int main(int argc, char *argv[]) try {
