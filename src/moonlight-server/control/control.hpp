@@ -43,6 +43,7 @@ bool is_superseded_stream(const immer::vector<events::StreamSession> &running_se
 
 bool encrypt_and_send(std::string_view payload,
                       std::string_view aes_key,
+                      const std::shared_ptr<events::ControlStreamState> &control_stream,
                       immer::box<std::shared_ptr<ENetPeer>> connected_client);
 
 bool init();

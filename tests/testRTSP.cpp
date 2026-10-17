@@ -309,13 +309,14 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
                        REQUIRE(response);
                        REQUIRE(response.value().response.status_code == 200);
                        REQUIRE(response.value().seq_number == 2);
-                       REQUIRE(response.value().payloads.size() == 5);
+                       REQUIRE(response.value().payloads.size() == 6);
                        REQUIRE_THAT(response.value().payloads[0].first, Equals("sprop-parameter-sets"));
                        REQUIRE_THAT(response.value().payloads[0].second, Equals("AAAAAU"));
                        REQUIRE_THAT(response.value().payloads[1].second, Equals("fmtp:97 surround-params=21101"));
                        REQUIRE_THAT(response.value().payloads[2].second, Equals("fmtp:97 surround-params=642014235"));
                        REQUIRE_THAT(response.value().payloads[3].second, Equals("fmtp:97 surround-params=85301467235"));
                        REQUIRE_THAT(response.value().payloads[4].second, Equals("x-ss-general.featureFlags: 3"));
+                       REQUIRE_THAT(response.value().payloads[5].second, Equals("x-ss-general.encryptionSupported: 1"));
                      });
   }
 
@@ -383,7 +384,7 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
                      "Host: 00.11.22.33.44\n"
                      "Session:  DEADBEEFCAFE\n"
                      "Content-type: application/sdp\n"
-                     "Content-length: 1308"
+                     "Content-length: 1344"
                      "\r\n\r\n" // start of payload
                      "v=0\n"
                      "o=android 0 14 IN IPv4 0.0.0.0\n"
@@ -404,6 +405,7 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
                      "a=x-nv-vqos[0].qosTrafficType:0 \n"
                      "a=x-nv-aqos.qosTrafficType:0 \n"
                      "a=x-nv-general.featureFlags:167 \n"
+                     "a=x-ss-general.encryptionEnabled:1 \n"
                      "a=x-nv-general.useReliableUdp:13 \n"
                      "a=x-nv-vqos[0].fec.minRequiredFecPackets:2 \n"
                      "a=x-nv-vqos[0].drc.enable:0 \n"
@@ -422,11 +424,34 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
                      "a=x-nv-video[0].encoderCscMode:0 \n"
                      "t=0 0\n"
                      "m=video 47998 \n"sv,
-                     [](std::optional<RTSP_PACKET> response) {
+                     [state](std::optional<RTSP_PACKET> response) {
                        REQUIRE(response.has_value());
                        REQUIRE(response.value().response.status_code == 200);
                        REQUIRE(response.value().seq_number == 6);
+                       // The client enabled V2 control stream encryption
+                       REQUIRE(*state->load()->front().control_stream->encryption.load() ==
+                               moonlight::control::ControlEncryption::V2);
                      });
+
+    // A second ANNOUNCE without it doesn't take the stream back to V1
+    tcp_tester::create_client(ioc, port, state)
+        ->run("ANNOUNCE streamid=control/13/0 RTSP/1.0\n"
+              "CSeq: 7\n"
+              "Host: 00.11.22.33.44\n"
+              "Content-type: application/sdp\n"
+              "Content-length: 145\n"
+              "\n"
+              "v=0\n"
+              "a=x-ss-general.encryptionEnabled:0 \n"
+              "a=x-nv-video[0].clientViewportWd:1920 \n"
+              "a=x-nv-video[0].clientViewportHt:1080 \n"
+              "a=x-nv-video[0].maxFPS:60 \n"sv,
+              [state](std::optional<RTSP_PACKET> response) {
+                REQUIRE(response.has_value());
+                REQUIRE(response.value().response.status_code == 200);
+                REQUIRE(*state->load()->front().control_stream->encryption.load() ==
+                        moonlight::control::ControlEncryption::V2);
+              });
   }
 
   SECTION("Non valid payload") {
@@ -446,10 +471,13 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
                      "a=x-nv-video[0].clientViewportHt:1080 \n"
                      "a=x-nv-video[0].maxFPS:60 \n"
                      "\n\n\n\n"sv,
-                     [](std::optional<RTSP_PACKET> response) {
+                     [state](std::optional<RTSP_PACKET> response) {
                        REQUIRE(response.has_value());
                        REQUIRE(response.value().response.status_code == 200);
                        REQUIRE(response.value().seq_number == 7);
+                       // An older client that doesn't enable V2 keeps V1
+                       REQUIRE(*state->load()->front().control_stream->encryption.load() ==
+                               moonlight::control::ControlEncryption::V1);
                      });
   }
 }
@@ -495,13 +523,14 @@ TEST_CASE("Commands (IP Matching)", "[RTSP]") {
                        REQUIRE(response);
                        REQUIRE(response.value().response.status_code == 200);
                        REQUIRE(response.value().seq_number == 2);
-                       REQUIRE(response.value().payloads.size() == 5);
+                       REQUIRE(response.value().payloads.size() == 6);
                        REQUIRE_THAT(response.value().payloads[0].first, Equals("sprop-parameter-sets"));
                        REQUIRE_THAT(response.value().payloads[0].second, Equals("AAAAAU"));
                        REQUIRE_THAT(response.value().payloads[1].second, Equals("fmtp:97 surround-params=21101"));
                        REQUIRE_THAT(response.value().payloads[2].second, Equals("fmtp:97 surround-params=642014235"));
                        REQUIRE_THAT(response.value().payloads[3].second, Equals("fmtp:97 surround-params=85301467235"));
                        REQUIRE_THAT(response.value().payloads[4].second, Equals("x-ss-general.featureFlags: 3"));
+                       REQUIRE_THAT(response.value().payloads[5].second, Equals("x-ss-general.encryptionSupported: 1"));
                      });
   }
 

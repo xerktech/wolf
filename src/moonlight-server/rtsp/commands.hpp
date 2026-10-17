@@ -105,6 +105,8 @@ describe(const RTSP_PACKET &req, const events::StreamSession &session) {
 
   payloads.push_back(
       {"a", fmt::format("x-ss-general.featureFlags: {}", FS_PEN_TOUCH_EVENTS | FS_CONTROLLER_TOUCH_EVENTS)});
+  // Moonlight enables V2 control stream encryption whenever the host supports it, and confirms it in the ANNOUNCE
+  payloads.push_back({"a", fmt::format("x-ss-general.encryptionSupported: {}", moonlight::control::SS_ENC_CONTROL_V2)});
 
   return ok_msg(req.seq_number, {}, payloads);
 }
@@ -168,6 +170,14 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
                 })                                             //
               | views::transform(parse_arg_line)               // turns an arg line into a pair
               | to<std::map<std::string, std::optional<int>>>; // to map
+
+  auto control_encryption = (args["x-ss-general.encryptionEnabled"].value_or(0) & moonlight::control::SS_ENC_CONTROL_V2)
+                                ? moonlight::control::ControlEncryption::V2
+                                : moonlight::control::ControlEncryption::V1;
+  // Never go back from V2: RTSP isn't authenticated, a second ANNOUNCE would make every genuine packet fail to decrypt
+  session.control_stream->encryption.update([control_encryption](auto current) {
+    return current == moonlight::control::ControlEncryption::V2 ? current : control_encryption;
+  });
 
   bool video_format_hevc = args["x-nv-vqos[0].bitStreamFormat"].value_or(0) == 1;
   bool video_format_av1 = args["x-nv-vqos[0].bitStreamFormat"].value_or(0) == 2;

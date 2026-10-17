@@ -2,6 +2,7 @@
 
 #define BOOST_THREAD_PROVIDES_FUTURE_CONTINUATION
 #define BOOST_THREAD_PROVIDES_FUTURE
+#include <atomic>
 #include <boost/thread.hpp>
 #include <boost/thread/future.hpp>
 #include <core/audio.hpp>
@@ -439,6 +440,18 @@ struct StreamState {
  * This will then be fired up in the event_bus so that the rtsp, command, audio and video threads
  * can start working their magic.
  */
+/**
+ * The ENet control stream's encryption state, shared by every copy of a StreamSession
+ */
+struct ControlStreamState {
+  /** Set by the RTSP ANNOUNCE, before the client connects to the control stream */
+  immer::atom<moonlight::control::ControlEncryption> encryption{moonlight::control::ControlEncryption::V1};
+  /** The seqs of the packets received so far, so that a replayed packet is dropped (V2 only, see accept_seq()) */
+  immer::atom<moonlight::control::ReplayWindow> replay_window;
+  /** The seq of the next packet sent to the client, so that no two share an IV */
+  std::atomic<std::uint32_t> send_seq = 0;
+};
+
 struct StreamSession {
   moonlight::DisplayMode display_mode;
   int audio_channel_count;
@@ -486,6 +499,11 @@ struct StreamSession {
    * Not carried over on resume: a resumed stream is a new StreamSession and starts from scratch.
    */
   std::shared_ptr<immer::atom<StreamState>> stream_state = std::make_shared<immer::atom<StreamState>>();
+
+  /**
+   * Not carried over on resume: the client negotiates encryption again and restarts its seq from 0 with the new key.
+   */
+  std::shared_ptr<ControlStreamState> control_stream = std::make_shared<ControlStreamState>();
 
   // virtual devices
   std::shared_ptr<std::optional<MouseTypes>> mouse = std::make_shared<std::optional<MouseTypes>>();
