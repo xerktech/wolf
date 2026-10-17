@@ -39,6 +39,14 @@ paths:
   - `follow_producer` resolves the name after the switch handler is registered, under a lock shared
     with it; join/leave update `connected_sessions` before firing the switch. Keep both orders,
     or a join while the stream starts is lost.
+- Interpipe also keys a producer's listeners by consumer element name, so `own_consumer` renames the
+  configured `interpipesrc_<session_id>_<kind>` to one unique per instance (`rtp_secret_payload` hex).
+  - With a shared name, a /resume's pipeline started before the old one's EOS is refused ("Already
+    listening") and gets nothing once the old one leaves: no video (XERK-2025).
+  - Look the consumer up by the returned name (switch handlers, `listen_to_producer`), never by
+    re-deriving it from the session_id.
+  - Tests: "streaming: a resumed stream keeps receiving after the superseded one ends",
+    "streaming: each stream instance names its own consumer".
 - `PauseStreamEvent` is also broadcast on the API event stream; external tools (fenrir) read it as
   "this client's stream paused". Don't overload it with per-instance semantics.
 - Tests: `tests/testControl.cpp` — "control: a dead client's late pause doesn't end its resumed

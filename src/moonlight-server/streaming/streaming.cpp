@@ -1,8 +1,10 @@
 #include "platforms/hw.hpp"
 
+#include <cctype>
 #include <chrono>
 #include <control/control.hpp>
 #include <core/batched_send.hpp>
+#include <crypto/crypto.hpp>
 #include <gst-video-context.hpp>
 #include <gstreamer-1.0/gst/app/gstappsink.h>
 #include <gstreamer-1.0/gst/app/gstappsrc.h>
@@ -200,15 +202,36 @@ void start_audio_producer(const std::string &session_id,
   });
 }
 
+std::string own_consumer(std::string &pipeline,
+                         std::size_t session_id,
+                         const std::array<char, 16> &rtp_secret_payload,
+                         const std::string &kind) {
+  auto configured = fmt::format("interpipesrc_{}_{}", session_id, kind);
+  auto key = "name=" + configured;
+  auto at = pipeline.find(key);
+  if (at == std::string::npos) {
+    return configured;
+  }
+  auto end = at + key.size();
+  if (end < pipeline.size() && !std::isspace(static_cast<unsigned char>(pipeline[end])) && pipeline[end] != '!') {
+    return configured; // Only a prefix of some other name
+  }
+  auto own = fmt::format("{}_{}",
+                         configured,
+                         crypto::str_to_hex(std::string_view(rtp_secret_payload.data(), rtp_secret_payload.size())));
+  pipeline.replace(at + 5, configured.size(), own);
+  return own;
+}
+
 void listen_to_producer(GstElement *pipeline,
+                        const std::string &consumer_name,
                         std::size_t session_id,
                         const std::string &producer_name,
                         const std::string &kind) {
   if (producer_name.empty()) {
     return;
   }
-  auto pipe_name = fmt::format("interpipesrc_{}_{}", session_id, kind);
-  auto src = gst_bin_get_by_name(GST_BIN(pipeline), pipe_name.c_str());
+  auto src = gst_bin_get_by_name(GST_BIN(pipeline), consumer_name.c_str());
   if (!src) {
     return;
   }
@@ -223,6 +246,7 @@ void listen_to_producer(GstElement *pipeline,
 }
 
 events::EventBusHandlers follow_producer(const gstreamer::gst_element_ptr &pipeline,
+                                         const std::string &consumer_name,
                                          std::size_t session_id,
                                          const std::string &kind,
                                          const std::function<std::string()> &producer_name,
@@ -230,7 +254,8 @@ events::EventBusHandlers follow_producer(const gstreamer::gst_element_ptr &pipel
   /* Serialises the initial listen-to with a lobby switch, so that neither overwrites the other's newer producer */
   auto listen_lock = std::make_shared<std::mutex>();
   auto switch_handler = event_bus->register_handler<immer::box<events::SwitchStreamProducerEvents>>(
-      [session_id, kind, pipeline, listen_lock](const immer::box<events::SwitchStreamProducerEvents> &switch_ev) {
+      [consumer_name, session_id, kind, pipeline, listen_lock](
+          const immer::box<events::SwitchStreamProducerEvents> &switch_ev) {
         if (switch_ev->session_id == session_id) {
           std::lock_guard lock(*listen_lock);
           logs::log(logs::debug,
@@ -238,8 +263,7 @@ events::EventBusHandlers follow_producer(const gstreamer::gst_element_ptr &pipel
                     kind,
                     session_id,
                     switch_ev->interpipe_src_id);
-          auto pipe_name = fmt::format("interpipesrc_{}_{}", session_id, kind);
-          if (auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), pipe_name.c_str())) {
+          if (auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), consumer_name.c_str())) {
             /* Perform the switch */
             auto interpipe = fmt::format("{}_{}", switch_ev->interpipe_src_id, kind);
             g_object_set(src, "listen-to", interpipe.c_str(), nullptr);
@@ -255,7 +279,7 @@ events::EventBusHandlers follow_producer(const gstreamer::gst_element_ptr &pipel
    * one before is already in producer_name() (the lobby membership is updated before the switch is fired).
    */
   std::lock_guard lock(*listen_lock);
-  listen_to_producer(pipeline.get(), session_id, producer_name(), kind);
+  listen_to_producer(pipeline.get(), consumer_name, session_id, producer_name(), kind);
   return switch_handler;
 }
 
@@ -462,6 +486,7 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
       fmt::arg("color_space", color_space),
       fmt::arg("color_range", color_range),
       fmt::arg("host_port", video_session->port));
+  auto consumer = own_consumer(pipeline, video_session->session_id, video_session->rtp_secret_payload, "video");
   logs::log(logs::debug, "Starting video pipeline: \n{}", pipeline);
 
   bool enable_pacing = utils::get_env("WOLF_ENABLE_VIDEO_PACING", "TRUE") == std::string("TRUE");
@@ -476,7 +501,7 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
       }});
   std::shared_ptr<NeedContextData> ctx_data_ptr = std::make_shared<NeedContextData>(
       NeedContextData{.device_path = video_session->render_node, .gst_context = video_context});
-  run_pipeline(pipeline, [video_session, producer_name, event_bus, udp_sink, ctx_data_ptr](auto pipeline) {
+  run_pipeline(pipeline, [video_session, consumer, producer_name, event_bus, udp_sink, ctx_data_ptr](auto pipeline) {
     if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
       logs::log(logs::debug, "Setting up wolf_udp_sink");
       g_assert(GST_IS_APP_SINK(app_sink_el));
@@ -527,7 +552,7 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
         });
 
     auto switch_producer_handler =
-        follow_producer(pipeline, video_session->session_id, "video", producer_name, event_bus);
+        follow_producer(pipeline, consumer, video_session->session_id, "video", producer_name, event_bus);
 
     auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
         [sess_id = video_session->session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
@@ -583,6 +608,7 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
       fmt::arg("client_port", client_port),
       fmt::arg("client_ip", client_ip),
       fmt::arg("host_port", audio_session->port));
+  auto consumer = own_consumer(pipeline, audio_session->session_id, audio_session->rtp_secret_payload, "audio");
   logs::log(logs::debug, "Starting audio pipeline: \n{}", pipeline);
 
   std::shared_ptr<custom_sink::UDPSink> udp_sink = std::make_shared<custom_sink::UDPSink>(custom_sink::UDPSink{
@@ -590,7 +616,7 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
       .client_endpoint = std::make_shared<udp::endpoint>(boost::asio::ip::make_address(client_ip), client_port)});
 
   auto session_id = audio_session->session_id;
-  run_pipeline(pipeline, [audio_session, session_id, producer_name, udp_sink, event_bus](auto pipeline) {
+  run_pipeline(pipeline, [audio_session, session_id, consumer, producer_name, udp_sink, event_bus](auto pipeline) {
     if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
       logs::log(logs::debug, "Setting up wolf_udp_sink");
       g_assert(GST_IS_APP_SINK(app_sink_el));
@@ -619,7 +645,7 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
           }
         });
 
-    auto switch_producer_handler = follow_producer(pipeline, session_id, "audio", producer_name, event_bus);
+    auto switch_producer_handler = follow_producer(pipeline, consumer, session_id, "audio", producer_name, event_bus);
 
     auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
         [session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {

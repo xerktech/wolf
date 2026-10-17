@@ -1,11 +1,12 @@
 #include <api/api.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
-#include <curl/curl.h>
 #include <cstdlib>
+#include <curl/curl.h>
 #include <filesystem>
 #include <future>
 #include <poll.h>
+#include <tuple>
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
@@ -556,9 +557,32 @@ TEST_CASE("Sessions APIs", "[API]") {
   // Test that we can add a session
   auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
       .client_ip = "127.0.0.1",
+      .video_width = 1920,
+      .video_height = 1080,
+      .video_refresh_rate = 60,
       .app_id = "304556286",               // test cfg file
       .client_id = "10594003729173467913", // test cfg file
   };
+
+  // A zero or huge display mode is refused, as on the Moonlight /launch path, and nothing is stored
+  for (auto [width, height, fps] : {std::tuple{0, 1080, 60},
+                                    std::tuple{1920, 0, 60},
+                                    std::tuple{1920, 1080, 0},
+                                    std::tuple{-1920, 1080, 60},
+                                    std::tuple{16385, 1080, 60},
+                                    std::tuple{1920, 16385, 60},
+                                    std::tuple{1920, 1080, 1001},
+                                    std::tuple{2147483647, 2147483647, 2147483647}}) {
+    auto bad_session = session;
+    bad_session.video_width = width;
+    bad_session.video_height = height;
+    bad_session.video_refresh_rate = fps;
+    response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(bad_session));
+    REQUIRE(response);
+    REQUIRE(response->first == 400);
+    REQUIRE_THAT(response->second, ContainsSubstring("\"success\":false"));
+  }
+  REQUIRE(running_sessions->load()->size() == 0);
   response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
   REQUIRE(response);
   REQUIRE_THAT(response->second, Catch::Matchers::ContainsSubstring("{\"success\":true,\"session_id\":"));
@@ -716,6 +740,9 @@ TEST_CASE("Sessions API: the listed state follows the stream's events", "[API]")
 
   auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
       .client_ip = "127.0.0.1",
+      .video_width = 1920,
+      .video_height = 1080,
+      .video_refresh_rate = 60,
       .app_id = "304556286",               // test cfg file
       .client_id = "10594003729173467913", // test cfg file
   };
@@ -735,6 +762,7 @@ TEST_CASE("Sessions API: the listed state follows the stream's events", "[API]")
   auto rtp_secret = [](char id) { return std::array<char, 16>{id}; };
   auto video_session = [&](char secret) {
     events::VideoSession video{.session_id = session_id};
+    video.display_mode = {.width = 1920, .height = 1080, .refreshRate = 60};
     video.rtp_secret_payload = rtp_secret(secret);
     return video;
   };
@@ -860,6 +888,9 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
   for (const std::string bad_id : {"not-a-number", "", "-1", "99999999999999999999999"}) {
     auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
         .client_ip = "127.0.0.1",
+        .video_width = 1920,
+        .video_height = 1080,
+        .video_refresh_rate = 60,
         .app_id = "304556286", // test cfg file
         .client_id = bad_id,
     };
@@ -910,9 +941,46 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
     REQUIRE_THAT(response->second, ContainsSubstring("Invalid session_id"));
   }
 
+  { // sessions/start on a real session rejects a zero or absurd display mode instead of streaming it
+    auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
+        .client_ip = "127.0.0.1",
+        .video_width = 1920,
+        .video_height = 1080,
+        .video_refresh_rate = 60,
+        .app_id = "304556286",               // test cfg file
+        .client_id = "10594003729173467913", // test cfg file
+    };
+    auto response =
+        req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
+    REQUIRE(response);
+    auto created = rfl::json::read<StreamSessionCreated>(response->second).value();
+    auto fired = std::make_shared<std::atomic<int>>(0);
+    auto video_handler = event_bus->register_handler<immer::box<events::VideoSession>>(
+        [fired](const immer::box<events::VideoSession> &) { (*fired)++; });
+    auto audio_handler = event_bus->register_handler<immer::box<events::AudioSession>>(
+        [fired](const immer::box<events::AudioSession> &) { (*fired)++; });
+    for (auto mode : {wolf::core::virtual_display::DisplayMode{0, 0, 0},
+                      wolf::core::virtual_display::DisplayMode{2147483647, 2147483647, 2147483647},
+                      wolf::core::virtual_display::DisplayMode{1920, 1080, 1001}}) {
+      auto start_request = StreamSessionStartRequest{.session_id = created.session_id};
+      start_request.video_session.display_mode = mode;
+      response =
+          req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/start", rfl::json::write(start_request));
+      REQUIRE(response);
+      REQUIRE(response->first == 400);
+      REQUIRE_THAT(response->second, ContainsSubstring("Invalid video_session.display_mode"));
+    }
+    REQUIRE(*fired == 0); // rejected before anything reached the event bus
+    video_handler.unregister();
+    audio_handler.unregister();
+  }
+
   { // runners/start on a real session replies (it used to close the connection without an answer)
     auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
         .client_ip = "127.0.0.1",
+        .video_width = 1920,
+        .video_height = 1080,
+        .video_refresh_rate = 60,
         .app_id = "304556286",               // test cfg file
         .client_id = "10594003729173467913", // test cfg file
     };
@@ -941,6 +1009,78 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
   response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/sessions");
   REQUIRE(response);
   REQUIRE(response->first == 200);
+}
+
+TEST_CASE("Runners: many concurrent starts on one session that exit at once", "[API]") {
+  using namespace std::chrono_literals;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .host = immer::box<state::Host>(state::Host{}),
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .running_sessions = running_sessions});
+
+  // No compositor here: the session's own runner must not wait for a Wayland socket that never comes
+  setenv("WOLF_SKIP_WAYLAND_SOCKET_WAIT", "1", 1);
+  auto unset_env = std::shared_ptr<void>(nullptr, [](void *) { unsetenv("WOLF_SKIP_WAYLAND_SOCKET_WAIT"); });
+
+  auto handlers = sessions::setup_moonlight_handlers(app_state, api_runtime_dir(), {});
+  start_api_server(app_state);
+  auto socket_path = api_socket_path();
+
+  auto app = std::make_shared<events::App>(
+      events::App{.base = {.title = "true", .id = "true", .support_hdr = false},
+                  .start_virtual_compositor = false,
+                  .start_audio_server = false,
+                  .runner = state::get_runner(wolf::config::AppCMD{.run_cmd = "true"}, event_bus)});
+
+  // Each runner exits at once with stop_stream_when_over: the first exit removes the session (and its devices queue)
+  // while the other starts are still being handled (XERK-2023: this aborted Wolf on a freed devices queue).
+  constexpr int rounds = 20;
+  constexpr int runners_per_round = 32;
+  for (int round = 0; round < rounds; round++) {
+    auto session = events::StreamSession{.event_bus = event_bus,
+                                         .app = app,
+                                         .enet_secret_payload = static_cast<uint32_t>(round + 1),
+                                         .session_id = static_cast<std::size_t>(4242 + round)};
+    running_sessions->update([&](const auto &sessions) { return sessions.push_back(session); });
+    event_bus->fire_event(immer::box<events::StreamSession>(session));
+
+    std::vector<std::thread> clients;
+    std::atomic_int answered = 0;
+    for (int i = 0; i < runners_per_round; i++) {
+      clients.emplace_back([&]() {
+        auto curl = curl_ptr(curl_easy_init(), ::curl_easy_cleanup);
+        curl_easy_setopt(curl.get(), CURLOPT_UNIX_SOCKET_PATH, socket_path.c_str());
+        curl_easy_setopt(curl.get(), CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
+        auto response = req(curl.get(),
+                            HTTPMethod::POST,
+                            "http://localhost/api/v1/runners/start",
+                            rfl::json::write(RunnerStartRequest{.stop_stream_when_over = true,
+                                                                .runner = wolf::config::AppCMD{.run_cmd = "true"},
+                                                                .session_id = std::to_string(session.session_id)}));
+        // Either started, or rejected because an earlier runner already ended the session
+        if (response && (response->first == 200 || response->first == 500)) {
+          answered++;
+        }
+      });
+    }
+    for (auto &client : clients) {
+      client.join();
+    }
+    REQUIRE(answered == runners_per_round);
+
+    // Let the runners started this round exit and stop the session before the next one
+    for (int i = 0; i < 100 && state::get_session_by_id(*running_sessions->load(), session.session_id); i++) {
+      std::this_thread::sleep_for(20ms);
+    }
+    REQUIRE_FALSE(state::get_session_by_id(*running_sessions->load(), session.session_id));
+    std::this_thread::sleep_for(200ms);
+  }
 }
 
 TEST_CASE("Session APIs without app_id or client_id", "[API]") {
@@ -974,6 +1114,9 @@ TEST_CASE("Session APIs without app_id or client_id", "[API]") {
   // Test that we can add a session
   auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
       .client_ip = "127.0.0.1",
+      .video_width = 1920,
+      .video_height = 1080,
+      .video_refresh_rate = 60,
   };
 
   response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));

@@ -21,7 +21,8 @@ void UnixSocketServer::endpoint_Events(const HTTPRequest &req, std::shared_ptr<U
 
 void UnixSocketServer::endpoint_PendingPairRequest(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto requests = std::vector<PendingPairClient>();
-  for (auto [secret, pair_request] : *(state_->app_state)->pairing_atom->load()) {
+  auto pairing = state_->app_state->pairing_atom->load(); // iterate a snapshot that an update can't free under us
+  for (auto [secret, pair_request] : *pairing) {
     requests.push_back({.pair_secret = secret, .client_ip = pair_request->client_ip});
   }
   send_http(socket, 200, rfl::json::write(PendingPairRequestsResponse{.requests = requests}));
@@ -30,7 +31,8 @@ void UnixSocketServer::endpoint_PendingPairRequest(const HTTPRequest &req, std::
 void UnixSocketServer::endpoint_Pair(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto event = rfl::json::read<PairRequest>(req.body);
   if (event) {
-    if (auto pair_request = state_->app_state->pairing_atom->load()->find(event.value().pair_secret)) {
+    auto pairing = state_->app_state->pairing_atom->load(); // find() points into this snapshot: keep it alive
+    if (auto pair_request = pairing->find(event.value().pair_secret)) {
       pair_request->get().user_pin->set_value(event.value().pin.value()); // Resolve the promise
       state_->app_state->pairing_atom->update(
           [pair_secret = event.value().pair_secret](auto pairing_map) { return pairing_map.erase(pair_secret); });
@@ -219,6 +221,16 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
   if (session) {
     immer::box<events::App> choosen_app;
     auto ss = session.value();
+    if (!moonlight::is_valid_display_mode(ss.video_width, ss.video_height, ss.video_refresh_rate)) {
+      logs::log(logs::warning,
+                "[API] Invalid display mode: {}x{}x{}",
+                ss.video_width,
+                ss.video_height,
+                ss.video_refresh_rate);
+      auto res = GenericErrorResponse{.error = "Invalid video_width, video_height or video_refresh_rate"};
+      send_http(socket, 400, rfl::json::write(res));
+      return;
+    }
     if (auto app_id = ss.app_id) {
       auto app = state::get_moonlight_app_by_id(this->state_->app_state->config, *app_id);
       if (!app) {
@@ -314,6 +326,13 @@ void UnixSocketServer::endpoint_StreamSessionStart(const HTTPRequest &req, std::
     auto session_id = *parsed_session_id;
     if (auto session = state::get_session_by_id(sessions.get(), session_id)) {
       auto video_session = start_req.value().video_session;
+      auto mode = video_session.display_mode;
+      if (!moonlight::is_valid_display_mode(mode.width, mode.height, mode.refreshRate)) {
+        logs::log(logs::warning, "[API] Invalid display mode: {}x{}x{}", mode.width, mode.height, mode.refreshRate);
+        auto res = GenericErrorResponse{.error = "Invalid video_session.display_mode"};
+        send_http(socket, 400, rfl::json::write(res));
+        return;
+      }
       video_session.session_id = session_id; // Can't be JSON encoded
       if (video_session.render_node.empty()) {
         video_session.render_node = session->app->render_node;
