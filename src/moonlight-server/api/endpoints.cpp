@@ -21,7 +21,8 @@ void UnixSocketServer::endpoint_Events(const HTTPRequest &req, std::shared_ptr<U
 
 void UnixSocketServer::endpoint_PendingPairRequest(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto requests = std::vector<PendingPairClient>();
-  for (auto [secret, pair_request] : *(state_->app_state)->pairing_atom->load()) {
+  auto pairing = state_->app_state->pairing_atom->load(); // iterate a snapshot that an update can't free under us
+  for (auto [secret, pair_request] : *pairing) {
     requests.push_back({.pair_secret = secret, .client_ip = pair_request->client_ip});
   }
   send_http(socket, 200, rfl::json::write(PendingPairRequestsResponse{.requests = requests}));

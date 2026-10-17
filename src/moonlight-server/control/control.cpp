@@ -101,8 +101,9 @@ std::optional<events::StreamSession> get_current_session(const enet_clients_map 
                                                          std::string_view client_ip,
                                                          const ENetEvent &enet_event) {
   if (enet_event.type == ENET_EVENT_TYPE_CONNECT) {
+    auto sessions = running_sessions->load(); // iterate a snapshot that an update can't free under us
     // A new connection, we should check if there's a session that matches the current client
-    for (const StreamSession &session : *running_sessions->load()) {
+    for (const StreamSession &session : *sessions) {
       if (session.enet_secret_payload == enet_event.data) {
         return session;
       }
@@ -110,7 +111,7 @@ std::optional<events::StreamSession> get_current_session(const enet_clients_map 
     logs::log(logs::warning,
               "[ENET] Unable to find a session that matches the client secret {}, matching by IP",
               enet_event.data);
-    for (const StreamSession &session : *running_sessions->load()) {
+    for (const StreamSession &session : *sessions) {
       if (session.ip == client_ip) {
         return session;
       }
@@ -198,7 +199,8 @@ void run_control(int port,
       [&connected_clients](const immer::box<StopStreamEvent> &ev) {
         auto terminate_pkt = ControlTerminatePacket{};
         std::string plaintext = {(char *)&terminate_pkt, sizeof(terminate_pkt)};
-        for (auto &[peer, session] : *connected_clients.load()) {
+        auto clients = connected_clients.load(); // iterate a snapshot that an update can't free under us
+        for (auto &[peer, session] : *clients) {
           if (session->session_id == ev->session_id) {
             immer::box<std::shared_ptr<ENetPeer>> enet_client = {to_shared_ptr(peer)};
             encrypt_and_send(plaintext, session->aes_key, session->control_stream, enet_client);

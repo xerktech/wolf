@@ -255,13 +255,17 @@ void run() {
   logs::log(logs::info, "Received shutdown signal, stopping all sessions and lobbies");
 
   // Stop lobbies first: each one makes its connected sessions leave gracefully.
-  for (const auto &lobby : local_state->lobbies->load().get()) {
+  // Hold each snapshot while iterating it: the box from a range-for over load() dies before the loop body runs,
+  // and every event fired below updates the atom, which frees the previous one.
+  auto lobbies = local_state->lobbies->load();
+  for (const auto &lobby : lobbies.get()) {
     local_state->event_bus->fire_event(
         immer::box<events::StopLobbyEvent>(events::StopLobbyEvent{.lobby_id = lobby.id}));
   }
 
   // Then stop any remaining standalone streams.
-  for (const auto &session : local_state->running_sessions->load().get()) {
+  auto sessions = local_state->running_sessions->load();
+  for (const auto &session : sessions.get()) {
     local_state->event_bus->fire_event(
         immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session.session_id}));
   }
