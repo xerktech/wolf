@@ -443,7 +443,12 @@ void UnixSocketServer::write_next(const std::shared_ptr<UnixSocket> &socket) {
 }
 
 void UnixSocketServer::handle_request(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
-  logs::log(logs::debug, "[API] Received request: {} {} - {}", rfl::enum_to_string(req.method), req.path, req.body);
+  // Bodies can be megabytes (e.g. apps with inline pipelines): only log the start
+  logs::log(logs::debug,
+            "[API] Received request: {} {} - {}",
+            rfl::enum_to_string(req.method),
+            req.path,
+            std::string_view(req.body).substr(0, 1024));
 
   if (!state_->http.handle_request(req, socket)) {
     send_http(socket, 404, "");

@@ -90,7 +90,7 @@ req(CURL *handle,
 
   /* Pass POST params (if present) */
   if (method == HTTPMethod::POST && !post_body.empty()) {
-    logs::log(logs::trace, "[CURL] POST: {}", post_body);
+    logs::log(logs::trace, "[CURL] POST: {}", post_body.substr(0, 1024));
 
     curl_easy_setopt(handle, CURLOPT_POST, 1L);
     headers = curl_slist_append(headers, "Content-type: application/json");
@@ -123,7 +123,7 @@ req(CURL *handle,
     curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &response_code);
     // Avoid printing binary output if the target is "/api/v1/utils/get-icon"
     if (target.find("/api/v1/utils/get-icon") == std::string::npos) {
-      logs::log(logs::trace, "[CURL] Received {} - {}", response_code, read_buf);
+      logs::log(logs::trace, "[CURL] Received {} - {}", response_code, std::string_view(read_buf).substr(0, 1024));
     }
     return {{response_code, read_buf}};
   }
