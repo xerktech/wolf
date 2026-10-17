@@ -632,23 +632,25 @@ TEST_CASE("streaming: a stream restarted right after a pause keeps receiving", "
     audio.rtp_secret_payload = rtp_secret;
     auto send_socket = std::make_shared<boost::asio::ip::udp::socket>(io, boost::asio::ip::udp::v4());
     std::thread([=] {
-      streaming::start_streaming_video(video,
-                                       "42_cafe",
-                                       event_bus,
-                                       "127.0.0.1",
-                                       video_client->local_endpoint().port(),
-                                       std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>(),
-                                       send_socket);
+      streaming::start_streaming_video(
+          video,
+          [] { return std::string("42_cafe"); },
+          event_bus,
+          "127.0.0.1",
+          video_client->local_endpoint().port(),
+          std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>(),
+          send_socket);
     }).detach();
     std::thread([=] {
-      streaming::start_streaming_audio(audio,
-                                       "42_cafe",
-                                       event_bus,
-                                       "127.0.0.1",
-                                       audio_client->local_endpoint().port(),
-                                       send_socket,
-                                       "sink",
-                                       "");
+      streaming::start_streaming_audio(
+          audio,
+          [] { return std::string("42_cafe"); },
+          event_bus,
+          "127.0.0.1",
+          audio_client->local_endpoint().port(),
+          send_socket,
+          "sink",
+          "");
     }).detach();
   };
   auto receives = [](const std::shared_ptr<boost::asio::ip::udp::socket> &socket) {
