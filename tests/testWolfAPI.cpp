@@ -1545,8 +1545,9 @@ TEST_CASE("QA: double StopStreamEvent for one session with live runners", "[QA]"
   SUCCEED();
 }
 
-// QA: wolf.cpp:264 shutdown loop, verbatim, against the real moonlight StopStreamEvent handler
-TEST_CASE("QA: shutdown loop over running_sessions->load().get()", "[QA]") {
+// QA: wolf.cpp shutdown loop against the real moonlight StopStreamEvent handler.
+// held=true is the 663daa1 shape (verbatim lines 267-268); held=false is the pre-fix shape (positive control).
+static void qa_shutdown_loop(bool held) {
   auto event_bus = std::make_shared<events::EventBusType>();
   auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
   auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
@@ -1557,6 +1558,7 @@ TEST_CASE("QA: shutdown loop over running_sessions->load().get()", "[QA]") {
       .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
       .event_bus = event_bus,
       .running_sessions = running_sessions});
+  auto local_state = app_state;
   auto handlers = sessions::setup_moonlight_handlers(app_state, api_runtime_dir(), {});
   const int n = 40;
   for (int i = 0; i < n; i++) {
@@ -1567,16 +1569,36 @@ TEST_CASE("QA: shutdown loop over running_sessions->load().get()", "[QA]") {
   }
   int fired = 0;
   std::set<std::size_t> seen;
-  for (const auto &session : app_state->running_sessions->load().get()) {
-    seen.insert(session.session_id);
-    event_bus->fire_event(
-        immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session.session_id}));
-    fired++;
+  if (held) {
+    auto sessions = local_state->running_sessions->load();
+    for (const auto &session : sessions.get()) {
+      seen.insert(session.session_id);
+      local_state->event_bus->fire_event(
+          immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session.session_id}));
+      fired++;
+    }
+  } else {
+    for (const auto &session : local_state->running_sessions->load().get()) {
+      seen.insert(session.session_id);
+      local_state->event_bus->fire_event(
+          immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session.session_id}));
+      fired++;
+    }
   }
-  logs::log(logs::warning, "QA shutdown loop fired {} distinct {} remaining {}", fired, seen.size(),
+  logs::log(logs::warning, "QA shutdown loop held={} fired {} distinct {} remaining {}", held, fired, seen.size(),
             running_sessions->load()->size());
   REQUIRE(running_sessions->load()->size() == 0);
   REQUIRE(seen.size() == n);
+  REQUIRE(fired == n);
+}
+
+TEST_CASE("QA: shutdown loop held snapshot (663daa1 shape)", "[QA]") {
+  for (int r = 0; r < 20; r++)
+    qa_shutdown_loop(true);
+}
+
+TEST_CASE("QA: shutdown loop load() temporary (pre-fix shape, control)", "[QA]") {
+  qa_shutdown_loop(false);
 }
 
 // QA: api/endpoints.cpp:24 iterates *pairing_atom->load() while pairing requests come and go

@@ -80,7 +80,7 @@ jobs:
         include:
           - {name: asan-fixed, cxx: g++, other_pkgs: "", arch: x86_64, unfix: "0", flags: "-fsanitize=address -fno-omit-frame-pointer -fPIC", btype: RelWithDebInfo, reps: "1"}
           - {name: release-fixed, cxx: clang++, other_pkgs: clang-18, arch: x86_64, unfix: "0", flags: "", btype: Release, reps: "1"}
-          - {name: asan-unfixed, cxx: g++, other_pkgs: "", arch: x86_64, unfix: "1", flags: "-fsanitize=address -fno-omit-frame-pointer -fPIC", btype: RelWithDebInfo, reps: "3"}
+          - {name: asan-unfixed, cxx: g++, other_pkgs: "", arch: x86_64, unfix: "1", flags: "-fsanitize=address -fno-omit-frame-pointer -fPIC", btype: RelWithDebInfo, reps: "1"}
     steps:
       - uses: actions/checkout@v6
 
@@ -126,7 +126,7 @@ jobs:
 
       - name: Revert fix (control)
         if: matrix.unfix == '1'
-        run: git fetch -q --unshallow origin && git checkout 25ee704 -- src/moonlight-server/sessions/moonlight.cpp && git diff --cached --stat
+        run: git fetch -q --unshallow origin && git checkout a2a6562 -- src/moonlight-server/api/endpoints.cpp src/moonlight-server/control/control.cpp && git diff --cached --stat
 
       - name: Configure build
         working-directory: ${{runner.workspace}}
@@ -158,7 +158,7 @@ jobs:
             rc=$?; echo "QARESULT many-starts rep=$i rc=$rc"
             if [ $rc -ne 0 ]; then grep -n -A40 "ERROR: AddressSanitizer" run_$i.log | head -80; tail -5 run_$i.log; fi
           done
-          for t in "QA: shutdown loop over running_sessions->load().get()" "QA: pending pair listing while pair requests change"; do
+          for t in "QA: shutdown loop held snapshot (663daa1 shape)" "QA: shutdown loop load() temporary (pre-fix shape, control)" "QA: pending pair listing while pair requests change" "QA: pending pair listing while pair requests change" "QA: pending pair listing while pair requests change"; do
             ./wolftests "$t" > qa2.log 2>&1; rc=$?; echo "QARESULT [$t] rc=$rc"
             grep -n "QA shutdown loop\|FAILED\|with expansion" -A2 qa2.log | head -12
             grep -n -A30 "ERROR: AddressSanitizer" qa2.log | grep -v "^[0-9]*-    #[0-9]* 0x[0-9a-f]* in \(std::\|immer::detail\|__\)" | cut -c1-220 | head -40
