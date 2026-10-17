@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 using Catch::Matchers::Equals;
@@ -574,13 +575,15 @@ TEST_CASE("streaming: a stream listens to its own instance's producers", "[GSTRE
 
 TEST_CASE("streaming: a lobby join while a stream starts is not lost", "[GSTREAMER]") {
   using namespace wolf::core;
+  std::string kind = GENERATE("video", "audio");
   auto event_bus = std::make_shared<events::EventBusType>();
+  auto src_name = fmt::format("interpipesrc_42_{}", kind);
   gstreamer::gst_element_ptr pipeline(
-      gst_parse_launch("interpipesrc name=interpipesrc_42_video listen-to=42_video ! fakesink", nullptr),
+      gst_parse_launch(fmt::format("interpipesrc name={} listen-to=42_{} ! fakesink", src_name, kind).c_str(), nullptr),
       [](GstElement *el) { gst_object_unref(el); });
   REQUIRE(pipeline);
   auto listen_to = [&] {
-    auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), "interpipesrc_42_video");
+    auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), src_name.c_str());
     gchar *value = nullptr;
     g_object_get(src, "listen-to", &value, nullptr);
     std::string result = value ? value : "";
@@ -597,7 +600,7 @@ TEST_CASE("streaming: a lobby join while a stream starts is not lost", "[GSTREAM
   auto handler = streaming::follow_producer(
       pipeline,
       42,
-      "video",
+      kind,
       [&] {
         // The join lands right after the stream read its producer: the switch it fires must reach this pipeline
         join = std::async(std::launch::async, [&] { switch_to("some-lobby"); });
@@ -606,10 +609,10 @@ TEST_CASE("streaming: a lobby join while a stream starts is not lost", "[GSTREAM
       },
       event_bus);
   join.wait();
-  REQUIRE(listen_to() == "some-lobby_video");
+  REQUIRE(listen_to() == "some-lobby_" + kind);
 
   switch_to("42_0badcafe");
-  REQUIRE(listen_to() == "42_0badcafe_video");
+  REQUIRE(listen_to() == "42_0badcafe_" + kind);
 }
 
 TEST_CASE("sessions: a stream whose session joined a lobby listens to the lobby's producers") {
