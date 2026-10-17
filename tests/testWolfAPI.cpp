@@ -954,6 +954,11 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
         req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
     REQUIRE(response);
     auto created = rfl::json::read<StreamSessionCreated>(response->second).value();
+    auto fired = std::make_shared<std::atomic<int>>(0);
+    auto video_handler = event_bus->register_handler<immer::box<events::VideoSession>>(
+        [fired](const immer::box<events::VideoSession> &) { (*fired)++; });
+    auto audio_handler = event_bus->register_handler<immer::box<events::AudioSession>>(
+        [fired](const immer::box<events::AudioSession> &) { (*fired)++; });
     for (auto mode : {wolf::core::virtual_display::DisplayMode{0, 0, 0},
                       wolf::core::virtual_display::DisplayMode{2147483647, 2147483647, 2147483647},
                       wolf::core::virtual_display::DisplayMode{1920, 1080, 1001}}) {
@@ -965,6 +970,9 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
       REQUIRE(response->first == 400);
       REQUIRE_THAT(response->second, ContainsSubstring("Invalid video_session.display_mode"));
     }
+    REQUIRE(*fired == 0); // rejected before anything reached the event bus
+    video_handler.unregister();
+    audio_handler.unregister();
   }
 
   { // runners/start on a real session replies (it used to close the connection without an answer)
