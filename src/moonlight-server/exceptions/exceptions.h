@@ -8,10 +8,12 @@
 
 #include <cpptrace/cpptrace.hpp>
 #include <csignal>
+#include <cstdio>
 #include <fcntl.h>
 #include <filesystem>
 #include <helpers/logger.hpp>
 #include <helpers/utils.hpp>
+#include <iostream>
 #include <unistd.h>
 
 using namespace std::string_literals;
@@ -81,6 +83,10 @@ static void check_exceptions() {
   if (std::filesystem::exists(stack_file)) {
     if (auto object_trace = load_stacktrace_from(stack_file)) {
       object_trace->resolve().print();
+      // stdout is block-buffered when redirected (docker/k8s logs) and a crash's _exit drops the buffer: flush now so
+      // a crash loop still shows the previous crash's trace
+      std::cout.flush();
+      std::fflush(stdout);
     }
     auto now = std::chrono::system_clock::now();
     std::filesystem::rename(
