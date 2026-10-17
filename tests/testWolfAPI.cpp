@@ -762,6 +762,7 @@ TEST_CASE("Sessions API: the listed state follows the stream's events", "[API]")
   auto rtp_secret = [](char id) { return std::array<char, 16>{id}; };
   auto video_session = [&](char secret) {
     events::VideoSession video{.session_id = session_id};
+    video.display_mode = {.width = 1920, .height = 1080, .refreshRate = 60};
     video.rtp_secret_payload = rtp_secret(secret);
     return video;
   };
@@ -938,6 +939,40 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
     REQUIRE(response);
     REQUIRE(response->first == 500);
     REQUIRE_THAT(response->second, ContainsSubstring("Invalid session_id"));
+  }
+
+  { // sessions/start on a real session rejects a zero or absurd display mode instead of streaming it
+    auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
+        .client_ip = "127.0.0.1",
+        .video_width = 1920,
+        .video_height = 1080,
+        .video_refresh_rate = 60,
+        .app_id = "304556286",               // test cfg file
+        .client_id = "10594003729173467913", // test cfg file
+    };
+    auto response =
+        req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
+    REQUIRE(response);
+    auto created = rfl::json::read<StreamSessionCreated>(response->second).value();
+    auto fired = std::make_shared<std::atomic<int>>(0);
+    auto video_handler = event_bus->register_handler<immer::box<events::VideoSession>>(
+        [fired](const immer::box<events::VideoSession> &) { (*fired)++; });
+    auto audio_handler = event_bus->register_handler<immer::box<events::AudioSession>>(
+        [fired](const immer::box<events::AudioSession> &) { (*fired)++; });
+    for (auto mode : {wolf::core::virtual_display::DisplayMode{0, 0, 0},
+                      wolf::core::virtual_display::DisplayMode{2147483647, 2147483647, 2147483647},
+                      wolf::core::virtual_display::DisplayMode{1920, 1080, 1001}}) {
+      auto start_request = StreamSessionStartRequest{.session_id = created.session_id};
+      start_request.video_session.display_mode = mode;
+      response =
+          req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/start", rfl::json::write(start_request));
+      REQUIRE(response);
+      REQUIRE(response->first == 400);
+      REQUIRE_THAT(response->second, ContainsSubstring("Invalid video_session.display_mode"));
+    }
+    REQUIRE(*fired == 0); // rejected before anything reached the event bus
+    video_handler.unregister();
+    audio_handler.unregister();
   }
 
   { // runners/start on a real session replies (it used to close the connection without an answer)
