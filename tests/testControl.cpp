@@ -8,6 +8,7 @@ using Catch::Matchers::Equals;
 #include <cstring>
 #include <moonlight/control.hpp>
 #include <mutex>
+#include <set>
 #include <state/sessions.hpp>
 #include <streaming/streaming.hpp>
 #include <thread>
@@ -472,13 +473,26 @@ TEST_CASE("streaming: a resumed stream keeps receiving after the superseded one 
   boost::asio::io_context io;
   auto rtp_secret = [](char id) { return std::array<char, 16>{id}; };
 
-  // One live producer per kind, as a running wayland display / pulse sink would be
-  auto producer = gst_parse_launch("videotestsrc is-live=true ! video/x-raw,width=16,height=16 ! "
-                                   "interpipesink name=42_cafe_video sync=false "
-                                   "audiotestsrc is-live=true ! interpipesink name=42_cafe_audio sync=false",
-                                   nullptr);
-  REQUIRE(producer);
-  gst_element_set_state(producer, GST_STATE_PLAYING);
+  // Live producers, as a running wayland display / pulse sink would be: the stream's own, and a lobby's.
+  // Each sends datagrams of its own size, so a client can tell which one it is getting.
+  auto start_producer = [](const std::string &name, int size, int samples) {
+    auto producer = gst_parse_launch(
+        fmt::format("videotestsrc is-live=true ! video/x-raw,format=I420,width={0},height={0} ! "
+                    "interpipesink name={2}_video sync=false "
+                    "audiotestsrc is-live=true samplesperbuffer={1} ! audio/x-raw,format=S16LE,channels=1,rate=48000 ! "
+                    "interpipesink name={2}_audio sync=false",
+                    size,
+                    samples,
+                    name)
+            .c_str(),
+        nullptr);
+    REQUIRE(producer);
+    gst_element_set_state(producer, GST_STATE_PLAYING);
+    return producer;
+  };
+  auto producer = start_producer("42_cafe", 16, 100), lobby = start_producer("lobby", 32, 300);
+  const std::set<std::size_t> own_video{16 * 16 * 3 / 2}, own_audio{100 * 2};
+  const std::set<std::size_t> lobby_video{32 * 32 * 3 / 2}, lobby_audio{300 * 2};
 
   // Consumers named as the configured default_source names them; each sends to its own client port
   auto client = [&] {
@@ -523,25 +537,25 @@ TEST_CASE("streaming: a resumed stream keeps receiving after the superseded one 
                                        "");
     }).detach();
   };
-  // Datagrams that reach `socket` over the next 500 ms
+  // The sizes of the datagrams that reach `socket` over the next 500 ms
   auto received = [](const std::shared_ptr<boost::asio::ip::udp::socket> &socket) {
     std::array<char, 65536> buf{};
-    std::size_t count = 0;
+    std::set<std::size_t> sizes;
     for (auto until = std::chrono::steady_clock::now() + 500ms; std::chrono::steady_clock::now() < until;) {
       boost::system::error_code ec;
-      if (socket->receive(boost::asio::buffer(buf), 0, ec) > 0) {
-        count++;
+      if (auto size = socket->receive(boost::asio::buffer(buf), 0, ec); size > 0) {
+        sizes.insert(size);
       } else {
         std::this_thread::sleep_for(5ms);
       }
     }
-    return count;
+    return sizes;
   };
 
   auto old_video = client(), old_audio = client();
   start(1, old_video, old_audio);
   std::this_thread::sleep_for(700ms);
-  REQUIRE(received(old_video) > 0);
+  REQUIRE(received(old_video) == own_video);
 
   // A /resume starts the new stream's pipelines while the dead client's are still running, then ends the old ones
   auto resumed_video = client(), resumed_audio = client();
@@ -554,13 +568,24 @@ TEST_CASE("streaming: a resumed stream keeps receiving after the superseded one 
   received(resumed_video);
   received(resumed_audio);
 
-  CHECK(received(resumed_video) > 0);
-  CHECK(received(resumed_audio) > 0);
+  CHECK(received(resumed_video) == own_video);
+  CHECK(received(resumed_audio) == own_audio);
+
+  // Joining a lobby switches the resumed stream's consumers, found by their own names
+  event_bus->fire_event(immer::box<events::SwitchStreamProducerEvents>(
+      events::SwitchStreamProducerEvents{.session_id = 42, .interpipe_src_id = "lobby"}));
+  std::this_thread::sleep_for(300ms);
+  received(resumed_video);
+  received(resumed_audio);
+  CHECK(received(resumed_video) == lobby_video);
+  CHECK(received(resumed_audio) == lobby_audio);
 
   event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = 42}));
   std::this_thread::sleep_for(500ms);
-  gst_element_set_state(producer, GST_STATE_NULL);
-  gst_object_unref(producer);
+  for (auto pipeline : {producer, lobby}) {
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+  }
 }
 
 /**
