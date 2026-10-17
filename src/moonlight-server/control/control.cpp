@@ -275,6 +275,10 @@ void run_control(int port,
                 break;
               }
               auto decrypted = decrypt_packet(*enc_pkt, client_session->aes_key);
+              if (decrypted.size() < sizeof(ControlPacket)) {
+                logs::log(logs::warning, "[ENET] Dropping decrypted packet of {} bytes", decrypted.size());
+                break;
+              }
               auto sub_type = ((ControlPacket *)decrypted.data())->type;
 
               logs::log(logs::trace,
@@ -286,7 +290,7 @@ void run_control(int port,
                 pause_stream(running_sessions, client_session.value(), event_bus);
               } else if (sub_type == INPUT_DATA) {
                 immer::box<std::shared_ptr<ENetPeer>> enet_client = {to_shared_ptr(event.peer)};
-                handle_input(client_session.value(), enet_client, (INPUT_PKT *)decrypted.data());
+                handle_input(client_session.value(), enet_client, (INPUT_PKT *)decrypted.data(), decrypted.size());
               } else if (sub_type == IDR_FRAME) {
                 auto ev = IDRRequestEvent{.session_id = client_session->session_id};
                 event_bus->fire_event(immer::box<IDRRequestEvent>{ev});
