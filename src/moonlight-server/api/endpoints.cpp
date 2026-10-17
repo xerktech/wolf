@@ -219,6 +219,16 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
   if (session) {
     immer::box<events::App> choosen_app;
     auto ss = session.value();
+    if (!moonlight::is_valid_display_mode(ss.video_width, ss.video_height, ss.video_refresh_rate)) {
+      logs::log(logs::warning,
+                "[API] Invalid display mode: {}x{}x{}",
+                ss.video_width,
+                ss.video_height,
+                ss.video_refresh_rate);
+      auto res = GenericErrorResponse{.error = "Invalid video_width, video_height or video_refresh_rate"};
+      send_http(socket, 400, rfl::json::write(res));
+      return;
+    }
     if (auto app_id = ss.app_id) {
       auto app = state::get_moonlight_app_by_id(this->state_->app_state->config, *app_id);
       if (!app) {
