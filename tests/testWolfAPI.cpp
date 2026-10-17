@@ -972,7 +972,7 @@ TEST_CASE("Runners: many concurrent starts on one session that exit at once", "[
 
   // Each runner exits at once with stop_stream_when_over: the first exit removes the session (and its devices queue)
   // while the other starts are still being handled (XERK-2023: this aborted Wolf on a freed devices queue).
-  constexpr int rounds = 20;
+  const int rounds = std::getenv("QA_ROUNDS") ? std::atoi(std::getenv("QA_ROUNDS")) : 20;
   constexpr int runners_per_round = 32;
   for (int round = 0; round < rounds; round++) {
     auto session = events::StreamSession{.event_bus = event_bus,
@@ -1468,4 +1468,78 @@ TEST_CASE("SSE APIs large events", "[API]") {
   }
   REQUIRE(ec == boost::asio::error::eof);
   REQUIRE(drained < 80 * big_event.container_id.size());
+}
+
+// QA (XERK-2023 scratch): a StopStreamEvent reaching a process runner whose child was already reaped
+// (between ios.run() returning and terminate_handler.unregister()) or already terminated once.
+TEST_CASE("QA: process runners survive StopStreamEvents while siblings exit", "[QA]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  std::atomic_bool done = false;
+  std::atomic_long fired = 0;
+  std::thread storm([&]() {
+    while (!done) {
+      event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = 77}));
+      fired++;
+    }
+  });
+  const int rounds = std::getenv("QA_STORM_ROUNDS") ? std::atoi(std::getenv("QA_STORM_ROUNDS")) : 100;
+  for (int round = 0; round < rounds; round++) {
+    std::vector<std::thread> ts;
+    for (int i = 0; i < 32; i++) {
+      ts.emplace_back([&]() {
+        auto runner = state::get_runner(wolf::config::AppCMD{.run_cmd = "true"}, event_bus);
+        runner->run("77",
+                    "/tmp",
+                    "/tmp",
+                    std::make_shared<events::devices_atom_queue>(),
+                    immer::array<std::string>{},
+                    immer::array<std::pair<std::string, std::string>>{},
+                    immer::map<std::string, std::string>{},
+                    "");
+      });
+    }
+    for (auto &t : ts) {
+      t.join();
+    }
+  }
+  done = true;
+  storm.join();
+  logs::log(logs::warning, "QA storm fired {} StopStreamEvents", fired.load());
+  SUCCEED();
+}
+
+// QA: two StopStreamEvents for one session close together (two sibling runners exiting at once), runners sleeping
+TEST_CASE("QA: double StopStreamEvent for one session with live runners", "[QA]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  const int rounds = std::getenv("QA_DOUBLE_ROUNDS") ? std::atoi(std::getenv("QA_DOUBLE_ROUNDS")) : 50;
+  for (int round = 0; round < rounds; round++) {
+    std::vector<std::thread> ts;
+    for (int i = 0; i < 16; i++) {
+      ts.emplace_back([&]() {
+        auto runner = state::get_runner(wolf::config::AppCMD{.run_cmd = "sleep 5"}, event_bus);
+        runner->run("78",
+                    "/tmp",
+                    "/tmp",
+                    std::make_shared<events::devices_atom_queue>(),
+                    immer::array<std::string>{},
+                    immer::array<std::pair<std::string, std::string>>{},
+                    immer::map<std::string, std::string>{},
+                    "");
+      });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    std::thread a([&]() {
+      event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = 78}));
+    });
+    std::thread b([&]() {
+      std::this_thread::sleep_for(std::chrono::microseconds(round * 20));
+      event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = 78}));
+    });
+    a.join();
+    b.join();
+    for (auto &t : ts) {
+      t.join();
+    }
+  }
+  SUCCEED();
 }

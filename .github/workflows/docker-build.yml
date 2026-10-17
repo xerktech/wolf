@@ -7,7 +7,7 @@ name: Docker build
 on:
   push:
     # Branches only: a tag has no {{branch}}, so the sha tag would be an invalid ":-<sha>".
-    branches: ["**"]
+    branches: ["qa-disabled-never"]
     paths-ignore:
       - "docs/**"
   workflow_dispatch:
