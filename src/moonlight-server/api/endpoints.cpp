@@ -21,7 +21,8 @@ void UnixSocketServer::endpoint_Events(const HTTPRequest &req, std::shared_ptr<U
 
 void UnixSocketServer::endpoint_PendingPairRequest(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto requests = std::vector<PendingPairClient>();
-  for (auto [secret, pair_request] : *(state_->app_state)->pairing_atom->load()) {
+  auto pairing = state_->app_state->pairing_atom->load(); // iterate a snapshot that an update can't free under us
+  for (auto [secret, pair_request] : *pairing) {
     requests.push_back({.pair_secret = secret, .client_ip = pair_request->client_ip});
   }
   send_http(socket, 200, rfl::json::write(PendingPairRequestsResponse{.requests = requests}));
@@ -30,7 +31,8 @@ void UnixSocketServer::endpoint_PendingPairRequest(const HTTPRequest &req, std::
 void UnixSocketServer::endpoint_Pair(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto event = rfl::json::read<PairRequest>(req.body);
   if (event) {
-    if (auto pair_request = state_->app_state->pairing_atom->load()->find(event.value().pair_secret)) {
+    auto pairing = state_->app_state->pairing_atom->load(); // find() points into this snapshot: keep it alive
+    if (auto pair_request = pairing->find(event.value().pair_secret)) {
       pair_request->get().user_pin->set_value(event.value().pin.value()); // Resolve the promise
       state_->app_state->pairing_atom->update(
           [pair_secret = event.value().pair_secret](auto pairing_map) { return pairing_map.erase(pair_secret); });
