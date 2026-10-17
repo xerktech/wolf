@@ -33,12 +33,19 @@ paths:
     (wayland display) running, so it carries the name over.
   - Consumers get it from the running session; `listen_to_producer` rewrites the configured
     `listen-to=<session_id>_<kind>` before the pipeline plays. Lobby leave switches back to it.
+  - A consumer starting after its session joined a lobby must start on the lobby's producers
+    (`state::stream_producer_name`): `SwitchStreamProducerEvents` only reaches running pipelines.
+    A /resume's new pipelines can start seconds after a join (XERK-2045).
+  - The name is resolved after the pipeline's switch handler is registered, under a lock shared
+    with it; join/leave update `connected_sessions` before firing the switch. Keep both orders,
+    or a join while the stream starts is lost.
 - `PauseStreamEvent` is also broadcast on the API event stream; external tools (fenrir) read it as
   "this client's stream paused". Don't overload it with per-instance semantics.
 - Tests: `tests/testControl.cpp` — "control: a dead client's late pause doesn't end its resumed
   stream" (real ENet), "streaming: a superseded stream instance ends only its own pipelines".
   - "sessions: a stopped or replaced stream instance is no longer the running one".
   - "streaming: a stream listens to its own instance's producers".
+  - "sessions: a stream whose session joined a lobby listens to the lobby's producers".
   - The ENet test client must keep servicing its host after connect, or the server never sees the
     CONNECT (the handshake ack is sent on the next service call).
 - `StreamSession::stream_state` backs the `state` field of `GET /api/v1/sessions`, so a client that

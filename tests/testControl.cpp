@@ -414,13 +414,14 @@ TEST_CASE("streaming: a superseded stream instance ends only its own pipelines",
     video.rtp_secret_payload = rtp_secret(secret);
     auto ended = std::make_shared<std::atomic_bool>(false);
     std::thread([=, &io] {
-      streaming::start_streaming_video(video,
-                                       "",
-                                       event_bus,
-                                       "127.0.0.1",
-                                       9,
-                                       std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>(),
-                                       std::make_shared<boost::asio::ip::udp::socket>(io, boost::asio::ip::udp::v4()));
+      streaming::start_streaming_video(
+          video,
+          [] { return std::string(); },
+          event_bus,
+          "127.0.0.1",
+          9,
+          std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>(),
+          std::make_shared<boost::asio::ip::udp::socket>(io, boost::asio::ip::udp::v4()));
       *ended = true;
     }).detach();
     return ended;
@@ -430,14 +431,15 @@ TEST_CASE("streaming: a superseded stream instance ends only its own pipelines",
     audio.rtp_secret_payload = rtp_secret(secret);
     auto ended = std::make_shared<std::atomic_bool>(false);
     std::thread([=, &io] {
-      streaming::start_streaming_audio(audio,
-                                       "",
-                                       event_bus,
-                                       "127.0.0.1",
-                                       9,
-                                       std::make_shared<boost::asio::ip::udp::socket>(io, boost::asio::ip::udp::v4()),
-                                       "sink",
-                                       "");
+      streaming::start_streaming_audio(
+          audio,
+          [] { return std::string(); },
+          event_bus,
+          "127.0.0.1",
+          9,
+          std::make_shared<boost::asio::ip::udp::socket>(io, boost::asio::ip::udp::v4()),
+          "sink",
+          "");
       *ended = true;
     }).detach();
     return ended;
@@ -567,6 +569,25 @@ TEST_CASE("streaming: a stream listens to its own instance's producers", "[GSTRE
   // A custom source, or no known producer, keeps the configured one
   REQUIRE(listen_to("some-lobby_video", "42_0badcafe") == "some-lobby_video");
   REQUIRE(listen_to("42_video", "") == "42_video");
+}
+
+TEST_CASE("sessions: a stream whose session joined a lobby listens to the lobby's producers") {
+  using namespace wolf::core;
+  events::StreamSession session{.session_id = 42};
+  session.producer_name = "42_0badcafe";
+  immer::vector<events::StreamSession> sessions{session};
+  events::Lobby lobby{.id = "some-lobby"};
+  immer::vector<events::Lobby> lobbies{lobby};
+
+  REQUIRE(state::stream_producer_name(sessions, lobbies, 42) == "42_0badcafe");
+  REQUIRE(state::stream_producer_name(sessions, lobbies, 7) == "");
+
+  // Joined before the stream's pipelines start (e.g. during a /resume overlap): they must start on the lobby
+  lobby.connected_sessions->update([](auto ids) { return ids.push_back(immer::box<std::string>{"42"}); });
+  REQUIRE(state::stream_producer_name(sessions, lobbies, 42) == "some-lobby");
+
+  lobby.connected_sessions->store({});
+  REQUIRE(state::stream_producer_name(sessions, lobbies, 42) == "42_0badcafe");
 }
 
 TEST_CASE("sessions: a session built without a producer name keeps its id's producers") {

@@ -61,11 +61,13 @@ void listen_to_producer(GstElement *pipeline,
                         const std::string &kind);
 
 /**
- * `producer_name` is the interpipe producer the stream's configured interpipesrc should listen to in place of
- * `<session_id>_video` (see StreamSession::producer_name); empty keeps the configured listen-to.
+ * `producer_name` returns the interpipe producer the stream's configured interpipesrc should listen to in place of
+ * `<session_id>_video`: the session's own (see StreamSession::producer_name) or the lobby it has joined; empty keeps
+ * the configured listen-to. It is called once the pipeline listens for SwitchStreamProducerEvents, so a join that
+ * happens while the stream starts is not lost.
  */
 void start_streaming_video(immer::box<events::VideoSession> video_session,
-                           const std::string &producer_name,
+                           const std::function<std::string()> &producer_name,
                            const std::shared_ptr<events::EventBusType> &event_bus,
                            std::string client_ip,
                            unsigned short client_port,
@@ -73,7 +75,7 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
                            std::shared_ptr<udp::socket> video_socket);
 
 void start_streaming_audio(immer::box<events::AudioSession> audio_session,
-                           const std::string &producer_name,
+                           const std::function<std::string()> &producer_name,
                            const std::shared_ptr<events::EventBusType> &event_bus,
                            std::string client_ip,
                            unsigned short client_port,
