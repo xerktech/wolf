@@ -3,6 +3,7 @@ paths:
   - "src/moonlight-server/state/configTOML.cpp"
   - "src/moonlight-server/state/config.hpp"
   - "src/moonlight-server/api/endpoints.cpp"
+  - "src/moonlight-server/state/default/*.toml"
 ---
 
 # config.toml writes
@@ -25,6 +26,17 @@ paths:
 - A failed save is logged, not thrown: an exception from an API handler terminates Wolf.
 - Tests: `tests/testMoonlight.cpp` "LocalState concurrent updates" (lost updates, mode, planted
   temp symlink/FIFO).
+
+# Default config (config.v7.toml)
+
+- `config.include.toml` is generated from `config.v7.toml` by `make_includable` at cmake
+  configure time only, and it is checked in: edit both, and re-run cmake (not just ninja).
+- Every encoder needs `video_params` and `video_params_zero_copy`, either inline or via
+  `[gstreamer.video.defaults.<plugin_name>]`; a missing one resolves to "" and the pipeline fails
+  to parse (XERK-2026).
+  - Tests: `tests/testMoonlight.cpp` "Default config: every encoder has video_params".
+- Only `config_version <= 6` is migrated on load: a fix to the defaults never reaches an existing
+  v7 config.toml without a version bump.
 
 # Running wolf locally to drive the API
 
