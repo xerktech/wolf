@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <curl/curl.h>
 #include <filesystem>
+#include <set>
 #include <future>
 #include <poll.h>
 #ifdef __GLIBC__
@@ -1542,4 +1543,79 @@ TEST_CASE("QA: double StopStreamEvent for one session with live runners", "[QA]"
     }
   }
   SUCCEED();
+}
+
+// QA: wolf.cpp:264 shutdown loop, verbatim, against the real moonlight StopStreamEvent handler
+TEST_CASE("QA: shutdown loop over running_sessions->load().get()", "[QA]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .host = immer::box<state::Host>(state::Host{}),
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .running_sessions = running_sessions});
+  auto handlers = sessions::setup_moonlight_handlers(app_state, api_runtime_dir(), {});
+  const int n = 40;
+  for (int i = 0; i < n; i++) {
+    auto session = events::StreamSession{.event_bus = event_bus,
+                                         .enet_secret_payload = static_cast<uint32_t>(i + 1),
+                                         .session_id = static_cast<std::size_t>(9000 + i)};
+    running_sessions->update([&](const auto &sessions) { return sessions.push_back(session); });
+  }
+  int fired = 0;
+  std::set<std::size_t> seen;
+  for (const auto &session : app_state->running_sessions->load().get()) {
+    seen.insert(session.session_id);
+    event_bus->fire_event(
+        immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session.session_id}));
+    fired++;
+  }
+  logs::log(logs::warning, "QA shutdown loop fired {} distinct {} remaining {}", fired, seen.size(),
+            running_sessions->load()->size());
+  REQUIRE(running_sessions->load()->size() == 0);
+  REQUIRE(seen.size() == n);
+}
+
+// QA: api/endpoints.cpp:24 iterates *pairing_atom->load() while pairing requests come and go
+TEST_CASE("QA: pending pair listing while pair requests change", "[QA]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto pairing = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>();
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .host = immer::box<state::Host>(state::Host{}),
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = pairing,
+      .event_bus = event_bus,
+      .running_sessions = running_sessions});
+  start_api_server(app_state);
+  auto socket_path = api_socket_path();
+  std::atomic_bool done = false;
+  std::thread churn([&]() {
+    long i = 0;
+    while (!done) {
+      auto key = std::to_string(i++ % 64);
+      pairing->update([&](auto m) {
+        return m.set(key,
+                     immer::box<events::PairSignal>(events::PairSignal{.client_ip = std::string(200, 'x') + key}));
+      });
+      pairing->update([&](auto m) { return m.erase(std::to_string((i * 7) % 64)); });
+    }
+  });
+  int ok = 0;
+  for (int i = 0; i < 3000; i++) {
+    auto curl = curl_ptr(curl_easy_init(), ::curl_easy_cleanup);
+    curl_easy_setopt(curl.get(), CURLOPT_UNIX_SOCKET_PATH, socket_path.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
+    auto r = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/pair/pending");
+    if (r && r->first == 200)
+      ok++;
+  }
+  done = true;
+  churn.join();
+  REQUIRE(ok == 3000);
 }
