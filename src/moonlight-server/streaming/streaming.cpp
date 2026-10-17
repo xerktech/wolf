@@ -12,6 +12,7 @@
 #include <immer/array.hpp>
 #include <immer/box.hpp>
 #include <memory>
+#include <mutex>
 #include <streaming/streaming.hpp>
 #include <thread>
 
@@ -244,6 +245,44 @@ void listen_to_producer(GstElement *pipeline,
   gst_object_unref(src);
 }
 
+events::EventBusHandlers follow_producer(const gstreamer::gst_element_ptr &pipeline,
+                                         const std::string &consumer_name,
+                                         std::size_t session_id,
+                                         const std::string &kind,
+                                         const std::function<std::string()> &producer_name,
+                                         const std::shared_ptr<events::EventBusType> &event_bus) {
+  /* Serialises the initial listen-to with a lobby switch, so that neither overwrites the other's newer producer */
+  auto listen_lock = std::make_shared<std::mutex>();
+  auto switch_handler = event_bus->register_handler<immer::box<events::SwitchStreamProducerEvents>>(
+      [consumer_name, session_id, kind, pipeline, listen_lock](
+          const immer::box<events::SwitchStreamProducerEvents> &switch_ev) {
+        if (switch_ev->session_id == session_id) {
+          std::lock_guard lock(*listen_lock);
+          logs::log(logs::debug,
+                    "[GSTREAMER] Switching {} producer for {} to {}",
+                    kind,
+                    session_id,
+                    switch_ev->interpipe_src_id);
+          if (auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), consumer_name.c_str())) {
+            /* Perform the switch */
+            auto interpipe = fmt::format("{}_{}", switch_ev->interpipe_src_id, kind);
+            g_object_set(src, "listen-to", interpipe.c_str(), nullptr);
+            gst_object_unref(src);
+          } else {
+            logs::log(logs::error, "[GSTREAMER] Failed to get {} interpipesrc for {}", kind, session_id);
+          }
+        }
+      });
+
+  /*
+   * Pick the producer only once the switch handler is registered: a lobby join or leave after this point reaches it,
+   * one before is already in producer_name() (the lobby membership is updated before the switch is fired).
+   */
+  std::lock_guard lock(*listen_lock);
+  listen_to_producer(pipeline.get(), consumer_name, session_id, producer_name(), kind);
+  return switch_handler;
+}
+
 namespace custom_sink {
 
 struct PacingConfig {
@@ -422,7 +461,7 @@ static void configure_appsink(GstElement *appsink, UDPSink *udp_sink) {
  * Start VIDEO pipeline
  */
 void start_streaming_video(immer::box<events::VideoSession> video_session,
-                           const std::string &producer_name,
+                           const std::function<std::string()> &producer_name,
                            const std::shared_ptr<events::EventBusType> &event_bus,
                            std::string client_ip,
                            unsigned short client_port,
@@ -463,7 +502,6 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
   std::shared_ptr<NeedContextData> ctx_data_ptr = std::make_shared<NeedContextData>(
       NeedContextData{.device_path = video_session->render_node, .gst_context = video_context});
   run_pipeline(pipeline, [video_session, consumer, producer_name, event_bus, udp_sink, ctx_data_ptr](auto pipeline) {
-    listen_to_producer(pipeline.get(), consumer, video_session->session_id, producer_name, "video");
     if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
       logs::log(logs::debug, "Setting up wolf_udp_sink");
       g_assert(GST_IS_APP_SINK(app_sink_el));
@@ -513,25 +551,8 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
           }
         });
 
-    auto switch_producer_handler = event_bus->register_handler<immer::box<events::SwitchStreamProducerEvents>>(
-        [sess_id = video_session->session_id, consumer, pipeline](
-            const immer::box<events::SwitchStreamProducerEvents> &switch_ev) {
-          if (switch_ev->session_id == sess_id) {
-            logs::log(logs::debug,
-                      "[GSTREAMER] Switching video producer pipeline for {} to {}",
-                      sess_id,
-                      switch_ev->interpipe_src_id);
-            /* Grab a reference to the interpipesrc */
-            if (auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), consumer.c_str())) {
-              /* Perform the switch */
-              auto video_interpipe = fmt::format("{}_video", switch_ev->interpipe_src_id);
-              g_object_set(src, "listen-to", video_interpipe.c_str(), nullptr);
-              gst_object_unref(src);
-            } else {
-              logs::log(logs::error, "[GSTREAMER] Failed to get video interpipesrc for {}", sess_id);
-            }
-          }
-        });
+    auto switch_producer_handler =
+        follow_producer(pipeline, consumer, video_session->session_id, "video", producer_name, event_bus);
 
     auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
         [sess_id = video_session->session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
@@ -562,7 +583,7 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
  * Start AUDIO pipeline
  */
 void start_streaming_audio(immer::box<events::AudioSession> audio_session,
-                           const std::string &producer_name,
+                           const std::function<std::string()> &producer_name,
                            const std::shared_ptr<events::EventBusType> &event_bus,
                            std::string client_ip,
                            unsigned short client_port,
@@ -596,7 +617,6 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
 
   auto session_id = audio_session->session_id;
   run_pipeline(pipeline, [audio_session, session_id, consumer, producer_name, udp_sink, event_bus](auto pipeline) {
-    listen_to_producer(pipeline.get(), consumer, session_id, producer_name, "audio");
     if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
       logs::log(logs::debug, "Setting up wolf_udp_sink");
       g_assert(GST_IS_APP_SINK(app_sink_el));
@@ -625,24 +645,7 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
           }
         });
 
-    auto switch_producer_handler = event_bus->register_handler<immer::box<events::SwitchStreamProducerEvents>>(
-        [session_id, consumer, pipeline](const immer::box<events::SwitchStreamProducerEvents> &switch_ev) {
-          if (switch_ev->session_id == session_id) {
-            logs::log(logs::debug,
-                      "[GSTREAMER] Switching audio producer for {} to {}",
-                      session_id,
-                      switch_ev->interpipe_src_id);
-
-            if (auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), consumer.c_str())) {
-              /* Perform the switch */
-              auto audio_interpipe = fmt::format("{}_audio", switch_ev->interpipe_src_id);
-              g_object_set(src, "listen-to", audio_interpipe.c_str(), nullptr);
-              gst_object_unref(src);
-            } else {
-              logs::log(logs::error, "[GSTREAMER] Failed to get audio interpipesrc for {}", session_id);
-            }
-          }
-        });
+    auto switch_producer_handler = follow_producer(pipeline, consumer, session_id, "audio", producer_name, event_bus);
 
     auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
         [session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
