@@ -659,6 +659,20 @@ TEST_CASE("HTTP Pairing", "[MoonlightProtocol]") {
       require_session_gone(next_phase("clientpairingsecret", moonlight_data.client_pairing_secret));
     }
 
+    SECTION("a failed phase 4") {
+      start_pairing();
+      REQUIRE(next_phase("clientchallenge", moonlight_data.client_challenge).status ==
+              SimpleWeb::StatusCode::success_ok);
+      REQUIRE(next_phase("serverchallengeresp", moonlight_data.server_challenge_resp).status ==
+              SimpleWeb::StatusCode::success_ok);
+      // The server challenge is random here, so the client hash check fails
+      REQUIRE(next_phase("clientpairingsecret", moonlight_data.client_pairing_secret).status ==
+              SimpleWeb::StatusCode::client_error_bad_request);
+      REQUIRE_THAT(app_state->config->paired_clients->load().get(), Catch::Matchers::IsEmpty());
+
+      require_session_gone(next_phase("clientpairingsecret", moonlight_data.client_pairing_secret));
+    }
+
     SECTION("a query matching no phase leaves the session alone") {
       start_pairing();
       REQUIRE_FALSE(endpoints::pair_next_phase(app_state, {{"foo", "bar"}}, "1234", "0.0.0.0").has_value());
