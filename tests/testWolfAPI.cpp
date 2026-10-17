@@ -1597,7 +1597,7 @@ TEST_CASE("QA: shutdown loop held snapshot (663daa1 shape)", "[QA]") {
     qa_shutdown_loop(true);
 }
 
-TEST_CASE("QA: shutdown loop load() temporary (pre-fix shape, control)", "[QA]") {
+TEST_CASE("QA: shutdown loop load() temporary (pre-fix shape control)", "[QA]") {
   qa_shutdown_loop(false);
 }
 
