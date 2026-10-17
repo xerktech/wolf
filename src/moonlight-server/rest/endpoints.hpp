@@ -233,6 +233,74 @@ XMLResult pair_phase4(state::PairCache &client_cache, const std::string &client_
   return {is_paired ? SimpleWeb::StatusCode::success_ok : SimpleWeb::StatusCode::client_error_bad_request, xml};
 }
 
+/* client_id is hardcoded in Moonlight, we add the IP so that different users can pair at the same time */
+std::string pair_cache_key(const std::string &client_id, const std::string &client_ip) {
+  return client_id + "@" + client_ip;
+}
+
+/**
+ * Pairing phases 2 to 4: picks the phase from the request query and runs it against the client's pairing session.
+ *
+ * Security measure: the pairing session is removed when phase 2 or 3 fails, and once phase 4 completes either way,
+ * so a client whose challenge was rejected has to start pairing again from phase 1.
+ *
+ * @return the response to send, or std::nullopt when the query matches no phase
+ */
+std::optional<XMLResult> pair_next_phase(const immer::box<state::AppState> &state,
+                                         const SimpleWeb::CaseInsensitiveMultimap &headers,
+                                         const std::string &client_id,
+                                         const std::string &client_ip) {
+  auto cache_key = pair_cache_key(client_id, client_ip);
+
+  auto client_cache_it = state->pairing_cache->load()->find(cache_key);
+  if (client_cache_it == nullptr) {
+    return XMLResult{SimpleWeb::StatusCode::client_error_bad_request,
+                     fail_pair(fmt::format("Unable to find {} {} in the pairing cache", client_id, client_ip))};
+  }
+  auto client_cache = *client_cache_it;
+
+  // PHASE 2
+  auto client_challenge = get_header(headers, "clientchallenge");
+  if (client_challenge) {
+    auto result = pair_phase2(state, client_cache, client_challenge.value(), cache_key);
+    if (result.status != SimpleWeb::StatusCode::success_ok) {
+      remove_pair_session(state, cache_key);
+    }
+    return result;
+  }
+
+  // PHASE 3
+  auto server_challenge = get_header(headers, "serverchallengeresp");
+  if (server_challenge && client_cache.server_secret) {
+    auto result = pair_phase3(state, client_cache, server_challenge.value(), cache_key);
+    if (result.status != SimpleWeb::StatusCode::success_ok) {
+      remove_pair_session(state, cache_key);
+    }
+    return result;
+  }
+
+  // PHASE 4
+  auto client_secret = get_header(headers, "clientpairingsecret");
+  if (client_secret && client_cache.server_challenge && client_cache.client_hash) {
+    auto result = pair_phase4(client_cache, client_secret.value());
+
+    if (result.status == SimpleWeb::StatusCode::success_ok) {
+      state::pair(
+          state->config,
+          state::PairedClient{.client_cert = client_cache.client_cert,
+                              .app_state_folder = std::to_string(std::hash<std::string>{}(client_cache.client_cert))});
+      logs::log(logs::info, "Succesfully paired {}", client_ip);
+    } else {
+      logs::log(logs::warning, "Failed pairing with {}", client_ip);
+    }
+
+    remove_pair_session(state, cache_key); // Either case, this session is done
+    return result;
+  }
+
+  return std::nullopt;
+}
+
 void pair(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTP>::Response> &response,
           const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTP>::Request> &request,
           const immer::box<state::AppState> &state) {
@@ -251,8 +319,7 @@ void pair(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTP>::Res
     return;
   }
 
-  /* client_id is hardcoded in Moonlight, we add the IP so that different users can pair at the same time */
-  auto cache_key = client_id.value() + "@" + client_ip;
+  auto cache_key = pair_cache_key(client_id.value(), client_ip);
 
   // PHASE 1
   if (client_id && salt && client_cert_str) {
@@ -269,59 +336,12 @@ void pair(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTP>::Res
     return;
   }
 
-  auto client_cache_it = state->pairing_cache->load()->find(cache_key);
-  if (client_cache_it == nullptr) {
-    send_xml<SimpleWeb::HTTP>(
-        response,
-        SimpleWeb::StatusCode::client_error_bad_request,
-        fail_pair(fmt::format("Unable to find {} {} in the pairing cache", client_id.value(), client_ip)));
-    return;
+  auto result = pair_next_phase(state, headers, client_id.value(), client_ip);
+  if (result) {
+    send_xml<SimpleWeb::HTTP>(response, result->status, result->xml);
+  } else {
+    logs::log(logs::warning, "Unable to match pair with any phase, you can retry pairing from Moonlight");
   }
-  auto client_cache = *client_cache_it;
-
-  // PHASE 2
-  auto client_challenge = get_header(headers, "clientchallenge");
-  if (client_challenge) {
-    auto [status, xml] = pair_phase2(state, client_cache, client_challenge.value(), cache_key);
-    send_xml<SimpleWeb::HTTP>(response, status, xml);
-    if (status != SimpleWeb::StatusCode::success_ok) {
-      remove_pair_session(state, cache_key); // security measure, remove the session if the pairing failed
-    }
-    return;
-  }
-
-  // PHASE 3
-  auto server_challenge = get_header(headers, "serverchallengeresp");
-  if (server_challenge && client_cache.server_secret) {
-    auto [status, xml] = pair_phase3(state, client_cache, server_challenge.value(), cache_key);
-    send_xml<SimpleWeb::HTTP>(response, status, xml);
-    if (status != SimpleWeb::StatusCode::success_ok) {
-      remove_pair_session(state, cache_key); // security measure, remove the session if the pairing failed
-    }
-    return;
-  }
-
-  // PHASE 4
-  auto client_secret = get_header(headers, "clientpairingsecret");
-  if (client_secret && client_cache.server_challenge && client_cache.client_hash) {
-    auto [status, xml] = pair_phase4(client_cache, client_secret.value());
-    send_xml<SimpleWeb::HTTP>(response, status, xml);
-
-    if (status == SimpleWeb::StatusCode::success_ok) {
-      state::pair(
-          state->config,
-          state::PairedClient{.client_cert = client_cache.client_cert,
-                              .app_state_folder = std::to_string(std::hash<std::string>{}(client_cache.client_cert))});
-      logs::log(logs::info, "Succesfully paired {}", client_ip);
-    } else {
-      logs::log(logs::warning, "Failed pairing with {}", client_ip);
-    }
-
-    remove_pair_session(state, cache_key); // Either case, this session is done
-    return;
-  }
-
-  logs::log(logs::warning, "Unable to match pair with any phase, you can retry pairing from Moonlight");
 }
 
 namespace https {
