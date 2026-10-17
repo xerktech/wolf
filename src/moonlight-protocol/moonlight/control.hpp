@@ -1,11 +1,13 @@
 #pragma once
 #include <array>
+#include <bitset>
 #include <boost/endian/conversion.hpp>
 #include <core/input.hpp>
 #include <crypto/crypto.hpp>
 #include <cstdint>
 #include <helpers/utils.hpp>
 #include <memory>
+#include <optional>
 
 namespace moonlight::control {
 
@@ -401,32 +403,127 @@ struct ControlEncryptedPacket {
 };
 
 /**
+ * How the control stream is encrypted, negotiated over RTSP: the host offers V2 in DESCRIBE
+ * (x-ss-general.encryptionSupported) and the client says what it enabled in ANNOUNCE (x-ss-general.encryptionEnabled).
+ */
+enum class ControlEncryption {
+  /**
+   * Nvidia's: only the low byte of seq goes into the 16-byte IV, the rest of seq isn't authenticated,
+   * and the IV repeats every 256 packets.
+   */
+  V1,
+  /**
+   * Sunshine's: the whole seq and who sent the packet go into a 12-byte IV
+   */
+  V2
+};
+
+/** Sunshine's encryption feature flag for V2 control stream encryption */
+static constexpr std::uint32_t SS_ENC_CONTROL_V2 = 0x01;
+
+/** Who sent an encrypted control packet, part of the V2 IV so that the two directions never share an IV */
+enum class ControlPacketOrigin : char {
+  CLIENT = 'C',
+  HOST = 'H'
+};
+
+/**
+ * The AES-GCM IV for the control packet with this (native byte order) seq, padded to 16 bytes;
+ * only control_iv_size() of it is used.
+ */
+static std::array<std::uint8_t, GCM_TAG_SIZE>
+control_iv(std::uint32_t seq, ControlEncryption encryption, ControlPacketOrigin origin) {
+  std::array<std::uint8_t, GCM_TAG_SIZE> iv = {0};
+  if (encryption == ControlEncryption::V2) {
+    iv[0] = seq;
+    iv[1] = seq >> 8;
+    iv[2] = seq >> 16;
+    iv[3] = seq >> 24;
+    iv[10] = static_cast<std::uint8_t>(origin);
+    iv[11] = 'C'; // Control stream
+  } else {
+    iv[0] = seq; // Truncated to the low byte, as Nvidia does
+  }
+  return iv;
+}
+
+static constexpr int control_iv_size(ControlEncryption encryption) {
+  return encryption == ControlEncryption::V2 ? 12 : GCM_TAG_SIZE;
+}
+
+/**
+ * Anti-replay state for the encrypted packets received on one stream (a sliding window, as in RFC 4303 3.4.3).
+ *
+ * Moonlight numbers every encrypted packet it sends with a single counter starting at 0, but spreads them over
+ * several ENet channels, some unreliable or unsequenced: packets can arrive out of order or not at all.
+ * A strict "seq > last" check would drop real input, so any seq not seen before is accepted as long as it's
+ * within the window behind the highest one received.
+ */
+struct ReplayWindow {
+  /**
+   * How far behind the highest seq a packet can still arrive. A reliable packet that ENet has to retransmit
+   * arrives behind everything sent on other channels in the meantime; this covers seconds of busy input.
+   */
+  static constexpr std::uint32_t SIZE = 4096;
+
+  std::optional<std::uint32_t> highest_seq;
+  std::bitset<SIZE> seen; // bit i: highest_seq - i has been accepted
+};
+
+/**
+ * Returns the window updated with `seq`, or nothing when `seq` must be dropped:
+ * it was already accepted (a replay) or it's too old for the window to tell.
+ * Only call it for a packet whose GCM tag verified with ControlEncryption::V2: with V1 the seq isn't authenticated,
+ * so a forged seq would move the window (and a seq far ahead would lock out every genuine packet).
+ */
+[[nodiscard]] static std::optional<ReplayWindow> accept_seq(ReplayWindow window, std::uint32_t seq) {
+  if (!window.highest_seq || seq > *window.highest_seq) {
+    auto shift = window.highest_seq ? seq - *window.highest_seq : ReplayWindow::SIZE;
+    window.seen = shift >= ReplayWindow::SIZE ? std::bitset<ReplayWindow::SIZE>{} : window.seen << shift;
+    window.seen.set(0);
+    window.highest_seq = seq;
+    return window;
+  }
+
+  auto age = *window.highest_seq - seq;
+  if (age >= ReplayWindow::SIZE || window.seen.test(age)) {
+    return std::nullopt;
+  }
+  window.seen.set(age);
+  return window;
+}
+
+/**
  * Given a received packet will decrypt the payload inside it.
  * This includes checking that the AES GCM TAG is valid and not tampered
  */
-static std::string decrypt_packet(const ControlEncryptedPacket &packet_data, std::string_view gcm_key) {
-  std::array<std::uint8_t, GCM_TAG_SIZE> iv_data = {0};
-  iv_data[0] = boost::endian::little_to_native(packet_data.seq);
+static std::string decrypt_packet(const ControlEncryptedPacket &packet_data,
+                                  std::string_view gcm_key,
+                                  ControlEncryption encryption = ControlEncryption::V1,
+                                  ControlPacketOrigin origin = ControlPacketOrigin::CLIENT) {
+  auto iv_data = control_iv(boost::endian::little_to_native(packet_data.seq), encryption, origin);
 
   return crypto::aes_decrypt_gcm(packet_data.encrypted_msg(),
                                  crypto::hex_to_str(gcm_key.data(), true),
                                  {packet_data.gcm_tag, GCM_TAG_SIZE},
                                  {(char *)iv_data.data(), iv_data.size()},
-                                 GCM_TAG_SIZE);
+                                 control_iv_size(encryption));
 }
 
 /**
  * Turns a payload into a properly formatted control encrypted packet
  */
-static std::unique_ptr<ControlEncryptedPacket>
-encrypt_packet(std::string_view gcm_key, std::uint32_t seq, std::string_view payload) {
-  std::array<std::uint8_t, GCM_TAG_SIZE> iv_data = {0};
-  iv_data[0] = boost::endian::native_to_little(seq);
+static std::unique_ptr<ControlEncryptedPacket> encrypt_packet(std::string_view gcm_key,
+                                                              std::uint32_t seq,
+                                                              std::string_view payload,
+                                                              ControlEncryption encryption = ControlEncryption::V1,
+                                                              ControlPacketOrigin origin = ControlPacketOrigin::HOST) {
+  auto iv_data = control_iv(seq, encryption, origin);
 
   auto [encrypted_str, gcm_tag] = crypto::aes_encrypt_gcm(payload,
                                                           crypto::hex_to_str(gcm_key.data(), true),
                                                           {(char *)iv_data.data(), iv_data.size()},
-                                                          GCM_TAG_SIZE);
+                                                          control_iv_size(encryption));
 
   std::uint16_t size = sizeof(seq) + GCM_TAG_SIZE + encrypted_str.length();
   ControlEncryptedPacket encrypted_pkt = {

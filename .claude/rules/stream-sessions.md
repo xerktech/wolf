@@ -51,3 +51,15 @@ paths:
   - Tests: `tests/testWolfAPI.cpp` "Sessions API: the listed state follows the stream's events"
     (pause → API start mid-teardown, resume + `EndSupersededStreamEvent`); "Sessions APIs" covers
     the listing only.
+- The control stream uses Sunshine's V2 encryption when the client enables it in the RTSP ANNOUNCE
+  (`x-ss-general.encryptionEnabled`, offered in DESCRIBE); state is `StreamSession::control_stream`.
+  - V1 (Nvidia's) only puts seq's low byte in the IV: seq bits 8..31 are not authenticated and
+    anyone can rewrite them. Never trust a V1 seq for anything, including replay checks.
+  - V2 packets pass a replay window (`accept_seq` in `moonlight/control.hpp`). Never make it a strict
+    `seq > last` check: Moonlight numbers all packets with one counter but sends them over several
+    ENet channels, some unreliable, so they arrive out of order.
+  - The window belongs to the stream instance, not the ENet peer: a new peer of the same stream
+    must not reset it. `/resume` gets a fresh `control_stream` (new key, seq restarts at 0).
+  - Packets Wolf sends take `send_seq++`: a fixed seq reuses the GCM nonce under one key.
+  - Tests: `tests/testControl.cpp` "Control replay window", "Control V2 encryption", "control: a
+    replayed encrypted packet is dropped"; `tests/testRTSP.cpp` DESCRIBE / "ANNOUNCE control".

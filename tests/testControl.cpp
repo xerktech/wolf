@@ -124,6 +124,57 @@ TEST_CASE("Control decrypt reads only the received packet", "CONTROL") {
   }
 }
 
+TEST_CASE("Control replay window", "CONTROL") {
+  auto accept_all = [](std::initializer_list<std::uint32_t> seqs) {
+    ReplayWindow window;
+    for (auto seq : seqs) {
+      auto next = accept_seq(window, seq);
+      REQUIRE(next);
+      window = *next;
+    }
+    return window;
+  };
+
+  SECTION("in order, out of order and with gaps") {
+    auto window = accept_all({0, 1, 2, 5, 3, 10, 4});
+    REQUIRE(*window.highest_seq == 10);
+    for (std::uint32_t seq : {0, 1, 2, 3, 4, 5, 10}) {
+      REQUIRE_FALSE(accept_seq(window, seq));
+    }
+    // Seqs that never arrived can still come in late, once
+    auto late = accept_seq(window, 7);
+    REQUIRE(late);
+    REQUIRE_FALSE(accept_seq(*late, 7));
+  }
+
+  SECTION("the first seq doesn't have to be 0") {
+    auto window = accept_all({100});
+    REQUIRE_FALSE(accept_seq(window, 100));
+    REQUIRE(accept_seq(window, 99));
+  }
+
+  SECTION("too old to tell") {
+    auto window = accept_all({0, ReplayWindow::SIZE});
+    REQUIRE_FALSE(accept_seq(window, 0));
+    REQUIRE(accept_seq(window, 1));
+    window = accept_all({0, ReplayWindow::SIZE + 1});
+    REQUIRE_FALSE(accept_seq(window, 1)); // never seen, but out of the window
+    REQUIRE(accept_seq(window, 2));
+  }
+
+  SECTION("a jump past the whole window forgets the old seqs") {
+    auto window = accept_all({5, 10'000'000, UINT32_MAX});
+    REQUIRE_FALSE(accept_seq(window, UINT32_MAX));
+    REQUIRE_FALSE(accept_seq(window, 10'000'000));
+    REQUIRE(accept_seq(window, UINT32_MAX - 1));
+  }
+
+  SECTION("the low byte repeats every 256 packets, the full seq doesn't") {
+    auto window = accept_all({1});
+    REQUIRE(accept_seq(window, 257));
+  }
+}
+
 TEST_CASE("control joypad input packets") {
   std::string payload =
       crypto::hex_to_str("060222000000001E0C0000001A000000010014000010000000000000000000009C0000005500");
@@ -185,6 +236,7 @@ struct TestENetClient {
   ENetPeer *peer = nullptr;
   bool disconnected = false;
   std::size_t received = 0;
+  std::vector<std::string> received_packets;
 
   TestENetClient(int port, std::uint32_t enet_secret) {
     ENetAddress addr;
@@ -208,17 +260,34 @@ struct TestENetClient {
           disconnected = true;
         if (ev.type == ENET_EVENT_TYPE_RECEIVE) {
           received++;
+          received_packets.emplace_back((char *)ev.packet->data, ev.packet->dataLength);
           enet_packet_destroy(ev.packet);
         }
       }
     }
   }
 
-  void send_termination(const std::string &aes_key) {
-    auto pkt = ControlTerminatePacket{};
-    auto encrypted = encrypt_packet(aes_key, 0, {(char *)&pkt, sizeof(pkt)});
-    enet_peer_send(peer, 0, enet_packet_create(encrypted.get(), encrypted->full_size(), ENET_PACKET_FLAG_RELIABLE));
+  void send_encrypted(const std::string &aes_key,
+                      std::uint32_t seq,
+                      std::string_view payload,
+                      ControlEncryption encryption = ControlEncryption::V1) {
+    auto encrypted = encrypt_packet(aes_key, seq, payload, encryption, ControlPacketOrigin::CLIENT);
+    send_raw({(char *)encrypted.get(), encrypted->full_size()});
+  }
+
+  void send_raw(std::string_view packet) {
+    enet_peer_send(peer, 0, enet_packet_create(packet.data(), packet.size(), ENET_PACKET_FLAG_RELIABLE));
     enet_host_flush(host);
+  }
+
+  void send_termination(const std::string &aes_key, std::uint32_t seq = 0) {
+    auto pkt = ControlTerminatePacket{};
+    send_encrypted(aes_key, seq, {(char *)&pkt, sizeof(pkt)});
+  }
+
+  void send_idr(const std::string &aes_key, std::uint32_t seq, ControlEncryption encryption) {
+    auto pkt = ControlPacket{.type = pkts::IDR_FRAME, .length = 0};
+    send_encrypted(aes_key, seq, {(char *)&pkt, sizeof(pkt)}, encryption);
   }
 
   ~TestENetClient() {
@@ -505,4 +574,155 @@ TEST_CASE("sessions: a session built without a producer name keeps its id's prod
   REQUIRE(state::producer_name(session) == "42");
   session.producer_name = "42_0badcafe";
   REQUIRE(state::producer_name(session) == "42_0badcafe");
+}
+
+/** The bytes of an encrypted packet with its (unauthenticated with V1) seq field rewritten */
+static std::string with_seq(std::string packet, std::uint32_t seq) {
+  ((ControlEncryptedPacket *)packet.data())->seq = boost::endian::native_to_little(seq);
+  return packet;
+}
+
+TEST_CASE("Control V2 encryption", "CONTROL") {
+  std::string aes_key = "EDF04A215C4FBEA20934120C8480D855";
+  auto idr = ControlPacket{.type = pkts::IDR_FRAME, .length = 0};
+  std::string payload = {(char *)&idr, sizeof(idr)};
+
+  SECTION("matches moonlight-common-c's encryptControlMessage()") {
+    std::uint32_t seq = 0x0A0B0C0D;
+    // 12-byte IV: seq in little endian, zeros, then 'C' (client originated) and 'C' (control stream)
+    std::string iv = {0x0D, 0x0C, 0x0B, 0x0A, 0, 0, 0, 0, 0, 0, 'C', 'C', 0, 0, 0, 0};
+    auto [expected_msg, expected_tag] = crypto::aes_encrypt_gcm(payload, crypto::hex_to_str(aes_key, true), iv, 12);
+
+    auto encrypted = encrypt_packet(aes_key, seq, payload, ControlEncryption::V2, ControlPacketOrigin::CLIENT);
+    REQUIRE(boost::endian::little_to_native(encrypted->seq) == seq);
+    REQUIRE_THAT(std::string(encrypted->gcm_tag, GCM_TAG_SIZE), Equals(expected_tag));
+    REQUIRE_THAT(std::string(encrypted->encrypted_msg()), Equals(expected_msg));
+    REQUIRE_THAT(decrypt_packet(*encrypted, aes_key, ControlEncryption::V2), Equals(payload));
+  }
+
+  SECTION("matches moonlight-common-c's decryptControlMessageToV1()") {
+    std::uint32_t seq = 0x01020304;
+    // Same as above, but 'H' (host originated)
+    std::string iv = {0x04, 0x03, 0x02, 0x01, 0, 0, 0, 0, 0, 0, 'H', 'C', 0, 0, 0, 0};
+    auto [expected_msg, expected_tag] = crypto::aes_encrypt_gcm(payload, crypto::hex_to_str(aes_key, true), iv, 12);
+
+    auto encrypted = encrypt_packet(aes_key, seq, payload, ControlEncryption::V2);
+    REQUIRE_THAT(std::string(encrypted->gcm_tag, GCM_TAG_SIZE), Equals(expected_tag));
+    REQUIRE_THAT(std::string(encrypted->encrypted_msg()), Equals(expected_msg));
+  }
+
+  SECTION("the whole seq is authenticated") {
+    auto encrypted = encrypt_packet(aes_key, 3, payload, ControlEncryption::V2, ControlPacketOrigin::CLIENT);
+    std::string bytes = {(char *)encrypted.get(), encrypted->full_size()};
+    for (std::uint32_t forged_seq : {3u + 256u, 0xFFFFFF03u, 4u}) {
+      auto forged = with_seq(bytes, forged_seq);
+      REQUIRE_THROWS(decrypt_packet(*(ControlEncryptedPacket *)forged.data(), aes_key, ControlEncryption::V2));
+    }
+
+    // With V1 only the low byte is: this is why V1 packets can't be checked for replays
+    auto v1 = encrypt_packet(aes_key, 3, payload);
+    std::string v1_forged = with_seq({(char *)v1.get(), v1->full_size()}, 3u + 256u);
+    REQUIRE_THAT(decrypt_packet(*(ControlEncryptedPacket *)v1_forged.data(), aes_key), Equals(payload));
+  }
+
+  SECTION("a packet can't be reflected back to the side that sent it") {
+    auto from_host = encrypt_packet(aes_key, 0, payload, ControlEncryption::V2, ControlPacketOrigin::HOST);
+    REQUIRE_THROWS(decrypt_packet(*from_host, aes_key, ControlEncryption::V2, ControlPacketOrigin::CLIENT));
+    REQUIRE_THAT(decrypt_packet(*from_host, aes_key, ControlEncryption::V2, ControlPacketOrigin::HOST),
+                 Equals(payload));
+  }
+}
+
+TEST_CASE("control: a replayed encrypted packet is dropped", "[ENET]") {
+  using wolf::core::events::StreamSession;
+  constexpr int port = 47997;
+  const std::string old_key = "EDF04A215C4FBEA20934120C8480D855", new_key = "00112233445566778899AABBCCDDEEFF";
+  auto make_session = [](std::uint32_t enet_secret, const std::string &aes_key, ControlEncryption encryption) {
+    StreamSession session{.session_id = 7};
+    session.enet_secret_payload = enet_secret;
+    session.rtp_secret_payload = {static_cast<char>(enet_secret)};
+    session.aes_key = aes_key;
+    session.ip = "10.255.255.1";                          // never matches loopback, keep the IP fallback out of the way
+    session.control_stream->encryption.store(encryption); // as negotiated in the RTSP ANNOUNCE
+    return session;
+  };
+
+  auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
+  std::atomic<int> idr_requests = 0;
+  auto idr_handler = event_bus->register_handler<immer::box<wolf::core::events::IDRRequestEvent>>(
+      [&idr_requests](const immer::box<wolf::core::events::IDRRequestEvent> &ev) { idr_requests++; });
+  state::SessionsAtoms running_sessions = std::make_shared<immer::atom<immer::vector<StreamSession>>>(
+      immer::vector{make_session(1, old_key, ControlEncryption::V2)});
+
+  REQUIRE(control::init());
+  std::thread([=] { control::run_control(port, running_sessions, event_bus, 20, 10ms, "127.0.0.1"); }).detach();
+  std::this_thread::sleep_for(200ms);
+
+  TestENetClient client(port, 1);
+  client.service(100ms);
+
+  // A genuine packet, then the same bytes resent: only the first one is acted on
+  auto idr = ControlPacket{.type = pkts::IDR_FRAME, .length = 0};
+  auto captured =
+      encrypt_packet(old_key, 3, {(char *)&idr, sizeof(idr)}, ControlEncryption::V2, ControlPacketOrigin::CLIENT);
+  std::string captured_bytes = {(char *)captured.get(), captured->full_size()};
+  client.send_raw(captured_bytes);
+  client.service(200ms);
+  REQUIRE(idr_requests == 1);
+  client.send_raw(captured_bytes);
+  client.service(200ms);
+  REQUIRE(idr_requests == 1);
+
+  // Rewriting its seq doesn't get it through, and doesn't move the window: genuine packets keep flowing
+  client.send_raw(with_seq(captured_bytes, 3 + 256));
+  client.send_raw(with_seq(captured_bytes, 0xFFFFFF03));
+  client.service(200ms);
+  REQUIRE(idr_requests == 1);
+
+  // Out of order but never seen: accepted; replayed again: dropped
+  client.send_idr(old_key, 1, ControlEncryption::V2);
+  client.send_idr(old_key, 4, ControlEncryption::V2);
+  client.send_idr(old_key, 1, ControlEncryption::V2);
+  client.service(200ms);
+  REQUIRE(idr_requests == 3);
+
+  // A packet replayed from a new ENet connection of the same stream is still dropped
+  TestENetClient reconnected(port, 1);
+  reconnected.service(100ms);
+  reconnected.send_raw(captured_bytes);
+  reconnected.service(200ms);
+  REQUIRE(idr_requests == 3);
+
+  // Packets sent to the client each get their own seq, under the V2 host IV
+  event_bus->fire_event(
+      immer::box<wolf::core::events::StopStreamEvent>(wolf::core::events::StopStreamEvent{.session_id = 7}));
+  event_bus->fire_event(
+      immer::box<wolf::core::events::StopStreamEvent>(wolf::core::events::StopStreamEvent{.session_id = 7}));
+  reconnected.service(200ms);
+  REQUIRE(reconnected.received_packets.size() == 2);
+  for (std::uint32_t seq = 0; seq < 2; seq++) {
+    auto pkt = (ControlEncryptedPacket *)reconnected.received_packets[seq].data();
+    REQUIRE(boost::endian::little_to_native(pkt->seq) == seq);
+    auto decrypted = decrypt_packet(*pkt, old_key, ControlEncryption::V2, ControlPacketOrigin::HOST);
+    REQUIRE_THAT(packet_type_to_str(((ControlPacket *)decrypted.data())->type), Equals("TERMINATION"));
+  }
+
+  // After /resume the client negotiates again and restarts its seq from 0 with the new key
+  running_sessions->store(immer::vector{make_session(2, new_key, ControlEncryption::V2)});
+  TestENetClient resumed(port, 2);
+  resumed.service(100ms);
+  resumed.send_idr(new_key, 0, ControlEncryption::V2);
+  resumed.service(200ms);
+  REQUIRE(idr_requests == 4);
+
+  // A V1 client's seq can't be trusted: no replay check, and a forged seq can't lock it out
+  running_sessions->store(immer::vector{make_session(3, old_key, ControlEncryption::V1)});
+  TestENetClient v1_client(port, 3);
+  v1_client.service(100ms);
+  auto v1_idr = encrypt_packet(old_key, 5, {(char *)&idr, sizeof(idr)});
+  v1_client.send_raw(with_seq({(char *)v1_idr.get(), v1_idr->full_size()}, 0xFFFFFF05));
+  v1_client.send_idr(old_key, 6, ControlEncryption::V1);
+  v1_client.send_idr(old_key, 7, ControlEncryption::V1);
+  v1_client.service(200ms);
+  REQUIRE(idr_requests == 7);
 }
