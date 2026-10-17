@@ -253,6 +253,30 @@ void delete_virtual_sink(const std::shared_ptr<Server> &server, const std::share
   });
 }
 
+bool flush(const std::shared_ptr<Server> &server, std::chrono::milliseconds timeout) {
+  auto done = std::make_shared<boost::promise<void>>();
+  auto done_fut = done->get_future();
+  // Only the op may own the promise: when queue_op drops it (connection gone) the promise is destroyed unset, which
+  // breaks it and makes the future ready right away instead of waiting out the timeout.
+  queue_op(server, [server, done = std::move(done)]() {
+    // PulseAudio answers a connection's requests in order: once this one is answered, every earlier one was handled
+    auto done_ref = new std::shared_ptr<boost::promise<void>>(done);
+    auto operation = pa_context_get_server_info(
+        server->ctx,
+        [](pa_context *c, const pa_server_info *info, void *data) {
+          std::unique_ptr<std::shared_ptr<boost::promise<void>>> done((std::shared_ptr<boost::promise<void>> *)data);
+          (*done)->set_value();
+        },
+        done_ref);
+    if (operation) {
+      pa_operation_unref(operation);
+    } else { // The callback will never run
+      delete done_ref;
+    }
+  });
+  return done_fut.wait_for(boost::chrono::milliseconds(timeout.count())) == boost::future_status::ready;
+}
+
 void disconnect(const std::shared_ptr<Server> &server) {
   MainloopLock lock(server->loop);
   server->on_ready = boost::promise<bool>(); // Creates a new promise

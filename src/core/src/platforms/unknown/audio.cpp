@@ -20,6 +20,10 @@ bool connected(const std::shared_ptr<Server> &server) {
   return false;
 }
 
+bool flush(const std::shared_ptr<Server> &server, std::chrono::milliseconds timeout) {
+  return true;
+}
+
 void disconnect(const std::shared_ptr<Server> &server) {}
 
 std::string get_server_name(const std::shared_ptr<Server> &server) {
