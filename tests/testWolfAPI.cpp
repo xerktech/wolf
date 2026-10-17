@@ -577,8 +577,7 @@ TEST_CASE("Sessions APIs", "[API]") {
     bad_session.video_width = width;
     bad_session.video_height = height;
     bad_session.video_refresh_rate = fps;
-    response =
-        req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(bad_session));
+    response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(bad_session));
     REQUIRE(response);
     REQUIRE(response->first == 400);
     REQUIRE_THAT(response->second, ContainsSubstring("\"success\":false"));
