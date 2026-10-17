@@ -55,13 +55,11 @@ void start_audio_producer(const std::string &session_id,
  * Interpipe keys a producer's listeners by element name, so two consumers with the configured name
  * `interpipesrc_<session_id>_<kind>` can't both listen: a /resume's pipeline, started while the superseded one
  * still runs, is never added as a listener, and gets nothing once the old one stops (XERK-2025).
- * Renames the configured consumer in `pipeline` (a formatted pipeline description) to one unique to this stream
- * instance, and returns the name it has now. A custom-named consumer is left alone.
+ * The same goes for an API start of a paused stream, which reuses the stream instance's secrets (XERK-2046).
+ * Renames the configured consumer in `pipeline` (a formatted pipeline description) to one unique to this pipeline
+ * start, and returns the name it has now. A custom-named consumer is left alone.
  */
-std::string own_consumer(std::string &pipeline,
-                         std::size_t session_id,
-                         const std::array<char, 16> &rtp_secret_payload,
-                         const std::string &kind);
+std::string own_consumer(std::string &pipeline, std::size_t session_id, const std::string &kind);
 
 /**
  * Points `pipeline`'s interpipesrc `consumer_name` from `<session_id>_<kind>` to

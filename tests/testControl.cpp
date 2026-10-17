@@ -594,6 +594,99 @@ TEST_CASE("streaming: a resumed stream keeps receiving after the superseded one 
   }
 }
 
+TEST_CASE("streaming: a stream restarted right after a pause keeps receiving", "[GSTREAMER]") {
+  using namespace wolf::core;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  boost::asio::io_context io;
+  const std::array<char, 16> rtp_secret{1};
+
+  auto producer = gst_parse_launch("videotestsrc is-live=true ! video/x-raw,format=I420,width=16,height=16 ! "
+                                   "interpipesink name=42_cafe_video sync=false "
+                                   "audiotestsrc is-live=true samplesperbuffer=100 ! "
+                                   "audio/x-raw,format=S16LE,channels=1,rate=48000 ! "
+                                   "interpipesink name=42_cafe_audio sync=false",
+                                   nullptr);
+  REQUIRE(producer);
+  gst_element_set_state(producer, GST_STATE_PLAYING);
+
+  auto client = [&] {
+    auto socket = std::make_shared<boost::asio::ip::udp::socket>(
+        io,
+        boost::asio::ip::udp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+    socket->non_blocking(true);
+    return socket;
+  };
+  // An API start of the same stream: it carries the stream's own rtp_secret_payload every time
+  auto start = [&](const std::shared_ptr<boost::asio::ip::udp::socket> &video_client,
+                   const std::shared_ptr<boost::asio::ip::udp::socket> &audio_client) {
+    events::VideoSession video{.gst_pipeline = "interpipesrc name=interpipesrc_{}_video listen-to={session_id}_video "
+                                               "is-live=true ! appsink name=wolf_udp_sink sync=false",
+                               .session_id = 42};
+    video.display_mode = {.width = 16, .height = 16, .refreshRate = 30};
+    video.bitrate_kbps = 1000;
+    video.packet_size = 1024;
+    video.rtp_secret_payload = rtp_secret;
+    events::AudioSession audio{.gst_pipeline = "interpipesrc name=interpipesrc_{}_audio listen-to={session_id}_audio "
+                                               "is-live=true ! appsink name=wolf_udp_sink sync=false",
+                               .session_id = 42};
+    audio.rtp_secret_payload = rtp_secret;
+    auto send_socket = std::make_shared<boost::asio::ip::udp::socket>(io, boost::asio::ip::udp::v4());
+    std::thread([=] {
+      streaming::start_streaming_video(
+          video,
+          [] { return std::string("42_cafe"); },
+          event_bus,
+          "127.0.0.1",
+          video_client->local_endpoint().port(),
+          std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>(),
+          send_socket);
+    }).detach();
+    std::thread([=] {
+      streaming::start_streaming_audio(
+          audio,
+          [] { return std::string("42_cafe"); },
+          event_bus,
+          "127.0.0.1",
+          audio_client->local_endpoint().port(),
+          send_socket,
+          "sink",
+          "");
+    }).detach();
+  };
+  auto receives = [](const std::shared_ptr<boost::asio::ip::udp::socket> &socket) {
+    std::array<char, 65536> buf{};
+    for (auto until = std::chrono::steady_clock::now() + 500ms; std::chrono::steady_clock::now() < until;) {
+      boost::system::error_code ec;
+      if (socket->receive(boost::asio::buffer(buf), 0, ec) > 0) {
+        return true;
+      }
+      std::this_thread::sleep_for(5ms);
+    }
+    return false;
+  };
+
+  auto video = client(), audio = client();
+  start(video, audio);
+  std::this_thread::sleep_for(700ms);
+  REQUIRE(receives(video));
+
+  for (int round = 0; round < 10; round++) {
+    // Pause, then start again before the paused pipelines have finished their EOS
+    event_bus->fire_event(immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = 42}));
+    video = client(), audio = client();
+    start(video, audio);
+    std::this_thread::sleep_for(700ms);
+    INFO("round " << round);
+    CHECK(receives(video));
+    CHECK(receives(audio));
+  }
+
+  event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = 42}));
+  std::this_thread::sleep_for(500ms);
+  gst_element_set_state(producer, GST_STATE_NULL);
+  gst_object_unref(producer);
+}
+
 /**
  * Feeds handle_input a heap buffer of exactly `len` bytes, so that under ASan any read past it is reported
  */
@@ -759,22 +852,24 @@ TEST_CASE("sessions: a stream whose session joined a lobby listens to the lobby'
   REQUIRE(state::stream_producer_name(sessions, lobbies, 42) == "42_0badcafe");
 }
 
-TEST_CASE("streaming: each stream instance names its own consumer") {
-  auto own = [](std::string pipeline, char secret) {
-    auto name = streaming::own_consumer(pipeline, 42, std::array<char, 16>{secret}, "video");
+TEST_CASE("streaming: each pipeline start names its own consumer") {
+  auto own = [](std::string pipeline) {
+    auto name = streaming::own_consumer(pipeline, 42, "video");
     return std::make_pair(name, pipeline);
   };
 
-  auto [first, first_pipeline] = own("interpipesrc name=interpipesrc_42_video listen-to=42_video ! fakesink", 1);
-  REQUIRE(first == "interpipesrc_42_video_01000000000000000000000000000000");
+  auto [first, first_pipeline] = own("interpipesrc name=interpipesrc_42_video listen-to=42_video ! fakesink");
+  REQUIRE_THAT(first, Catch::Matchers::StartsWith("interpipesrc_42_video_"));
+  REQUIRE(first.size() == std::string("interpipesrc_42_video_").size() + 32);
   REQUIRE(first_pipeline == "interpipesrc name=" + first + " listen-to=42_video ! fakesink");
-  REQUIRE(own("interpipesrc name=interpipesrc_42_video", 2).first != first);
+  // Even a restart of the same stream instance gets a new name
+  REQUIRE(own("interpipesrc name=interpipesrc_42_video listen-to=42_video ! fakesink").first != first);
   // A custom name, or another session's consumer, is left alone
-  REQUIRE(own("interpipesrc name=my_src ! fakesink", 1) ==
+  REQUIRE(own("interpipesrc name=my_src ! fakesink") ==
           std::make_pair(std::string("interpipesrc_42_video"), std::string("interpipesrc name=my_src ! fakesink")));
-  REQUIRE(own("interpipesrc name=interpipesrc_42_video2 ! fakesink", 1).second ==
+  REQUIRE(own("interpipesrc name=interpipesrc_42_video2 ! fakesink").second ==
           "interpipesrc name=interpipesrc_42_video2 ! fakesink");
-  REQUIRE(own("interpipesrc name=interpipesrc_420_video ! fakesink", 1).second ==
+  REQUIRE(own("interpipesrc name=interpipesrc_420_video ! fakesink").second ==
           "interpipesrc name=interpipesrc_420_video ! fakesink");
 }
 
