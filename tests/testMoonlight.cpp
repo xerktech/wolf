@@ -286,7 +286,13 @@ TEST_CASE("Encoder video_params fall back to the embedded default", "[LocalState
   auto embedded =
       rfl::toml::read<wolf::config::WolfConfig, rfl::DefaultIfMissing>(default_toml).value().gstreamer.video;
   auto params = [&](const GstEncoder &encoder, const GstVideoCfg &user_cfg, bool zero_copy) {
-    return state::encoder_video_params(encoder, user_cfg, embedded.h264_encoders, embedded.defaults, zero_copy);
+    return state::encoder_video_params("h264", encoder, user_cfg, embedded, zero_copy);
+  };
+  auto embedded_params = [](const std::vector<GstEncoder> &encoders, std::string_view plugin_name) {
+    auto found =
+        std::find_if(encoders.begin(), encoders.end(), [&](const auto &e) { return e.plugin_name == plugin_name; });
+    REQUIRE(found != encoders.end());
+    return found->video_params.value();
   };
 
   // A config.toml generated before XERK-2026: x264 without params and no defaults.x264
@@ -308,6 +314,15 @@ TEST_CASE("Encoder video_params fall back to the embedded default", "[LocalState
   REQUIRE_THAT(params(custom, GstVideoCfg{}, false), Equals("custom"));
   auto user_defaults = GstVideoCfg{.defaults = {{"x264", {.video_params = "mine", .video_params_zero_copy = "mine0"}}}};
   REQUIRE_THAT(params(old_x264, user_defaults, true), Equals("mine0"));
+
+  // Each codec falls back to its own list: x265 only exists for HEVC, aom only for AV1
+  auto old_x265 = GstEncoder{.plugin_name = "x265", .check_elements = {"x265enc"}};
+  auto old_aom = GstEncoder{.plugin_name = "aom", .check_elements = {"av1enc"}};
+  REQUIRE_THAT(state::encoder_video_params("h265", old_x265, GstVideoCfg{}, embedded, false),
+               Equals(embedded_params(embedded.hevc_encoders, "x265")));
+  REQUIRE_THAT(state::encoder_video_params("av1", old_aom, GstVideoCfg{}, embedded, false),
+               Equals(embedded_params(embedded.av1_encoders, "aom")));
+  REQUIRE(state::encoder_video_params("h264", old_x265, GstVideoCfg{}, embedded, false).empty());
 
   // A plugin the embedded config doesn't know stays empty
   auto unknown = GstEncoder{.plugin_name = "coreelements", .check_elements = {"identity"}};

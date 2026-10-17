@@ -216,23 +216,26 @@ static std::string resolve_video_params(const GstEncoder &encoder,
                        : encoder.video_params.value_or(plugin_default.video_params);
 }
 
-std::string encoder_video_params(const GstEncoder &encoder,
+std::string encoder_video_params(std::string_view tech,
+                                 const GstEncoder &encoder,
                                  const GstVideoCfg &video_cfg,
-                                 const std::vector<GstEncoder> &embedded_encoders,
-                                 const std::map<std::string, GstEncoderDefault> &embedded_defaults,
+                                 const GstVideoCfg &embedded_cfg,
                                  bool use_zero_copy) {
   auto params = resolve_video_params(encoder, video_cfg.defaults, use_zero_copy);
   if (!params.empty()) {
     return params;
   }
+  const auto &embedded_encoders = tech == "h264"   ? embedded_cfg.h264_encoders
+                                  : tech == "h265" ? embedded_cfg.hevc_encoders
+                                                   : embedded_cfg.av1_encoders;
   auto field = use_zero_copy ? "video_params_zero_copy" : "video_params";
   for (const auto &embedded : embedded_encoders) {
     if (embedded.plugin_name == encoder.plugin_name) {
-      params = resolve_video_params(embedded, embedded_defaults, use_zero_copy);
+      params = resolve_video_params(embedded, embedded_cfg.defaults, use_zero_copy);
       if (!params.empty()) {
         logs::log(logs::warning,
                   "Encoder {} has no {} in config.toml, using the built-in default; "
-                  "add it to config.toml (or delete the file to regenerate it) to silence this warning",
+                  "add it to config.toml to silence this warning",
                   encoder.plugin_name,
                   field);
         return params;
@@ -391,24 +394,17 @@ Config load_or_default(const std::string &source,
   }
 
   auto embedded_video = rfl::toml::read<WolfConfig, rfl::DefaultIfMissing>(default_toml).value().gstreamer.video;
-  auto h264_video_params = h264_encoder ? encoder_video_params(*h264_encoder,
-                                                               default_gst_video_settings,
-                                                               embedded_video.h264_encoders,
-                                                               embedded_video.defaults,
-                                                               use_zero_copy)
-                                        : "";
-  auto hevc_video_params = hevc_encoder ? encoder_video_params(*hevc_encoder,
-                                                               default_gst_video_settings,
-                                                               embedded_video.hevc_encoders,
-                                                               embedded_video.defaults,
-                                                               use_zero_copy)
-                                        : "";
-  auto av1_video_params = av1_encoder ? encoder_video_params(*av1_encoder,
-                                                             default_gst_video_settings,
-                                                             embedded_video.av1_encoders,
-                                                             embedded_video.defaults,
-                                                             use_zero_copy)
-                                      : "";
+  auto h264_video_params =
+      h264_encoder
+          ? encoder_video_params("h264", *h264_encoder, default_gst_video_settings, embedded_video, use_zero_copy)
+          : "";
+  auto hevc_video_params =
+      hevc_encoder
+          ? encoder_video_params("h265", *hevc_encoder, default_gst_video_settings, embedded_video, use_zero_copy)
+          : "";
+  auto av1_video_params =
+      av1_encoder ? encoder_video_params("av1", *av1_encoder, default_gst_video_settings, embedded_video, use_zero_copy)
+                  : "";
 
   auto clients_atom = std::make_shared<immer::atom<PairedClientList>>(paired_clients);
 

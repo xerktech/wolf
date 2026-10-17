@@ -31,13 +31,13 @@ Config load_or_default(const std::string &source,
  *
  * Empty params turn the pipeline into "... ! ! x264enc", which GStreamer can't parse. Configs generated
  * before XERK-2026 have exactly that for x264, and v7 configs aren't migrated, so when the user's config
- * resolves to "" this falls back to the first encoder with the same plugin_name in the embedded default
+ * resolves to "" this falls back to the first encoder of the same codec and plugin_name in the embedded default
  * config, logging a warning.
  */
-std::string encoder_video_params(const GstEncoder &encoder,
+std::string encoder_video_params(std::string_view tech, // "h264", "h265" or "av1", as in get_encoder
+                                 const GstEncoder &encoder,
                                  const GstVideoCfg &video_cfg,
-                                 const std::vector<GstEncoder> &embedded_encoders,
-                                 const std::map<std::string, GstEncoderDefault> &embedded_defaults,
+                                 const GstVideoCfg &embedded_cfg,
                                  bool use_zero_copy);
 
 /**
