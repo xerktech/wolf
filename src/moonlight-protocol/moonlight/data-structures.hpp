@@ -14,6 +14,16 @@ struct DisplayMode {
   bool av1_supported = false;
 };
 
+/**
+ * A zero size or fps would reach the virtual display and encoder as is, and INT_MAX-sized values ask them for
+ * impossible allocations: cap them generously above any real display or client (8K is 7680x4320).
+ */
+constexpr bool is_valid_display_mode(std::int64_t width, std::int64_t height, std::int64_t refresh_rate) {
+  constexpr std::int64_t max_size = 16384, max_fps = 1000;
+  return width >= 1 && width <= max_size && height >= 1 && height <= max_size && refresh_rate >= 1 &&
+         refresh_rate <= max_fps;
+}
+
 struct App {
   const std::string title;
   const std::string id;

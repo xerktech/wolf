@@ -416,14 +416,11 @@ auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
     height = utils::to_size_t(display_mode_str[1]);
     fps = utils::to_size_t(display_mode_str[2]);
   }
-  // A zero size or fps would reach the virtual display and encoder as is, and INT_MAX-sized values ask them for
-  // impossible allocations: cap them generously above any real display or client (8K is 7680x4320).
-  constexpr std::size_t max_size = 16384, max_fps = 1000;
   auto surround_info = utils::to_size_t(get_header(headers, "surroundAudioInfo").value_or("196610"));
   auto rikey = get_header(headers, "rikey");
   auto rikeyid = get_header(headers, "rikeyid");
-  if (!width || !height || !fps || *width == 0 || *width > max_size || *height == 0 || *height > max_size ||
-      *fps == 0 || *fps > max_fps || !surround_info || !rikey || !rikeyid || !is_rikeyid(*rikeyid)) {
+  if (!width || !height || !fps || !moonlight::is_valid_display_mode(*width, *height, *fps) || !surround_info ||
+      !rikey || !rikeyid || !is_rikeyid(*rikeyid)) {
     logs::log(logs::warning, "[HTTPS] Invalid launch parameters from {}", client_ip);
     return std::shared_ptr<events::StreamSession>{};
   }
