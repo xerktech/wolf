@@ -16,3 +16,6 @@ paths:
   instance's producers") fail with `"" == ...` when gst-interpipe isn't installed (CI builds it);
   environmental, not a regression.
 - Build with `ninja -j2` on shared hosts: a full-parallel build of wolftests uses >12 GiB.
+- Never log a whole multi-megabyte payload (request or reply bodies, SSE events). CI pipes the
+  console straight to the GitHub runner, and one line of a few MiB stalls the "Run tests" step
+  until the 30 min job timeout. The suite itself finishes in ~20 s. Log at most the first 1 KiB.
