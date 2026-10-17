@@ -259,22 +259,26 @@ void run() {
 
   // Runner threads remove these after the app exits, which can be after we _Exit below; collect them so the
   // shutdown can remove leftovers itself (deleting a sink twice is a no-op).
+  // Hold the snapshots: iterating `load().get()` directly frees the list mid-loop once a Stop handler swaps it.
+  const auto lobbies = local_state->lobbies->load();
+  const auto sessions = local_state->running_sessions->load();
   std::vector<std::shared_ptr<audio::VSink>> audio_sinks;
-  for (const auto &lobby : local_state->lobbies->load().get()) {
+  for (const auto &lobby : lobbies.get()) {
     audio_sinks.push_back(lobby.audio_sink->load());
   }
-  for (const auto &session : local_state->running_sessions->load().get()) {
+  for (const auto &session : sessions.get()) {
     audio_sinks.push_back(session.audio_sink->load());
   }
 
   // Stop lobbies first: each one makes its connected sessions leave gracefully.
-  for (const auto &lobby : local_state->lobbies->load().get()) {
+  for (const auto &lobby : lobbies.get()) {
     local_state->event_bus->fire_event(
         immer::box<events::StopLobbyEvent>(events::StopLobbyEvent{.lobby_id = lobby.id}));
   }
 
-  // Then stop any remaining standalone streams.
-  for (const auto &session : local_state->running_sessions->load().get()) {
+  // Then stop any remaining standalone streams (re-read: leaving a lobby already stopped its sessions).
+  const auto remaining_sessions = local_state->running_sessions->load();
+  for (const auto &session : remaining_sessions.get()) {
     local_state->event_bus->fire_event(
         immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session.session_id}));
   }
