@@ -711,6 +711,16 @@ TEST_CASE("Launch rejects malformed client parameters", "[HTTP]") {
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080x60x1"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080x60fps"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "-1920x1080x60"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "0x0x0"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "0x1080x60"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x0x60"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080x0"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "16385x1080x60"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x16385x60"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080x1001"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "2147483647x2147483647x2147483647"}}));
+  REQUIRE(launch({{"rikeyid", "1"}, {"mode", "16384x16384x1000"}})); // the bounds themselves are accepted
+  REQUIRE(launch({{"rikeyid", "1"}, {"mode", "1x1x1"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"surroundAudioInfo", "abc"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"surroundAudioInfo", "196610junk"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "abc"}}));

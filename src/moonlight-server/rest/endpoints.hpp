@@ -416,12 +416,14 @@ auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
     height = utils::to_size_t(display_mode_str[1]);
     fps = utils::to_size_t(display_mode_str[2]);
   }
-  constexpr std::size_t max_int = std::numeric_limits<int>::max();
+  // A zero size or fps would reach the virtual display and encoder as is, and a huge one could ask them for an
+  // enormous allocation: bound them well past anything a real display or client uses.
+  constexpr std::size_t max_size = 16384, max_fps = 1000;
   auto surround_info = utils::to_size_t(get_header(headers, "surroundAudioInfo").value_or("196610"));
   auto rikey = get_header(headers, "rikey");
   auto rikeyid = get_header(headers, "rikeyid");
-  if (!width || !height || !fps || *width > max_int || *height > max_int || *fps > max_int || !surround_info ||
-      !rikey || !rikeyid || !is_rikeyid(*rikeyid)) {
+  if (!width || !height || !fps || *width == 0 || *width > max_size || *height == 0 || *height > max_size ||
+      *fps == 0 || *fps > max_fps || !surround_info || !rikey || !rikeyid || !is_rikeyid(*rikeyid)) {
     logs::log(logs::warning, "[HTTPS] Invalid launch parameters from {}", client_ip);
     return std::shared_ptr<events::StreamSession>{};
   }
