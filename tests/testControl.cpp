@@ -8,6 +8,7 @@ using Catch::Matchers::Equals;
 #include <cstring>
 #include <moonlight/control.hpp>
 #include <mutex>
+#include <set>
 #include <state/sessions.hpp>
 #include <streaming/streaming.hpp>
 #include <thread>
@@ -482,6 +483,127 @@ TEST_CASE("streaming: a superseded stream instance ends only its own pipelines",
   CHECK(*other_session_video);
 }
 
+TEST_CASE("streaming: a resumed stream keeps receiving after the superseded one ends", "[GSTREAMER]") {
+  using namespace wolf::core;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  boost::asio::io_context io;
+  auto rtp_secret = [](char id) { return std::array<char, 16>{id}; };
+
+  // Live producers, as a running wayland display / pulse sink would be: the stream's own, and a lobby's.
+  // Each sends datagrams of its own size, so a client can tell which one it is getting.
+  auto start_producer = [](const std::string &name, int size, int samples) {
+    auto producer = gst_parse_launch(
+        fmt::format("videotestsrc is-live=true ! video/x-raw,format=I420,width={0},height={0} ! "
+                    "interpipesink name={2}_video sync=false "
+                    "audiotestsrc is-live=true samplesperbuffer={1} ! audio/x-raw,format=S16LE,channels=1,rate=48000 ! "
+                    "interpipesink name={2}_audio sync=false",
+                    size,
+                    samples,
+                    name)
+            .c_str(),
+        nullptr);
+    REQUIRE(producer);
+    gst_element_set_state(producer, GST_STATE_PLAYING);
+    return producer;
+  };
+  auto producer = start_producer("42_cafe", 16, 100), lobby = start_producer("lobby", 32, 300);
+  const std::set<std::size_t> own_video{16 * 16 * 3 / 2}, own_audio{100 * 2};
+  const std::set<std::size_t> lobby_video{32 * 32 * 3 / 2}, lobby_audio{300 * 2};
+
+  // Consumers named as the configured default_source names them; each sends to its own client port
+  auto client = [&] {
+    auto socket = std::make_shared<boost::asio::ip::udp::socket>(
+        io,
+        boost::asio::ip::udp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+    socket->non_blocking(true);
+    return socket;
+  };
+  auto start = [&](char secret,
+                   const std::shared_ptr<boost::asio::ip::udp::socket> &video_client,
+                   const std::shared_ptr<boost::asio::ip::udp::socket> &audio_client) {
+    events::VideoSession video{.gst_pipeline = "interpipesrc name=interpipesrc_{}_video listen-to={session_id}_video "
+                                               "is-live=true ! appsink name=wolf_udp_sink sync=false",
+                               .session_id = 42};
+    video.display_mode = {.width = 16, .height = 16, .refreshRate = 30};
+    video.bitrate_kbps = 1000;
+    video.packet_size = 1024;
+    video.rtp_secret_payload = rtp_secret(secret);
+    events::AudioSession audio{.gst_pipeline = "interpipesrc name=interpipesrc_{}_audio listen-to={session_id}_audio "
+                                               "is-live=true ! appsink name=wolf_udp_sink sync=false",
+                               .session_id = 42};
+    audio.rtp_secret_payload = rtp_secret(secret);
+    auto send_socket = std::make_shared<boost::asio::ip::udp::socket>(io, boost::asio::ip::udp::v4());
+    std::thread([=] {
+      streaming::start_streaming_video(video,
+                                       "42_cafe",
+                                       event_bus,
+                                       "127.0.0.1",
+                                       video_client->local_endpoint().port(),
+                                       std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>(),
+                                       send_socket);
+    }).detach();
+    std::thread([=] {
+      streaming::start_streaming_audio(audio,
+                                       "42_cafe",
+                                       event_bus,
+                                       "127.0.0.1",
+                                       audio_client->local_endpoint().port(),
+                                       send_socket,
+                                       "sink",
+                                       "");
+    }).detach();
+  };
+  // The sizes of the datagrams that reach `socket` over the next 500 ms
+  auto received = [](const std::shared_ptr<boost::asio::ip::udp::socket> &socket) {
+    std::array<char, 65536> buf{};
+    std::set<std::size_t> sizes;
+    for (auto until = std::chrono::steady_clock::now() + 500ms; std::chrono::steady_clock::now() < until;) {
+      boost::system::error_code ec;
+      if (auto size = socket->receive(boost::asio::buffer(buf), 0, ec); size > 0) {
+        sizes.insert(size);
+      } else {
+        std::this_thread::sleep_for(5ms);
+      }
+    }
+    return sizes;
+  };
+
+  auto old_video = client(), old_audio = client();
+  start(1, old_video, old_audio);
+  std::this_thread::sleep_for(700ms);
+  REQUIRE(received(old_video) == own_video);
+
+  // A /resume starts the new stream's pipelines while the dead client's are still running, then ends the old ones
+  auto resumed_video = client(), resumed_audio = client();
+  start(2, resumed_video, resumed_audio);
+  std::this_thread::sleep_for(700ms);
+  event_bus->fire_event(immer::box<events::EndSupersededStreamEvent>(
+      events::EndSupersededStreamEvent{.session_id = 42, .rtp_secret_payload = rtp_secret(1)}));
+  std::this_thread::sleep_for(500ms);
+  // Drain what was sent before the old stream ended
+  received(resumed_video);
+  received(resumed_audio);
+
+  CHECK(received(resumed_video) == own_video);
+  CHECK(received(resumed_audio) == own_audio);
+
+  // Joining a lobby switches the resumed stream's consumers, found by their own names
+  event_bus->fire_event(immer::box<events::SwitchStreamProducerEvents>(
+      events::SwitchStreamProducerEvents{.session_id = 42, .interpipe_src_id = "lobby"}));
+  std::this_thread::sleep_for(300ms);
+  received(resumed_video);
+  received(resumed_audio);
+  CHECK(received(resumed_video) == lobby_video);
+  CHECK(received(resumed_audio) == lobby_audio);
+
+  event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = 42}));
+  std::this_thread::sleep_for(500ms);
+  for (auto pipeline : {producer, lobby}) {
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+  }
+}
+
 /**
  * Feeds handle_input a heap buffer of exactly `len` bytes, so that under ASan any read past it is reported
  */
@@ -561,6 +683,54 @@ TEST_CASE("control input packets shorter than their type are dropped", "[CONTROL
     handle_truncated(pkts::UTF8_TEXT, header + 2, 0xFFFFFFFF); // huge data_size
     handle_truncated(pkts::UTF8_TEXT, header + 64, 4 + 64);    // longer than UTF8_TEXT_MAX_LEN
   }
+}
+
+TEST_CASE("streaming: a stream listens to its own instance's producers", "[GSTREAMER]") {
+  auto listen_to = [](const std::string &configured, const std::string &producer_name) {
+    auto desc = fmt::format("interpipesrc name=interpipesrc_42_video listen-to={} ! fakesink", configured);
+    auto pipeline = gst_parse_launch(desc.c_str(), nullptr);
+    REQUIRE(pipeline);
+    streaming::listen_to_producer(pipeline, "interpipesrc_42_video", 42, producer_name, "video");
+    auto src = gst_bin_get_by_name(GST_BIN(pipeline), "interpipesrc_42_video");
+    gchar *value = nullptr;
+    g_object_get(src, "listen-to", &value, nullptr);
+    std::string result = value ? value : "";
+    g_free(value);
+    gst_object_unref(src);
+    gst_object_unref(pipeline);
+    return result;
+  };
+
+  REQUIRE(listen_to("42_video", "42_0badcafe") == "42_0badcafe_video");
+  // A custom source, or no known producer, keeps the configured one
+  REQUIRE(listen_to("some-lobby_video", "42_0badcafe") == "some-lobby_video");
+  REQUIRE(listen_to("42_video", "") == "42_video");
+}
+
+TEST_CASE("streaming: each stream instance names its own consumer") {
+  auto own = [](std::string pipeline, char secret) {
+    auto name = streaming::own_consumer(pipeline, 42, std::array<char, 16>{secret}, "video");
+    return std::make_pair(name, pipeline);
+  };
+
+  auto [first, first_pipeline] = own("interpipesrc name=interpipesrc_42_video listen-to=42_video ! fakesink", 1);
+  REQUIRE(first == "interpipesrc_42_video_01000000000000000000000000000000");
+  REQUIRE(first_pipeline == "interpipesrc name=" + first + " listen-to=42_video ! fakesink");
+  REQUIRE(own("interpipesrc name=interpipesrc_42_video", 2).first != first);
+  // A custom name, or another session's consumer, is left alone
+  REQUIRE(own("interpipesrc name=my_src ! fakesink", 1) ==
+          std::make_pair(std::string("interpipesrc_42_video"), std::string("interpipesrc name=my_src ! fakesink")));
+  REQUIRE(own("interpipesrc name=interpipesrc_42_video2 ! fakesink", 1).second ==
+          "interpipesrc name=interpipesrc_42_video2 ! fakesink");
+  REQUIRE(own("interpipesrc name=interpipesrc_420_video ! fakesink", 1).second ==
+          "interpipesrc name=interpipesrc_420_video ! fakesink");
+}
+
+TEST_CASE("sessions: a session built without a producer name keeps its id's producers") {
+  wolf::core::events::StreamSession session{.session_id = 42};
+  REQUIRE(state::producer_name(session) == "42");
+  session.producer_name = "42_0badcafe";
+  REQUIRE(state::producer_name(session) == "42_0badcafe");
 }
 
 /** The bytes of an encrypted packet with its (unauthenticated with V1) seq field rewritten */
@@ -712,33 +882,4 @@ TEST_CASE("control: a replayed encrypted packet is dropped", "[ENET]") {
   v1_client.send_idr(old_key, 7, ControlEncryption::V1);
   v1_client.service(200ms);
   REQUIRE(idr_requests == 7);
-}
-
-TEST_CASE("streaming: a stream listens to its own instance's producers", "[GSTREAMER]") {
-  auto listen_to = [](const std::string &configured, const std::string &producer_name) {
-    auto desc = fmt::format("interpipesrc name=interpipesrc_42_video listen-to={} ! fakesink", configured);
-    auto pipeline = gst_parse_launch(desc.c_str(), nullptr);
-    REQUIRE(pipeline);
-    streaming::listen_to_producer(pipeline, 42, producer_name, "video");
-    auto src = gst_bin_get_by_name(GST_BIN(pipeline), "interpipesrc_42_video");
-    gchar *value = nullptr;
-    g_object_get(src, "listen-to", &value, nullptr);
-    std::string result = value ? value : "";
-    g_free(value);
-    gst_object_unref(src);
-    gst_object_unref(pipeline);
-    return result;
-  };
-
-  REQUIRE(listen_to("42_video", "42_0badcafe") == "42_0badcafe_video");
-  // A custom source, or no known producer, keeps the configured one
-  REQUIRE(listen_to("some-lobby_video", "42_0badcafe") == "some-lobby_video");
-  REQUIRE(listen_to("42_video", "") == "42_video");
-}
-
-TEST_CASE("sessions: a session built without a producer name keeps its id's producers") {
-  wolf::core::events::StreamSession session{.session_id = 42};
-  REQUIRE(state::producer_name(session) == "42");
-  session.producer_name = "42_0badcafe";
-  REQUIRE(state::producer_name(session) == "42_0badcafe");
 }
