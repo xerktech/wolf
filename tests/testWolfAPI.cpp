@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <future>
 #include <poll.h>
+#include <tuple>
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
@@ -556,9 +557,32 @@ TEST_CASE("Sessions APIs", "[API]") {
   // Test that we can add a session
   auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
       .client_ip = "127.0.0.1",
+      .video_width = 1920,
+      .video_height = 1080,
+      .video_refresh_rate = 60,
       .app_id = "304556286",               // test cfg file
       .client_id = "10594003729173467913", // test cfg file
   };
+
+  // A zero or huge display mode is refused, as on the Moonlight /launch path, and nothing is stored
+  for (auto [width, height, fps] : {std::tuple{0, 1080, 60},
+                                    std::tuple{1920, 0, 60},
+                                    std::tuple{1920, 1080, 0},
+                                    std::tuple{-1920, 1080, 60},
+                                    std::tuple{16385, 1080, 60},
+                                    std::tuple{1920, 16385, 60},
+                                    std::tuple{1920, 1080, 1001},
+                                    std::tuple{2147483647, 2147483647, 2147483647}}) {
+    auto bad_session = session;
+    bad_session.video_width = width;
+    bad_session.video_height = height;
+    bad_session.video_refresh_rate = fps;
+    response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(bad_session));
+    REQUIRE(response);
+    REQUIRE(response->first == 400);
+    REQUIRE_THAT(response->second, ContainsSubstring("\"success\":false"));
+  }
+  REQUIRE(running_sessions->load()->size() == 0);
   response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
   REQUIRE(response);
   REQUIRE_THAT(response->second, Catch::Matchers::ContainsSubstring("{\"success\":true,\"session_id\":"));
@@ -716,6 +740,9 @@ TEST_CASE("Sessions API: the listed state follows the stream's events", "[API]")
 
   auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
       .client_ip = "127.0.0.1",
+      .video_width = 1920,
+      .video_height = 1080,
+      .video_refresh_rate = 60,
       .app_id = "304556286",               // test cfg file
       .client_id = "10594003729173467913", // test cfg file
   };
@@ -735,6 +762,7 @@ TEST_CASE("Sessions API: the listed state follows the stream's events", "[API]")
   auto rtp_secret = [](char id) { return std::array<char, 16>{id}; };
   auto video_session = [&](char secret) {
     events::VideoSession video{.session_id = session_id};
+    video.display_mode = {.width = 1920, .height = 1080, .refreshRate = 60};
     video.rtp_secret_payload = rtp_secret(secret);
     return video;
   };
@@ -860,6 +888,9 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
   for (const std::string bad_id : {"not-a-number", "", "-1", "99999999999999999999999"}) {
     auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
         .client_ip = "127.0.0.1",
+        .video_width = 1920,
+        .video_height = 1080,
+        .video_refresh_rate = 60,
         .app_id = "304556286", // test cfg file
         .client_id = bad_id,
     };
@@ -910,9 +941,46 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
     REQUIRE_THAT(response->second, ContainsSubstring("Invalid session_id"));
   }
 
+  { // sessions/start on a real session rejects a zero or absurd display mode instead of streaming it
+    auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
+        .client_ip = "127.0.0.1",
+        .video_width = 1920,
+        .video_height = 1080,
+        .video_refresh_rate = 60,
+        .app_id = "304556286",               // test cfg file
+        .client_id = "10594003729173467913", // test cfg file
+    };
+    auto response =
+        req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
+    REQUIRE(response);
+    auto created = rfl::json::read<StreamSessionCreated>(response->second).value();
+    auto fired = std::make_shared<std::atomic<int>>(0);
+    auto video_handler = event_bus->register_handler<immer::box<events::VideoSession>>(
+        [fired](const immer::box<events::VideoSession> &) { (*fired)++; });
+    auto audio_handler = event_bus->register_handler<immer::box<events::AudioSession>>(
+        [fired](const immer::box<events::AudioSession> &) { (*fired)++; });
+    for (auto mode : {wolf::core::virtual_display::DisplayMode{0, 0, 0},
+                      wolf::core::virtual_display::DisplayMode{2147483647, 2147483647, 2147483647},
+                      wolf::core::virtual_display::DisplayMode{1920, 1080, 1001}}) {
+      auto start_request = StreamSessionStartRequest{.session_id = created.session_id};
+      start_request.video_session.display_mode = mode;
+      response =
+          req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/start", rfl::json::write(start_request));
+      REQUIRE(response);
+      REQUIRE(response->first == 400);
+      REQUIRE_THAT(response->second, ContainsSubstring("Invalid video_session.display_mode"));
+    }
+    REQUIRE(*fired == 0); // rejected before anything reached the event bus
+    video_handler.unregister();
+    audio_handler.unregister();
+  }
+
   { // runners/start on a real session replies (it used to close the connection without an answer)
     auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
         .client_ip = "127.0.0.1",
+        .video_width = 1920,
+        .video_height = 1080,
+        .video_refresh_rate = 60,
         .app_id = "304556286",               // test cfg file
         .client_id = "10594003729173467913", // test cfg file
     };
@@ -1046,6 +1114,9 @@ TEST_CASE("Session APIs without app_id or client_id", "[API]") {
   // Test that we can add a session
   auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
       .client_ip = "127.0.0.1",
+      .video_width = 1920,
+      .video_height = 1080,
+      .video_refresh_rate = 60,
   };
 
   response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));

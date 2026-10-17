@@ -15,6 +15,7 @@ using Catch::Matchers::Equals;
 #include <moonlight/protocol.hpp>
 #include <range/v3/view.hpp>
 #include <rest/helpers.hpp>
+#include <rfl/toml.hpp>
 #include <state/config.hpp>
 #include <streaming/streaming.hpp>
 #include <sys/stat.h>
@@ -236,6 +237,25 @@ TEST_CASE("LocalState concurrent updates", "[LocalState]") {
           initial_clients + n_threads + 2);
   REQUIRE(!std::filesystem::exists(std::filesystem::symlink_status(cfg_file + ".tmp")));
   std::filesystem::remove(cfg_file);
+}
+
+TEST_CASE("Default config: every encoder has video_params", "[LocalState]") {
+  constexpr char const *default_toml =
+#include <state/default/config.include.toml>
+      ;
+  auto cfg = rfl::toml::read<wolf::config::WolfConfig, rfl::DefaultIfMissing>(default_toml).value();
+  auto video = cfg.gstreamer.video;
+  for (const auto &encoders : {video.h264_encoders, video.hevc_encoders, video.av1_encoders}) {
+    for (const auto &encoder : encoders) {
+      INFO("plugin_name: " << encoder.plugin_name << ", encoder: " << encoder.check_elements.at(0));
+      auto plugin_default = video.defaults.find(encoder.plugin_name);
+      auto has_default = plugin_default != video.defaults.end();
+      // An encoder without its own params falls back to the plugin default, otherwise to an empty string
+      REQUIRE(!encoder.video_params.value_or(has_default ? plugin_default->second.video_params : "").empty());
+      REQUIRE(!encoder.video_params_zero_copy.value_or(has_default ? plugin_default->second.video_params_zero_copy : "")
+                   .empty());
+    }
+  }
 }
 
 TEST_CASE("Mocked serverinfo", "[MoonlightProtocol]") {
@@ -461,6 +481,8 @@ TEST_CASE("HTTP Pairing", "[MoonlightProtocol]") {
   ServerData server_data;
 
   immer::box<state::AppState> app_state = {state::AppState{
+      .config = state::Config{.config_source = "config.test.PAIRING.toml",
+                              .paired_clients = std::make_shared<immer::atom<state::PairedClientList>>()},
       .host = {state::Host{.server_cert = server_data.server_cert,
                            .server_pkey = signature::create_key(server_data.server_pkey, true)}},
       .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
@@ -583,6 +605,99 @@ TEST_CASE("HTTP Pairing", "[MoonlightProtocol]") {
     auto bad_phase_3 = endpoints::pair_phase3(app_state, client_cache, bad_challenge, cache_key);
     REQUIRE(bad_phase_3.status == SimpleWeb::StatusCode::client_error_bad_request);
     REQUIRE(bad_phase_3.xml.get<int>("root.paired") == 0);
+  }
+
+  SECTION("The handler drops the pairing session after a failed phase 2/3 or phase 4") {
+    // Same key as `cache_key`, built the way the /pair handler builds it
+    REQUIRE(endpoints::pair_cache_key("1234", "0.0.0.0") == cache_key);
+    auto bad_challenge = std::string("0102030405060708090a0b0c0d0e0f"); // 15 bytes, see above
+
+    auto start_pairing = [&]() {
+      auto phase_1 = endpoints::pair_phase1(app_state,
+                                            "0.0.0.0",
+                                            "1.1.1.1",
+                                            moonlight_data.client_cert_base64,
+                                            moonlight_data.salt,
+                                            cache_key);
+      REQUIRE(phase_1->get_future().get().status == SimpleWeb::StatusCode::success_ok);
+    };
+    auto next_phase = [&](const std::string &param, const std::string &value) {
+      auto result = endpoints::pair_next_phase(app_state, {{param, value}}, "1234", "0.0.0.0");
+      REQUIRE(result.has_value());
+      return result.value();
+    };
+    auto require_session_gone = [&](const endpoints::XMLResult &retry) {
+      REQUIRE(app_state->pairing_cache->load().get().find(cache_key) == nullptr);
+      REQUIRE(retry.status == SimpleWeb::StatusCode::client_error_bad_request);
+      REQUIRE_THAT(retry.xml.get<std::string>("root.<xmlattr>.status_message"),
+                   Equals("Unable to find 1234 0.0.0.0 in the pairing cache"));
+    };
+
+    SECTION("phase 2") {
+      start_pairing();
+      REQUIRE(next_phase("clientchallenge", bad_challenge).status == SimpleWeb::StatusCode::client_error_bad_request);
+
+      // Retrying with a valid challenge must not resume the rejected session
+      require_session_gone(next_phase("clientchallenge", moonlight_data.client_challenge));
+    }
+
+    SECTION("phase 3") {
+      start_pairing();
+      REQUIRE(next_phase("clientchallenge", moonlight_data.client_challenge).status ==
+              SimpleWeb::StatusCode::success_ok);
+      REQUIRE(next_phase("serverchallengeresp", bad_challenge).status ==
+              SimpleWeb::StatusCode::client_error_bad_request);
+
+      require_session_gone(next_phase("serverchallengeresp", moonlight_data.server_challenge_resp));
+    }
+
+    SECTION("phase 4 pairs the client and ends the session") {
+      std::filesystem::copy_file("config.test.toml",
+                                 app_state->config->config_source,
+                                 std::filesystem::copy_options::overwrite_existing);
+      start_pairing();
+      REQUIRE(next_phase("clientchallenge", moonlight_data.client_challenge).status ==
+              SimpleWeb::StatusCode::success_ok);
+      // Swap the random server secret/challenge for the fixed ones the test vectors were made with
+      app_state->pairing_cache->update([&](const immer::map<std::string, state::PairCache> &pairing_cache) {
+        auto client_cache = pairing_cache.at(cache_key);
+        client_cache.server_secret = server_data.server_secret;
+        client_cache.server_challenge = server_data.server_secret;
+        return pairing_cache.set(cache_key, client_cache);
+      });
+      REQUIRE(next_phase("serverchallengeresp", moonlight_data.server_challenge_resp).status ==
+              SimpleWeb::StatusCode::success_ok);
+
+      auto phase_4 = next_phase("clientpairingsecret", moonlight_data.client_pairing_secret);
+      INFO(xml_to_str(phase_4.xml));
+      REQUIRE(phase_4.status == SimpleWeb::StatusCode::success_ok);
+      REQUIRE_THAT(app_state->config->paired_clients->load().get(), Catch::Matchers::SizeIs(1));
+      REQUIRE(app_state->config->paired_clients->load().get()[0]->client_cert ==
+              crypto::hex_to_str(moonlight_data.client_cert_base64, true));
+
+      // Replaying the last phase must not pair again
+      require_session_gone(next_phase("clientpairingsecret", moonlight_data.client_pairing_secret));
+    }
+
+    SECTION("a failed phase 4") {
+      start_pairing();
+      REQUIRE(next_phase("clientchallenge", moonlight_data.client_challenge).status ==
+              SimpleWeb::StatusCode::success_ok);
+      REQUIRE(next_phase("serverchallengeresp", moonlight_data.server_challenge_resp).status ==
+              SimpleWeb::StatusCode::success_ok);
+      // The server challenge is random here, so the client hash check fails
+      REQUIRE(next_phase("clientpairingsecret", moonlight_data.client_pairing_secret).status ==
+              SimpleWeb::StatusCode::client_error_bad_request);
+      REQUIRE_THAT(app_state->config->paired_clients->load().get(), Catch::Matchers::IsEmpty());
+
+      require_session_gone(next_phase("clientpairingsecret", moonlight_data.client_pairing_secret));
+    }
+
+    SECTION("a query matching no phase leaves the session alone") {
+      start_pairing();
+      REQUIRE_FALSE(endpoints::pair_next_phase(app_state, {{"foo", "bar"}}, "1234", "0.0.0.0").has_value());
+      REQUIRE(app_state->pairing_cache->load().get().find(cache_key) != nullptr);
+    }
   }
 
   SECTION("Testing null params") {
@@ -711,6 +826,16 @@ TEST_CASE("Launch rejects malformed client parameters", "[HTTP]") {
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080x60x1"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080x60fps"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "-1920x1080x60"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "0x0x0"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "0x1080x60"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x0x60"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080x0"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "16385x1080x60"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x16385x60"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "1920x1080x1001"}}));
+  REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"mode", "2147483647x2147483647x2147483647"}}));
+  REQUIRE(launch({{"rikeyid", "1"}, {"mode", "16384x16384x1000"}})); // the bounds themselves are accepted
+  REQUIRE(launch({{"rikeyid", "1"}, {"mode", "1x1x1"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"surroundAudioInfo", "abc"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"surroundAudioInfo", "196610junk"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "abc"}}));

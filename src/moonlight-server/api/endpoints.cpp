@@ -221,6 +221,16 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
   if (session) {
     immer::box<events::App> choosen_app;
     auto ss = session.value();
+    if (!moonlight::is_valid_display_mode(ss.video_width, ss.video_height, ss.video_refresh_rate)) {
+      logs::log(logs::warning,
+                "[API] Invalid display mode: {}x{}x{}",
+                ss.video_width,
+                ss.video_height,
+                ss.video_refresh_rate);
+      auto res = GenericErrorResponse{.error = "Invalid video_width, video_height or video_refresh_rate"};
+      send_http(socket, 400, rfl::json::write(res));
+      return;
+    }
     if (auto app_id = ss.app_id) {
       auto app = state::get_moonlight_app_by_id(this->state_->app_state->config, *app_id);
       if (!app) {
@@ -316,6 +326,13 @@ void UnixSocketServer::endpoint_StreamSessionStart(const HTTPRequest &req, std::
     auto session_id = *parsed_session_id;
     if (auto session = state::get_session_by_id(sessions.get(), session_id)) {
       auto video_session = start_req.value().video_session;
+      auto mode = video_session.display_mode;
+      if (!moonlight::is_valid_display_mode(mode.width, mode.height, mode.refreshRate)) {
+        logs::log(logs::warning, "[API] Invalid display mode: {}x{}x{}", mode.width, mode.height, mode.refreshRate);
+        auto res = GenericErrorResponse{.error = "Invalid video_session.display_mode"};
+        send_http(socket, 400, rfl::json::write(res));
+        return;
+      }
       video_session.session_id = session_id; // Can't be JSON encoded
       if (video_session.render_node.empty()) {
         video_session.render_node = session->app->render_node;
