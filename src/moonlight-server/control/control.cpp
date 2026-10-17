@@ -84,9 +84,11 @@ bool send_packet(std::string_view payload, ENetPeer *peer) {
 
 bool encrypt_and_send(std::string_view payload,
                       std::string_view aes_key,
+                      const std::shared_ptr<events::ControlStreamState> &control_stream,
                       immer::box<std::shared_ptr<ENetPeer>> connected_client) {
   if (auto enet_client = connected_client->get()) {
-    auto encrypted = control::encrypt_packet(aes_key, 0, payload); // TODO: seq?
+    auto encrypted =
+        control::encrypt_packet(aes_key, control_stream->send_seq++, payload, *control_stream->encryption.load());
     return send_packet({(char *)encrypted.get(), encrypted->full_size()}, enet_client);
   } else {
     logs::log(logs::warning, "[ENET] Failed to send packet, client is not connected");
@@ -199,7 +201,7 @@ void run_control(int port,
         for (auto &[peer, session] : *connected_clients.load()) {
           if (session->session_id == ev->session_id) {
             immer::box<std::shared_ptr<ENetPeer>> enet_client = {to_shared_ptr(peer)};
-            encrypt_and_send(plaintext, session->aes_key, enet_client);
+            encrypt_and_send(plaintext, session->aes_key, session->control_stream, enet_client);
             return;
           }
         }
@@ -274,10 +276,24 @@ void run_control(int port,
                           enc_pkt->full_size());
                 break;
               }
-              auto decrypted = decrypt_packet(*enc_pkt, client_session->aes_key);
+              auto control_stream = client_session->control_stream;
+              auto encryption = *control_stream->encryption.load();
+              auto decrypted = decrypt_packet(*enc_pkt, client_session->aes_key, encryption);
               if (decrypted.size() < sizeof(ControlPacket)) {
                 logs::log(logs::warning, "[ENET] Dropping decrypted packet of {} bytes", decrypted.size());
                 break;
+              }
+
+              // V1 doesn't authenticate seq past its low byte, so there's no seq to check for a replay.
+              // With V2 the tag covers the whole seq. Only this thread updates the window.
+              if (encryption == ControlEncryption::V2) {
+                auto seq = boost::endian::little_to_native(enc_pkt->seq);
+                auto window = accept_seq(*control_stream->replay_window.load(), seq);
+                if (!window) {
+                  logs::log(logs::warning, "[ENET] Dropping encrypted packet with seq {}, replayed or too old", seq);
+                  break;
+                }
+                control_stream->replay_window.store(*window);
               }
               auto sub_type = ((ControlPacket *)decrypted.data())->type;
 
