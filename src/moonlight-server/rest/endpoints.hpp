@@ -252,7 +252,8 @@ std::optional<XMLResult> pair_next_phase(const immer::box<state::AppState> &stat
                                          const std::string &client_ip) {
   auto cache_key = pair_cache_key(client_id, client_ip);
 
-  auto client_cache_it = state->pairing_cache->load()->find(cache_key);
+  auto pairing_cache = state->pairing_cache->load(); // find() points into this snapshot: keep it alive
+  auto client_cache_it = pairing_cache->find(cache_key);
   if (client_cache_it == nullptr) {
     return XMLResult{SimpleWeb::StatusCode::client_error_bad_request,
                      fail_pair(fmt::format("Unable to find {} {} in the pairing cache", client_id, client_ip))};
