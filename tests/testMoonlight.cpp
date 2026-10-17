@@ -585,6 +585,57 @@ TEST_CASE("HTTP Pairing", "[MoonlightProtocol]") {
     REQUIRE(bad_phase_3.xml.get<int>("root.paired") == 0);
   }
 
+  SECTION("A failed phase 2 or 3 drops the pairing session") {
+    // Same key as `cache_key`, built the way the /pair handler builds it
+    REQUIRE(endpoints::pair_cache_key("1234", "0.0.0.0") == cache_key);
+    auto bad_challenge = std::string("0102030405060708090a0b0c0d0e0f"); // 15 bytes, see above
+
+    auto start_pairing = [&]() {
+      auto phase_1 = endpoints::pair_phase1(app_state,
+                                            "0.0.0.0",
+                                            "1.1.1.1",
+                                            moonlight_data.client_cert_base64,
+                                            moonlight_data.salt,
+                                            cache_key);
+      REQUIRE(phase_1->get_future().get().status == SimpleWeb::StatusCode::success_ok);
+    };
+    auto next_phase = [&](const std::string &param, const std::string &value) {
+      auto result = endpoints::pair_next_phase(app_state, {{param, value}}, "1234", "0.0.0.0");
+      REQUIRE(result.has_value());
+      return result.value();
+    };
+    auto require_session_gone = [&](const endpoints::XMLResult &retry) {
+      REQUIRE(app_state->pairing_cache->load().get().find(cache_key) == nullptr);
+      REQUIRE(retry.status == SimpleWeb::StatusCode::client_error_bad_request);
+      REQUIRE_THAT(retry.xml.get<std::string>("root.<xmlattr>.status_message"),
+                   Equals("Unable to find 1234 0.0.0.0 in the pairing cache"));
+    };
+
+    SECTION("phase 2") {
+      start_pairing();
+      REQUIRE(next_phase("clientchallenge", bad_challenge).status == SimpleWeb::StatusCode::client_error_bad_request);
+
+      // Retrying with a valid challenge must not resume the rejected session
+      require_session_gone(next_phase("clientchallenge", moonlight_data.client_challenge));
+    }
+
+    SECTION("phase 3") {
+      start_pairing();
+      REQUIRE(next_phase("clientchallenge", moonlight_data.client_challenge).status ==
+              SimpleWeb::StatusCode::success_ok);
+      REQUIRE(next_phase("serverchallengeresp", bad_challenge).status ==
+              SimpleWeb::StatusCode::client_error_bad_request);
+
+      require_session_gone(next_phase("serverchallengeresp", moonlight_data.server_challenge_resp));
+    }
+
+    SECTION("a query matching no phase leaves the session alone") {
+      start_pairing();
+      REQUIRE_FALSE(endpoints::pair_next_phase(app_state, {{"foo", "bar"}}, "1234", "0.0.0.0").has_value());
+      REQUIRE(app_state->pairing_cache->load().get().find(cache_key) != nullptr);
+    }
+  }
+
   SECTION("Testing null params") {
     auto phase_1 = endpoints::pair_phase1(app_state, "0.0.0.0", "1.1.1.1", {}, {}, cache_key);
     auto result = phase_1->get_future().get();
