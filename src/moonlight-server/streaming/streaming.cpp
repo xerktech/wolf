@@ -202,10 +202,7 @@ void start_audio_producer(const std::string &session_id,
   });
 }
 
-std::string own_consumer(std::string &pipeline,
-                         std::size_t session_id,
-                         const std::array<char, 16> &rtp_secret_payload,
-                         const std::string &kind) {
+std::string own_consumer(std::string &pipeline, std::size_t session_id, const std::string &kind) {
   auto configured = fmt::format("interpipesrc_{}_{}", session_id, kind);
   auto key = "name=" + configured;
   auto at = pipeline.find(key);
@@ -216,9 +213,9 @@ std::string own_consumer(std::string &pipeline,
   if (end < pipeline.size() && !std::isspace(static_cast<unsigned char>(pipeline[end])) && pipeline[end] != '!') {
     return configured; // Only a prefix of some other name
   }
-  auto own = fmt::format("{}_{}",
-                         configured,
-                         crypto::str_to_hex(std::string_view(rtp_secret_payload.data(), rtp_secret_payload.size())));
+  // Random per pipeline start, not per stream instance: an API start after a pause reuses the instance's
+  // rtp_secret_payload while the paused pipelines may still be leaving their producers
+  auto own = fmt::format("{}_{}", configured, crypto::str_to_hex(crypto::random(16)));
   pipeline.replace(at + 5, configured.size(), own);
   return own;
 }
@@ -486,7 +483,7 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
       fmt::arg("color_space", color_space),
       fmt::arg("color_range", color_range),
       fmt::arg("host_port", video_session->port));
-  auto consumer = own_consumer(pipeline, video_session->session_id, video_session->rtp_secret_payload, "video");
+  auto consumer = own_consumer(pipeline, video_session->session_id, "video");
   logs::log(logs::debug, "Starting video pipeline: \n{}", pipeline);
 
   bool enable_pacing = utils::get_env("WOLF_ENABLE_VIDEO_PACING", "TRUE") == std::string("TRUE");
@@ -608,7 +605,7 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
       fmt::arg("client_port", client_port),
       fmt::arg("client_ip", client_ip),
       fmt::arg("host_port", audio_session->port));
-  auto consumer = own_consumer(pipeline, audio_session->session_id, audio_session->rtp_secret_payload, "audio");
+  auto consumer = own_consumer(pipeline, audio_session->session_id, "audio");
   logs::log(logs::debug, "Starting audio pipeline: \n{}", pipeline);
 
   std::shared_ptr<custom_sink::UDPSink> udp_sink = std::make_shared<custom_sink::UDPSink>(custom_sink::UDPSink{
