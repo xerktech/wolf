@@ -15,5 +15,8 @@ paths:
   - Never touch fds 0-2: they are the app's stdio (captured pipes on Boost < 1.88).
 - The fcntl fallback (kernel < 5.11) is capped at 65536 fds. One fcntl per possible fd up to an
   `infinity` RLIMIT_NOFILE (~1e9) would stall every launch for minutes.
+- Keep `close_inherited_fds{}` last in the `bp::child` arguments, after the stdio redirects.
+  - Placed earlier, a redirect's dup2 re-clears close-on-exec on fds 1-2, which masks a range that
+    wrongly starts below 3, and the test no longer catches it.
 - Tests: `tests/platforms/linux/process.cpp` "Process runner doesn't leak Wolf's sockets to the child"
   (fails without the initializer; its stderr assertion catches a range that starts below 3).

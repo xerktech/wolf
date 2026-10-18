@@ -14,6 +14,14 @@
 #if __has_include(<linux/close_range.h>)
 #include <linux/close_range.h>
 #endif
+// close_range (Linux 5.9) has the same syscall number on every architecture; defined here so builds against older
+// glibc or kernel headers still use it, instead of only the slow fallback below
+#ifndef SYS_close_range
+#define SYS_close_range 436
+#endif
+#ifndef CLOSE_RANGE_CLOEXEC
+#define CLOSE_RANGE_CLOEXEC (1U << 2)
+#endif
 #endif
 
 namespace process {
@@ -31,12 +39,10 @@ using namespace wolf::core::events;
 struct close_inherited_fds : bp::extend::handler {
   template <class Executor> void on_exec_setup(Executor &) const {
 #ifdef __linux__
-#if defined(SYS_close_range) && defined(CLOSE_RANGE_CLOEXEC)
     // raw syscall: the glibc wrapper only exists from 2.34
     if (::syscall(SYS_close_range, 3, ~0U, CLOSE_RANGE_CLOEXEC) == 0) {
       return;
     }
-#endif
     // Kernel < 5.11: fall back to marking each possible fd (fcntl and getrlimit are safe to call after fork).
     // Capped: RLIMIT_NOFILE can be ~1e9 (LimitNOFILE=infinity), and one fcntl per fd would stall every app launch;
     // Wolf's own sockets are opened at startup, so they sit at low fd numbers.
@@ -74,13 +80,14 @@ void RunProcess::run(std::string_view session_id,
     child_proc = bp::child(this->run_cmd,
                            env,
                            bp::std_in.close(),
-                           close_inherited_fds{},
 #if BOOST_VERSION < 108800
                            bp::std_out > std_out,
                            bp::std_err > err_out,
                            ios,
 #endif
-                           group_proc);
+                           group_proc,
+                           // last, so it runs after the stdio redirects have set up fds 0-2
+                           close_inherited_fds{});
 
   } catch (const std::system_error &e) {
     logs::log(logs::error, "Unable to start process, error: {} - {}", e.code().value(), e.what());
