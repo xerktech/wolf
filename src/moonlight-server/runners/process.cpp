@@ -6,10 +6,14 @@
 #include <immer/atom.hpp>
 #include <runners/process.hpp>
 #ifdef __linux__
+#include <algorithm>
 #include <fcntl.h>
-#include <linux/close_range.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+#if __has_include(<linux/close_range.h>)
+#include <linux/close_range.h>
+#endif
 #endif
 
 namespace process {
@@ -27,13 +31,19 @@ using namespace wolf::core::events;
 struct close_inherited_fds : bp::extend::handler {
   template <class Executor> void on_exec_setup(Executor &) const {
 #ifdef __linux__
-    if (::close_range(3, ~0U, CLOSE_RANGE_CLOEXEC) == 0) {
+#if defined(SYS_close_range) && defined(CLOSE_RANGE_CLOEXEC)
+    // raw syscall: the glibc wrapper only exists from 2.34
+    if (::syscall(SYS_close_range, 3, ~0U, CLOSE_RANGE_CLOEXEC) == 0) {
       return;
     }
-    // Kernel < 5.11: fall back to marking each possible fd (fcntl and getrlimit are safe to call after fork)
+#endif
+    // Kernel < 5.11: fall back to marking each possible fd (fcntl and getrlimit are safe to call after fork).
+    // Capped: RLIMIT_NOFILE can be ~1e9 (LimitNOFILE=infinity), and one fcntl per fd would stall every app launch;
+    // Wolf's own sockets are opened at startup, so they sit at low fd numbers.
+    constexpr rlim_t max_scanned_fds = 65536;
     rlimit lim{};
-    int max_fd = (::getrlimit(RLIMIT_NOFILE, &lim) == 0 && lim.rlim_cur != RLIM_INFINITY) ? lim.rlim_cur : 65536;
-    for (int fd = 3; fd < max_fd; fd++) {
+    auto max_fd = ::getrlimit(RLIMIT_NOFILE, &lim) == 0 ? std::min(lim.rlim_cur, max_scanned_fds) : max_scanned_fds;
+    for (int fd = 3; fd < static_cast<int>(max_fd); fd++) {
       ::fcntl(fd, F_SETFD, FD_CLOEXEC);
     }
 #endif

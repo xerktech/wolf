@@ -30,6 +30,6 @@ TEST_CASE("Process runner doesn't leak Wolf's sockets to the child", "[PROCESS]"
   child_fds << in.rdbuf();
   std::filesystem::remove(out_file);
 
-  REQUIRE_THAT(child_fds.str(), ContainsSubstring("->")); // the child did run and list its fds
+  REQUIRE_THAT(child_fds.str(), ContainsSubstring(" 2 -> ")); // the child ran, and kept its stderr
   REQUIRE_THAT(child_fds.str(), !ContainsSubstring(listen_socket));
 }
