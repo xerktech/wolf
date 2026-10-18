@@ -14,9 +14,9 @@
 #if __has_include(<linux/close_range.h>)
 #include <linux/close_range.h>
 #endif
-// close_range (Linux 5.9) has the same syscall number on every architecture; defined here so builds against older
-// glibc or kernel headers still use it, instead of only the slow fallback below
-#ifndef SYS_close_range
+// close_range (Linux 5.9) is 436 on every architecture that uses the unified syscall table (all but alpha and mips);
+// defined here so builds against older glibc or kernel headers still use it, instead of only the slow fallback below
+#if !defined(SYS_close_range) && !defined(__alpha__) && !defined(__mips__)
 #define SYS_close_range 436
 #endif
 #ifndef CLOSE_RANGE_CLOEXEC
@@ -39,10 +39,12 @@ using namespace wolf::core::events;
 struct close_inherited_fds : bp::extend::handler {
   template <class Executor> void on_exec_setup(Executor &) const {
 #ifdef __linux__
+#ifdef SYS_close_range
     // raw syscall: the glibc wrapper only exists from 2.34
     if (::syscall(SYS_close_range, 3, ~0U, CLOSE_RANGE_CLOEXEC) == 0) {
       return;
     }
+#endif
     // Kernel < 5.11: fall back to marking each possible fd (fcntl and getrlimit are safe to call after fork).
     // Capped: RLIMIT_NOFILE can be ~1e9 (LimitNOFILE=infinity), and one fcntl per fd would stall every app launch;
     // Wolf's own sockets are opened at startup, so they sit at low fd numbers.
