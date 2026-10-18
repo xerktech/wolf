@@ -179,6 +179,7 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
           .request_description =
               APIDescription{.json_schema = rfl::json::to_schema<rfl::Reflector<events::StreamSession>::ReflType>()},
           .response_description = {{200, {.json_schema = rfl::json::to_schema<StreamSessionCreated>()}},
+                                   {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                    {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
           .handler = [this](auto req, auto socket) { endpoint_StreamSessionAdd(req, socket); },
       });
@@ -190,6 +191,7 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
           .summary = "Start a stream session",
           .request_description = APIDescription{.json_schema = rfl::json::to_schema<StreamSessionStartRequest>()},
           .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                   {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                    {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
           .handler = [this](auto req, auto socket) { endpoint_StreamSessionStart(req, socket); },
       });
@@ -256,6 +258,7 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
                        .summary = "Create a new lobby",
                        .request_description = APIDescription{.json_schema = rfl::json::to_schema<CreateLobbyRequest>()},
                        .response_description = {{200, {.json_schema = rfl::json::to_schema<LobbyCreateResponse>()}},
+                                                {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                                 {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
                        .handler = [this](auto req, auto socket) { endpoint_LobbyCreate(req, socket); },
                    });
