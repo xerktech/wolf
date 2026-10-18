@@ -5,10 +5,40 @@
 #include <helpers/logger.hpp>
 #include <immer/atom.hpp>
 #include <runners/process.hpp>
+#ifdef __linux__
+#include <fcntl.h>
+#include <linux/close_range.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 namespace process {
 
 using namespace wolf::core::events;
+
+/**
+ * Wolf's own descriptors (listening sockets, ENet, the API socket, ...) are not opened with close-on-exec, so without
+ * this a spawned app would inherit them. A child that outlives Wolf would then keep its ports bound, and the next
+ * Wolf fails with "bind: Address already in use".
+ *
+ * Runs in the forked child, right before exec: marks every fd above stdio as close-on-exec rather than closing it, so
+ * Boost.Process' own (already close-on-exec) error-reporting pipe keeps working.
+ */
+struct close_inherited_fds : bp::extend::handler {
+  template <class Executor> void on_exec_setup(Executor &) const {
+#ifdef __linux__
+    if (::close_range(3, ~0U, CLOSE_RANGE_CLOEXEC) == 0) {
+      return;
+    }
+    // Kernel < 5.11: fall back to marking each possible fd (fcntl and getrlimit are safe to call after fork)
+    rlimit lim{};
+    int max_fd = (::getrlimit(RLIMIT_NOFILE, &lim) == 0 && lim.rlim_cur != RLIM_INFINITY) ? lim.rlim_cur : 65536;
+    for (int fd = 3; fd < max_fd; fd++) {
+      ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
+#endif
+  }
+};
 
 void RunProcess::run(std::string_view session_id,
                      std::string_view app_state_folder,
@@ -34,6 +64,7 @@ void RunProcess::run(std::string_view session_id,
     child_proc = bp::child(this->run_cmd,
                            env,
                            bp::std_in.close(),
+                           close_inherited_fds{},
 #if BOOST_VERSION < 108800
                            bp::std_out > std_out,
                            bp::std_err > err_out,
