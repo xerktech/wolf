@@ -453,6 +453,17 @@ void UnixSocketServer::endpoint_Lobbies(const wolf::api::HTTPRequest &req, std::
 void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto event = rfl::json::read<CreateLobbyRequest>(req.body);
   if (event) {
+    const auto &video = event.value().video_settings;
+    if (!moonlight::is_valid_display_mode(video.width, video.height, video.refresh_rate)) {
+      logs::log(logs::warning,
+                "[API] Invalid lobby display mode: {}x{}x{}",
+                video.width,
+                video.height,
+                video.refresh_rate);
+      auto res = GenericErrorResponse{.error = "Invalid video_settings width, height or refresh_rate"};
+      send_http(socket, 400, rfl::json::write(res));
+      return;
+    }
     auto default_client_settings = state::ClientSettings{};
     auto client_settings = event.value().client_settings.value().value_or(PartialClientSettings{});
     auto lobby_id = state::gen_uuid();

@@ -1136,6 +1136,39 @@ TEST_CASE("Lobbies APIs", "[API]") {
     REQUIRE(sessions.lobbies.size() == 0);
   }
 
+  { // A zero or absurd display mode is rejected before any video producer is started
+    auto created = std::make_shared<std::atomic<int>>(0);
+    auto create_handler = event_bus->register_handler<immer::box<events::CreateLobbyEvent>>(
+        [created](const immer::box<events::CreateLobbyEvent> &) { (*created)++; });
+    for (auto mode : {wolf::core::virtual_display::DisplayMode{0, 0, 0},
+                      wolf::core::virtual_display::DisplayMode{2147483647, 2147483647, 2147483647},
+                      wolf::core::virtual_display::DisplayMode{1920, 1080, 1001}}) {
+      auto bad_lobby = CreateLobbyRequest{.profile_id = "test_profile",
+                                          .name = "bad_lobby",
+                                          .multi_user = false,
+                                          .stop_when_everyone_leaves = false,
+                                          .video_settings = {.width = mode.width,
+                                                             .height = mode.height,
+                                                             .refresh_rate = mode.refreshRate,
+                                                             .wayland_render_node = "software",
+                                                             .runner_render_node = "runner_render_node",
+                                                             .video_producer_buffer_caps = "video/x-raw"},
+                                          .audio_settings = {.channel_count = 2},
+                                          .runner_state_folder = "runner_state_folder",
+                                          .runner = wolf::config::AppCMD{.run_cmd = "sleep 10"}};
+      auto response =
+          req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/lobbies/create", rfl::json::write(bad_lobby));
+      REQUIRE(response);
+      REQUIRE(response->first == 400);
+      REQUIRE_THAT(response->second, ContainsSubstring("Invalid video_settings"));
+    }
+    REQUIRE(*created == 0);
+    create_handler.unregister();
+    auto response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/lobbies");
+    REQUIRE(response);
+    REQUIRE(rfl::json::read<LobbiesResponse>(response->second).value().lobbies.empty());
+  }
+
   std::string lobby_id;
   std::vector<short> pin = {1, 2, 3, 4};
   { // Test creating a lobby
