@@ -70,10 +70,23 @@ public:
       host_option = host->second;
     }
     for (const events::StreamSession &session : sessions) {
+      // RTSP is unauthenticated and the fake IP is no secret (e.g. an orchestrator may set it to the pod IP), so
+      // it only picks between the sessions of the client that is talking to us: a request from any other address
+      // could otherwise read the session's ping payload (and steal its video) or ANNOUNCE before the real client.
+      if (session.ip != user_ip) {
+        if (session.rtsp_fake_ip == packet.request.uri.ip || host_option == session.rtsp_fake_ip) {
+          logs::log(logs::warning,
+                    "[RTSP] rejecting request for session {} from {}, expected {}",
+                    session.rtsp_fake_ip,
+                    user_ip,
+                    session.ip);
+        }
+        continue;
+      }
       if (session.rtsp_fake_ip == packet.request.uri.ip || host_option == session.rtsp_fake_ip) {
         logs::log(logs::debug, "[RTSP] found session by matching payload: {}", session.rtsp_fake_ip);
         return session;
-      } else if ((host_option == "0.0.0.0" || host_option.empty()) && session.ip == user_ip) {
+      } else if (host_option == "0.0.0.0" || host_option.empty()) {
         logs::log(logs::debug, "[RTSP] found session by matching IP: {}", session.ip);
         return session;
       }
