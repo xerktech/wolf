@@ -286,11 +286,17 @@ std::optional<XMLResult> pair_next_phase(const immer::box<state::AppState> &stat
     auto result = pair_phase4(client_cache, client_secret.value());
 
     if (result.status == SimpleWeb::StatusCode::success_ok) {
-      state::pair(
-          state->config,
-          state::PairedClient{.client_cert = client_cache.client_cert,
-                              .app_state_folder = std::to_string(std::hash<std::string>{}(client_cache.client_cert))});
-      logs::log(logs::info, "Succesfully paired {}", client_ip);
+      auto client = state::PairedClient{
+          .client_cert = client_cache.client_cert,
+          .app_state_folder = std::to_string(std::hash<std::string>{}(client_cache.client_cert))};
+      if (state::pair(state->config, client)) {
+        logs::log(logs::info, "Succesfully paired {}", client_ip);
+      } else {
+        // Not persisted, so the pairing would be lost on restart: fail it now, the client can retry
+        logs::log(logs::error, "Failed pairing with {}: config.toml couldn't be saved", client_ip);
+        state::unpair(state->config, client);
+        result = {SimpleWeb::StatusCode::server_error_internal_server_error, fail_pair("Unable to save the pairing")};
+      }
     } else {
       logs::log(logs::warning, "Failed pairing with {}", client_ip);
     }

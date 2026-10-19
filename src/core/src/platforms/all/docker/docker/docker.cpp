@@ -333,10 +333,16 @@ bool DockerAPI::pull_image(std::string_view image_name,
     auto slash = image_name.find_last_of('/');
     auto last_component = slash == std::string_view::npos ? image_name : image_name.substr(slash + 1);
     bool has_tag = last_component.find(':') != std::string_view::npos || image_name.find('@') != std::string_view::npos;
-    auto api_url = fmt::format("http://localhost/{}/images/create?fromImage={}{}",
-                               docker_api_version,
-                               image_name,
-                               has_tag ? "" : ":latest");
+    // Escaped: a raw '&' or '#' in the name would add query parameters or cut the URL short
+    auto from_image = std::string(image_name) + (has_tag ? "" : ":latest");
+    std::unique_ptr<char, decltype(&curl_free)> escaped_image(
+        curl_easy_escape(conn->get(), from_image.c_str(), static_cast<int>(from_image.size())),
+        &curl_free);
+    if (!escaped_image) {
+      return false;
+    }
+    auto api_url =
+        fmt::format("http://localhost/{}/images/create?fromImage={}", docker_api_version, escaped_image.get());
 
     struct PullState {
       std::string buffer = {};

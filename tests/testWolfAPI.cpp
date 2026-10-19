@@ -310,6 +310,10 @@ TEST_CASE("APPs APIs", "[API]") {
   response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/apps/add", rfl::json::write(app));
   REQUIRE(response);
   REQUIRE_THAT(response->second, Equals("{\"success\":true}"));
+  // Adding it again (e.g. a client retrying) doesn't create a second app with the same id
+  response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/apps/add", rfl::json::write(app));
+  REQUIRE(response);
+  REQUIRE(response->first == 409);
 
   // Test that the new app is in the list
   response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/apps");
@@ -571,6 +575,8 @@ TEST_CASE("Sessions APIs", "[API]") {
   // Test that we can add a session
   auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
       .client_ip = "127.0.0.1",
+      .aes_key = "00112233445566778899aabbccddeeff",
+      .aes_iv = "1",
       .video_width = 1920,
       .video_height = 1080,
       .video_refresh_rate = 60,
@@ -754,6 +760,8 @@ TEST_CASE("Sessions API: the listed state follows the stream's events", "[API]")
 
   auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
       .client_ip = "127.0.0.1",
+      .aes_key = "00112233445566778899aabbccddeeff",
+      .aes_iv = "1",
       .video_width = 1920,
       .video_height = 1080,
       .video_refresh_rate = 60,
@@ -899,6 +907,8 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
   for (const std::string bad_id : {"not-a-number", "", "-1", "99999999999999999999999"}) {
     auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
         .client_ip = "127.0.0.1",
+        .aes_key = "00112233445566778899aabbccddeeff",
+        .aes_iv = "1",
         .video_width = 1920,
         .video_height = 1080,
         .video_refresh_rate = 60,
@@ -908,6 +918,7 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
     auto response =
         req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
     REQUIRE(response);
+    REQUIRE(response->first == 400);
     REQUIRE_THAT(response->second, ContainsSubstring("Invalid client_id"));
 
     response = req(curl.get(),
@@ -922,7 +933,7 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
                    "http://localhost/api/v1/unpair/client",
                    rfl::json::write(UnpairClientRequest{.client_id = bad_id}));
     REQUIRE(response);
-    REQUIRE(response->first == 404);
+    REQUIRE(response->first == 400);
 
     auto expect_invalid_session = [&](std::string_view endpoint, const std::string &body) {
       auto res = req(curl.get(), HTTPMethod::POST, std::string("http://localhost") + endpoint.data(), body);
@@ -966,6 +977,7 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
   { // An aes_iv that isn't Moonlight's decimal rikeyid would silently encrypt the audio with IV 0
     auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
         .client_ip = "127.0.0.1",
+        .aes_key = "00112233445566778899aabbccddeeff",
         .aes_iv = "abc",
         .video_width = 1920,
         .video_height = 1080,
@@ -976,6 +988,56 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
     REQUIRE(response);
     REQUIRE(response->first == 400);
     REQUIRE_THAT(response->second, ContainsSubstring("Invalid aes_iv"));
+    session.aes_iv = "";
+    response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
+    REQUIRE(response);
+    REQUIRE(response->first == 400);
+
+    // A missing or short key crashed the audio payloader once a stream started
+    session.aes_iv = "1";
+    for (auto key : {"", "0011", "00112233445566778899aabbccddeefg", "00112233445566778899aabbccddeeff00"}) {
+      session.aes_key = key;
+      response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
+      REQUIRE(response);
+      REQUIRE(response->first == 400);
+      REQUIRE_THAT(response->second, ContainsSubstring("Invalid aes_key"));
+    }
+  }
+
+  { // Concurrent adds for one client: exactly one gets the session, the others 409
+    auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
+        .client_ip = "127.0.0.1",
+        .aes_key = "00112233445566778899aabbccddeeff",
+        .aes_iv = "1",
+        .video_width = 1920,
+        .video_height = 1080,
+        .video_refresh_rate = 60,
+        .app_id = "304556286",               // test cfg file
+        .client_id = "10594003729173467913", // test cfg file
+    };
+    constexpr int n_clients = 16;
+    std::atomic_int created_count = 0, conflicts = 0;
+    std::vector<std::thread> clients;
+    for (int i = 0; i < n_clients; i++) {
+      clients.emplace_back([&]() {
+        auto c = curl_ptr(curl_easy_init(), ::curl_easy_cleanup);
+        curl_easy_setopt(c.get(), CURLOPT_UNIX_SOCKET_PATH, socket_path.c_str());
+        curl_easy_setopt(c.get(), CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
+        auto res = req(c.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
+        if (res && res->first == 200) {
+          created_count++;
+        } else if (res && res->first == 409) {
+          conflicts++;
+        }
+      });
+    }
+    for (auto &c : clients) {
+      c.join();
+    }
+    REQUIRE(created_count == 1);
+    REQUIRE(conflicts == n_clients - 1);
+    REQUIRE(running_sessions->load()->size() == 1);
+    running_sessions->store({}); // No handlers here to remove it on sessions/stop
   }
 
   StreamSessionCreated created;
@@ -983,6 +1045,8 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
   { // sessions/start on a real session rejects a zero or absurd display mode instead of streaming it
     auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
         .client_ip = "127.0.0.1",
+        .aes_key = "00112233445566778899aabbccddeeff",
+        .aes_iv = "1",
         .video_width = 1920,
         .video_height = 1080,
         .video_refresh_rate = 60,
@@ -1018,6 +1082,19 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
       REQUIRE(response->first == 400);
       REQUIRE_THAT(response->second, ContainsSubstring("Invalid video_session.display_mode"));
     }
+    // An encrypted audio session needs a usable key: an empty one crashed the payloader (hex_to_str(NULL))
+    for (auto key : {"", "abc"}) {
+      auto start_request = StreamSessionStartRequest{.session_id = created.session_id};
+      start_request.video_session.display_mode = {1920, 1080, 60};
+      start_request.audio_session.encrypt_audio = true;
+      start_request.audio_session.aes_key = key;
+      start_request.audio_session.aes_iv = "1";
+      response =
+          req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/start", rfl::json::write(start_request));
+      REQUIRE(response);
+      REQUIRE(response->first == 400);
+      REQUIRE_THAT(response->second, ContainsSubstring("Invalid audio_session.aes_key"));
+    }
     REQUIRE(*fired == 0); // rejected before anything reached the event bus
     video_handler.unregister();
     audio_handler.unregister();
@@ -1040,6 +1117,26 @@ TEST_CASE("Malformed IDs are rejected without crashing", "[API]") {
       req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", "{}", {"Content-Length: abc"});
   REQUIRE(response);
   REQUIRE(response->first == 400);
+
+  { // A body that doesn't parse is the client's error, e.g. a client_id sent as a number
+    auto response = req(curl.get(),
+                        HTTPMethod::POST,
+                        "http://localhost/api/v1/sessions/add",
+                        "{\"client_ip\":\"127.0.0.1\",\"client_id\":42,\"video_width\":1920,\"video_height\":1080,"
+                        "\"video_refresh_rate\":60}");
+    REQUIRE(response);
+    REQUIRE(response->first == 400);
+    response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/lobbies/join", "{\"lobby_id\":1}");
+    REQUIRE(response);
+    REQUIRE(response->first == 400);
+    response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/docker/images/pull", "{}");
+    REQUIRE(response);
+    REQUIRE(response->first == 400);
+    response =
+        req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/docker/images/pull", "{\"image_name\":\" \"}");
+    REQUIRE(response);
+    REQUIRE(response->first == 400);
+  }
 
   // An unknown endpoint gets its 404 (the socket used to be closed with the reply still in flight)
   response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/no-such-endpoint");
@@ -1153,6 +1250,8 @@ TEST_CASE("Session APIs without app_id or client_id", "[API]") {
   // Test that we can add a session
   auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
       .client_ip = "127.0.0.1",
+      .aes_key = "00112233445566778899aabbccddeeff",
+      .aes_iv = "1",
       .video_width = 1920,
       .video_height = 1080,
       .video_refresh_rate = 60,
@@ -1265,6 +1364,15 @@ TEST_CASE("Joining a second lobby leaves the first one", "[API]") {
   // Joining the lobby it's already in changes nothing
   REQUIRE(join("lobby-b").empty());
   REQUIRE(members("lobby-b") == 1);
+
+  // Concurrent joins to both: the session ends up in exactly one lobby, listed once
+  for (int round = 0; round < 20; round++) {
+    std::thread to_a([&]() { join("lobby-a"); });
+    std::thread to_b([&]() { join("lobby-b"); });
+    to_a.join();
+    to_b.join();
+    REQUIRE(members("lobby-a") + members("lobby-b") == 1);
+  }
 }
 
 TEST_CASE("Lobbies APIs", "[API]") {
@@ -1379,6 +1487,15 @@ TEST_CASE("Lobbies APIs", "[API]") {
     auto error_res = rfl::json::read<GenericErrorResponse>(response->second).value();
     // we expect this to fail since we don't pass the PIN!
     REQUIRE(!error_res.success);
+    REQUIRE(response->first == 403);
+    // An unknown lobby is the client's error too
+    response = req(
+        curl.get(),
+        HTTPMethod::POST,
+        "http://localhost/api/v1/lobbies/join",
+        rfl::json::write(events::JoinLobbyEvent{.lobby_id = "nope", .moonlight_session_id = moonlight_session_id}));
+    REQUIRE(response);
+    REQUIRE(response->first == 404);
 
     // Now call it with the right PIN
     response = req(
@@ -1430,6 +1547,7 @@ TEST_CASE("Lobbies APIs", "[API]") {
     auto error_res = rfl::json::read<GenericSuccessResponse>(response->second).value();
     // We expect this to fail since we don't pass a PIN!
     REQUIRE(!error_res.success);
+    REQUIRE(response->first == 403);
     // Now try again with the PIN
     response = req(curl.get(),
                    HTTPMethod::POST,
@@ -1703,7 +1821,8 @@ TEST_CASE("A failed docker pull is reported as a failure", "[API]") {
   boost::asio::io_context ctx;
   boost::asio::local::stream_protocol::acceptor acceptor(ctx,
                                                          boost::asio::local::stream_protocol::endpoint(socket_path));
-  std::thread fake_docker([&acceptor]() {
+  std::string pull_request;
+  std::thread fake_docker([&acceptor, &pull_request]() {
     // DockerAPI asks for /version first, then pulls
     for (auto body : {std::string("{\"ApiVersion\":\"1.41\"}"),
                       std::string("{\"status\":\"Pulling from library/nope\",\"id\":\"latest\"}\r\n"
@@ -1712,6 +1831,7 @@ TEST_CASE("A failed docker pull is reported as a failure", "[API]") {
       acceptor.accept(conn);
       boost::asio::streambuf request;
       boost::asio::read_until(conn, request, "\r\n\r\n");
+      pull_request = std::string(boost::asio::buffers_begin(request.data()), boost::asio::buffers_end(request.data()));
       auto reply = fmt::format("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n"
                                "Connection: close\r\n\r\n{}",
                                body.size(),
@@ -1721,8 +1841,10 @@ TEST_CASE("A failed docker pull is reported as a failure", "[API]") {
   });
 
   docker::DockerAPI docker_api(socket_path);
-  REQUIRE_FALSE(docker_api.pull_image("nope", ""));
+  REQUIRE_FALSE(docker_api.pull_image("nope&tag=evil", ""));
   fake_docker.join();
+  // The name is escaped: it can't add query parameters
+  REQUIRE_THAT(pull_request, ContainsSubstring("/images/create?fromImage=nope%26tag%3Devil%3Alatest "));
   std::filesystem::remove(socket_path);
 }
 

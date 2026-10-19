@@ -10,6 +10,7 @@ using Catch::Matchers::Equals;
 #include <future>
 #include <gst-plugin/audio.hpp>
 #include <gst-plugin/video.hpp>
+#include <gst/app/gstappsrc.h>
 #include <moonlight/fec.hpp>
 #include <streaming/streaming.hpp>
 #include <string>
@@ -504,6 +505,36 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Audio RTP packet creation", "[GSTPlugin
                    Equals(std::string(original_pkt.begin(), original_pkt.end())));
     }
   }
+}
+
+TEST_CASE_METHOD(GStreamerTestsFixture, "Audio payloader refuses a missing aes_key", "[GSTPlugin]") {
+  // An empty aes_key= in the pipeline string arrives as a NULL string: it used to be dereferenced (hex_to_str(NULL))
+  auto pay = (gst_rtp_moonlight_pay_audio *)g_object_new(gst_TYPE_rtp_moonlight_pay_audio, nullptr);
+  g_object_set(pay, "aes_key", nullptr, "aes_iv", nullptr, nullptr);
+  REQUIRE(pay->aes_key.empty());
+  REQUIRE(pay->aes_iv.empty());
+  g_object_unref(pay);
+
+  // Encrypting with it would read 16 bytes of key: the stream errors out instead
+  gst_element_register(nullptr, "rtpmoonlightpay_audio", GST_RANK_PRIMARY, gst_TYPE_rtp_moonlight_pay_audio);
+  GError *error = nullptr;
+  auto pipeline = gst_parse_launch("appsrc name=src ! rtpmoonlightpay_audio name=pay encrypt=true ! fakesink", &error);
+  REQUIRE(error == nullptr);
+  auto pay_el = gst_bin_get_by_name(GST_BIN(pipeline), "pay");
+  g_object_set(pay_el, "aes_key", nullptr, nullptr);
+  gst_object_unref(pay_el);
+  auto src = gst_bin_get_by_name(GST_BIN(pipeline), "src");
+  gst_element_set_state(pipeline, GST_STATE_PLAYING);
+  auto payload_str = "TUNZ TUNZ TUMP TUMP!"s;
+  gst_app_src_push_buffer(GST_APP_SRC(src), gst_buffer_new_and_fill(payload_str.size(), payload_str.c_str()));
+  auto bus = gst_element_get_bus(pipeline);
+  auto msg = gst_bus_timed_pop_filtered(bus, 5 * GST_SECOND, GST_MESSAGE_ERROR);
+  REQUIRE(msg != nullptr);
+  gst_message_unref(msg);
+  gst_object_unref(bus);
+  gst_object_unref(src);
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  gst_object_unref(pipeline);
 }
 
 TEST_CASE_METHOD(GStreamerTestsFixture, "Audio RTP without encryption", "[GSTPlugin]") {

@@ -137,6 +137,9 @@ static void gst_rtp_moonlight_pay_audio_class_init(gst_rtp_moonlight_pay_audioCl
 }
 
 static void gst_rtp_moonlight_pay_audio_init(gst_rtp_moonlight_pay_audio *rtpmoonlightpay_audio) {
+  // GObject only zeroes the instance: construct the C++ strings (a zeroed std::string isn't a valid empty one)
+  new (&rtpmoonlightpay_audio->aes_key) std::string();
+  new (&rtpmoonlightpay_audio->aes_iv) std::string();
   rtpmoonlightpay_audio->cur_seq_number = 0;
 
   rtpmoonlightpay_audio->encrypt = true;
@@ -164,11 +167,19 @@ void gst_rtp_moonlight_pay_audio_set_property(GObject *object,
   case PROP_AES_ENCRYPTION:
     rtpmoonlightpay_audio->encrypt = g_value_get_boolean(value);
     break;
-  case PROP_AES_KEY:
-    rtpmoonlightpay_audio->aes_key = crypto::hex_to_str(g_value_get_string(value), true);
+  case PROP_AES_KEY: // An empty aes_key= in the pipeline string comes in as NULL
+    if (auto key = g_value_get_string(value)) {
+      rtpmoonlightpay_audio->aes_key = crypto::hex_to_str(key, true);
+    } else {
+      rtpmoonlightpay_audio->aes_key.clear();
+    }
     break;
   case PROP_AES_IV:
-    rtpmoonlightpay_audio->aes_iv = g_value_get_string(value);
+    if (auto iv = g_value_get_string(value)) {
+      rtpmoonlightpay_audio->aes_iv = iv;
+    } else {
+      rtpmoonlightpay_audio->aes_iv.clear();
+    }
     break;
   case PROP_PACKET_DURATION:
     rtpmoonlightpay_audio->packet_duration = g_value_get_int(value);
@@ -222,6 +233,10 @@ void gst_rtp_moonlight_pay_audio_finalize(GObject *object) {
 
   GST_DEBUG_OBJECT(rtpmoonlightpay_audio, "finalize");
 
+  using std::string;
+  rtpmoonlightpay_audio->aes_key.~string();
+  rtpmoonlightpay_audio->aes_iv.~string();
+
   G_OBJECT_CLASS(gst_rtp_moonlight_pay_audio_parent_class)->finalize(object);
 }
 
@@ -240,6 +255,13 @@ static GstFlowReturn gst_rtp_moonlight_pay_audio_generate_output(GstBaseTransfor
   /* we can't do anything without an input */
   if (inbuf == nullptr)
     return GST_FLOW_OK;
+
+  /* AES-128 reads 16 bytes of key: refuse a missing or short one instead of reading past it */
+  if (rtpmoonlightpay_audio->encrypt && rtpmoonlightpay_audio->aes_key.size() != 16) {
+    gst_buffer_unref(inbuf);
+    GST_ELEMENT_ERROR(rtpmoonlightpay_audio, STREAM, FAILED, ("Missing or invalid aes_key"), (nullptr));
+    return GST_FLOW_ERROR;
+  }
 
   auto rtp_packets = audio::split_into_rtp(rtpmoonlightpay_audio, inbuf);
 
