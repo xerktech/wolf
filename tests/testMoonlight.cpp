@@ -2,6 +2,7 @@
 
 #include "storm.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_container_properties.hpp>
 #include <catch2/matchers/catch_matchers_contains.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -1105,7 +1106,14 @@ TEST_CASE("Multiple users", "[HTTP]") {
   REQUIRE(session1->audio_stream_port == 48200);
   REQUIRE_FALSE(session1->rtsp_encrypted); // No corever: plaintext RTSP
 
-  for (auto [corever, encrypted] : {std::pair{"1", true}, {"2", true}, {"0", false}, {"junk", false}}) {
+  for (auto [corever, encrypted] : {std::pair{"1", true},
+                                    {"2", true},
+                                    {"99999999999", true},
+                                    {"0", false},
+                                    {"-1", false},
+                                    {"1abc", false},
+                                    {"", false},
+                                    {"junk", false}}) {
     auto headers = client1_headers;
     headers.emplace("corever", corever);
     REQUIRE(endpoints::https::create_run_session(headers, client1_ip, client1, app_state, app1)->rtsp_encrypted ==
@@ -1241,6 +1249,85 @@ TEST_CASE("HTTP Pairing over the /pair handler", "[MoonlightProtocol]") {
   REQUIRE_THAT(body_3, Catch::Matchers::ContainsSubstring("<paired>0</paired>"));
   auto [status_4, body_4] = get("salt=" + moonlight_data.salt);
   REQUIRE_THAT(status_4, Equals("400 Bad Request"));
+}
+
+TEST_CASE("HTTPS /launch and /resume: encrypted RTSP", "[MoonlightProtocol]") {
+  // Certificates for the HTTPS server and the (already paired) client
+  char dir_template[] = "/tmp/wolf-rtspenc-XXXXXX";
+  REQUIRE(mkdtemp(dir_template));
+  std::string dir = dir_template;
+  auto server_key = x509::generate_key();
+  REQUIRE(x509::write_to_disk(server_key, dir + "/server.key", x509::generate_x509(server_key), dir + "/server.crt"));
+  auto client_key = x509::generate_key();
+  auto client_cert = x509::generate_x509(client_key);
+  REQUIRE(x509::write_to_disk(client_key, dir + "/client.key", client_cert, dir + "/client.crt"));
+
+  auto require_encryption = GENERATE(false, true);
+  CAPTURE(require_encryption);
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = state::Config{.paired_clients = std::make_shared<immer::atom<state::PairedClientList>>()},
+      .host = {state::Host{.rtsp_require_encryption = require_encryption}},
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .event_bus = std::make_shared<events::EventBusType>(),
+      .running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>()});
+  auto client = state::PairedClient{.client_cert = x509::get_cert_pem(client_cert), .app_state_folder = "test"};
+  auto app = events::App{.base = moonlight::App{.title = "test_app"}};
+  auto running = endpoints::https::create_run_session({{"rikey", "00112233445566778899aabbccddeeff"}, {"rikeyid", "1"}},
+                                                      "127.0.0.1",
+                                                      client,
+                                                      app_state,
+                                                      app);
+  REQUIRE(running);
+  app_state->running_sessions->store(immer::vector{*running});
+
+  HttpsServer server(dir + "/server.crt", dir + "/server.key");
+  server.config.address = "127.0.0.1";
+  server.config.port = 0;
+  server.resource["^/launch$"]["GET"] = [&](auto resp, auto req) {
+    endpoints::https::launch(resp, req, client, app_state);
+  };
+  server.resource["^/resume$"]["GET"] = [&](auto resp, auto req) {
+    endpoints::https::resume(resp, req, client, app_state);
+  };
+  std::promise<unsigned short> bound_port;
+  std::thread server_thread([&] { server.start([&](unsigned short port) { bound_port.set_value(port); }); });
+  auto stop_server = std::shared_ptr<void>(nullptr, [&](void *) {
+    server.stop();
+    server_thread.join();
+    std::filesystem::remove_all(dir);
+  });
+  SimpleWeb::Client<SimpleWeb::HTTPS> https_client("127.0.0.1:" + std::to_string(bound_port.get_future().get()),
+                                                   false,
+                                                   dir + "/client.crt",
+                                                   dir + "/client.key");
+  https_client.config.timeout = 5;
+  auto get = [&](const std::string &path_and_query) {
+    auto response = https_client.request("GET", path_and_query);
+    REQUIRE_THAT(response->status_code, Equals("200 OK")); // Errors are in the XML, as Moonlight expects
+    return response->content.string();
+  };
+  auto running_key = [&]() { return app_state->running_sessions->load()->front().aes_key; };
+
+  auto plaintext_query = std::string("rikey=ffeeddccbbaa99887766554433221100&rikeyid=2&surroundAudioInfo=196610");
+  if (require_encryption) {
+    // A plaintext-only client is refused before anything else happens (no app lookup, no session replaced)
+    for (auto query : {plaintext_query, plaintext_query + "&corever=0"}) {
+      for (auto path : {"/launch?appid=1&", "/resume?"}) {
+        REQUIRE_THAT(get(path + query), Catch::Matchers::ContainsSubstring("status_code=\"403\""));
+        REQUIRE(running_key() == "00112233445566778899aabbccddeeff");
+      }
+    }
+  } else {
+    REQUIRE_THAT(get("/resume?" + plaintext_query), Catch::Matchers::ContainsSubstring("<sessionUrl0>rtsp://"));
+    REQUIRE(running_key() == "ffeeddccbbaa99887766554433221100");
+    REQUIRE_FALSE(app_state->running_sessions->load()->front().rtsp_encrypted);
+  }
+
+  // An encrypted RTSP client always gets it
+  auto body = get("/resume?rikey=0123456789abcdef0123456789abcdef&rikeyid=3&surroundAudioInfo=196610&corever=1");
+  REQUIRE_THAT(body, Catch::Matchers::ContainsSubstring("<sessionUrl0>rtspenc://"));
+  REQUIRE(running_key() == "0123456789abcdef0123456789abcdef");
+  REQUIRE(app_state->running_sessions->load()->front().rtsp_encrypted);
 }
 
 TEST_CASE("HTTPS /resume carries the stream's devices over to the new instance", "[MoonlightProtocol]") {

@@ -1,6 +1,7 @@
 #include <api/api.hpp>
 #include <atomic>
 #include <audio/pulse_router.hpp>
+#include <boost/algorithm/string/predicate.hpp>
 #include <boost/asio.hpp>
 #include <chrono>
 #include <control/control.hpp>
@@ -100,6 +101,13 @@ state::Host get_host_config(std::string_view pkey_filename, std::string_view cer
   std::string host_base_state_folder = local_base_state_folder;
   std::string host_xdg_runtime_dir = utils::get_env("XDG_RUNTIME_DIR", "/tmp/sockets");
 
+  // A security switch: don't let it fail open on "true" vs "TRUE"
+  bool rtsp_require_encryption =
+      boost::algorithm::iequals(utils::get_env("WOLF_RTSP_REQUIRE_ENCRYPTION", "FALSE"), std::string_view("TRUE"));
+  if (rtsp_require_encryption) {
+    logs::log(logs::info, "Encrypted RTSP is required: refusing Moonlight clients that don't support it");
+  }
+
   docker::DockerAPI docker_api(utils::get_env("WOLF_DOCKER_SOCKET", "/var/run/docker.sock"));
   if (auto container = introspect::get_current_container(docker_api)) {
     host_base_state_folder =
@@ -119,7 +127,8 @@ state::Host get_host_config(std::string_view pkey_filename, std::string_view cer
           mac_address,
           host_base_state_folder,
           local_base_state_folder,
-          host_xdg_runtime_dir};
+          host_xdg_runtime_dir,
+          rtsp_require_encryption};
 }
 
 /**

@@ -529,11 +529,6 @@ struct StreamSession {
    * refused for this session: nobody else (same NAT, on-path) can SETUP/ANNOUNCE it or read its secrets.
    */
   bool rtsp_encrypted = false;
-  /**
-   * Sequence number of the last encrypted RTSP message we sent; it's the GCM IV so it must never repeat for aes_key.
-   * Shared across copies of this session.
-   */
-  std::shared_ptr<std::atomic<std::uint32_t>> rtsp_encryption_seq = std::make_shared<std::atomic<std::uint32_t>>(0);
 
   // client info
   std::size_t session_id;

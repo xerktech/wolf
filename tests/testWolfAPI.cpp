@@ -2135,11 +2135,13 @@ TEST_CASE("A failed docker pull is reported as a failure", "[API]") {
 }
 
 TEST_CASE("Sessions API: a session added with encrypted RTSP says so", "[API]") {
+  // WOLF_RTSP_REQUIRE_ENCRYPTION=TRUE
   auto event_bus = std::make_shared<events::EventBusType>();
   auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
   auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
   auto app_state = immer::box<state::AppState>(state::AppState{
       .config = config,
+      .host = {state::Host{.rtsp_require_encryption = true}},
       .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
       .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
       .event_bus = event_bus,
@@ -2161,6 +2163,18 @@ TEST_CASE("Sessions API: a session added with encrypted RTSP says so", "[API]") 
       .video_refresh_rate = 60,
       .app_id = "304556286", // test cfg file
   };
+
+  // The host requires encrypted RTSP: a session without it is refused, and nothing is stored
+  for (auto rtsp_encrypted : {std::optional<bool>{}, std::optional<bool>{false}}) {
+    auto plaintext = session;
+    plaintext.rtsp_encrypted = rtsp_encrypted;
+    auto response =
+        req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(plaintext));
+    REQUIRE(response);
+    REQUIRE(response->first == 403);
+    REQUIRE(running_sessions->load()->empty());
+  }
+
   auto response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
   REQUIRE(response);
   REQUIRE(response->first == 200);

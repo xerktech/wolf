@@ -41,7 +41,7 @@ Wolf is configured via a TOML config file and some additional optional ENV varia
 
 |WOLF_RTSP_REQUIRE_ENCRYPTION
 |FALSE
-|Moonlight clients that support it (they send `corever=1` on launch) always get encrypted RTSP, and their streams refuse plaintext RTSP. Set to TRUE to also refuse launching or resuming for older clients that only speak plaintext RTSP, and API `sessions/add` requests without `rtsp_encrypted: true`
+|Moonlight clients that support it (they send `corever=1` on launch) always get encrypted RTSP, and their streams refuse plaintext RTSP. Set to TRUE (any case) to also refuse launching or resuming for older clients that only speak plaintext RTSP, and API `sessions/add` requests without `rtsp_encrypted: true`
 
 |WOLF_WAYLAND_SOCKET_WAIT_TIMEOUT_MS
 |5000

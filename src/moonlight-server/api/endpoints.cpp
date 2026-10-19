@@ -367,7 +367,7 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
     choosen_client.settings = ss.client_settings.value_or(config::ClientSettings{});
 
     auto rtsp_encrypted = ss.rtsp_encrypted.value_or(false);
-    if (!rtsp_encrypted && state::rtsp_encryption_required()) {
+    if (!rtsp_encrypted && state_->app_state->host->rtsp_require_encryption) {
       logs::log(logs::warning, "[API] Refusing a session without encrypted RTSP (WOLF_RTSP_REQUIRE_ENCRYPTION)");
       auto res = GenericErrorResponse{.error = "Encrypted RTSP is required by this host (rtsp_encrypted)"};
       send_http(socket, 403, rfl::json::write(res));

@@ -206,7 +206,7 @@ public:
     logs::log(logs::trace, "[RTSP] sending encrypted reply: \n{}", raw_response);
     auto sealed = encryption::seal(raw_response,
                                    crypto::hex_to_str(session.aes_key, true),
-                                   session.rtsp_encryption_seq->fetch_add(1) + 1,
+                                   ++encryption_seq_,
                                    encryption::HOST_ORIGINATED);
     send_raw(std::move(sealed), [self = shared_from_this()](auto bytes) { self->close(); });
   }
@@ -367,6 +367,12 @@ protected:
       : socket_(io_context), streambuf_(max_msg_size), deadline_(io_context),
         stream_sessions(std::move(stream_sessions)), prev_read_bytes_(0) {}
   tcp::socket socket_;
+
+  /**
+   * Sequence number of the last encrypted RTSP message we sent: it's the GCM IV, so it must never repeat under one key.
+   * Process wide, not per session: two sessions may share a key (an API caller or a /resume reusing a rikey).
+   */
+  static inline std::atomic<std::uint32_t> encryption_seq_ = 0;
 
   static constexpr auto max_msg_size = 2048;
   /** Upper bound on a message's declared Content-length; Moonlight's largest (ANNOUNCE) is a few KiB */

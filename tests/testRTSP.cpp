@@ -1027,11 +1027,14 @@ TEST_CASE("Commands (Encrypted RTSP)", "[RTSP]") {
                   "Accept: application/sdp\r\n\r\n"s;
 
   // An encrypted request gets an encrypted reply
-  for (std::uint32_t expected_seq = 1; expected_seq <= 2; expected_seq++) {
-    auto reply = rtsp_raw_exchange(port, encryption::seal(describe, key, expected_seq, encryption::CLIENT_ORIGINATED));
+  std::uint32_t last_host_seq = 0;
+  for (std::uint32_t client_seq = 1; client_seq <= 2; client_seq++) {
+    auto reply = rtsp_raw_exchange(port, encryption::seal(describe, key, client_seq, encryption::CLIENT_ORIGINATED));
     REQUIRE(encryption::is_encrypted(reply));
-    // Every reply must use a new IV
-    REQUIRE(encryption::read_be32(reply, sizeof(std::uint32_t)) == expected_seq);
+    // Every reply must use a new IV (the counter is process wide, other tests may have used some)
+    auto host_seq = encryption::read_be32(reply, sizeof(std::uint32_t));
+    REQUIRE(host_seq > last_host_seq);
+    last_host_seq = host_seq;
     auto plaintext = encryption::unseal(reply, key, encryption::HOST_ORIGINATED);
     REQUIRE(plaintext);
     auto response = rtsp::parse(*plaintext);

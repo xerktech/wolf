@@ -164,6 +164,12 @@ struct Host {
    * The path (or usually the Docker volume) on the host where we'll put the audio/video sockets
    */
   std::string host_xdg_runtime_dir;
+
+  /**
+   * WOLF_RTSP_REQUIRE_ENCRYPTION: refuse sessions whose client can't do Sunshine's encrypted RTSP (no corever),
+   * instead of falling back to plaintext RTSP for them.
+   */
+  bool rtsp_require_encryption = false;
 };
 
 enum class PAIR_PHASE {

@@ -435,9 +435,9 @@ inline bool is_rikeyid(std::string_view str) {
  */
 inline bool client_supports_encrypted_rtsp(const SimpleWeb::CaseInsensitiveMultimap &headers) {
   auto corever_str = get_header(headers, "corever").value_or("0");
-  int corever = 0;
-  std::from_chars(corever_str.data(), corever_str.data() + corever_str.size(), corever);
-  return corever >= 1;
+  std::int64_t corever = 0;
+  auto [end, ec] = std::from_chars(corever_str.data(), corever_str.data() + corever_str.size(), corever);
+  return ec == std::errc{} && end == corever_str.data() + corever_str.size() && corever >= 1;
 }
 
 auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
@@ -505,8 +505,9 @@ inline void carry_over_resumed_session(events::StreamSession &old_session, event
  */
 inline bool
 refuse_plaintext_rtsp(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::Response> &response,
-                      const SimpleWeb::CaseInsensitiveMultimap &headers) {
-  if (!state::rtsp_encryption_required() || client_supports_encrypted_rtsp(headers)) {
+                      const SimpleWeb::CaseInsensitiveMultimap &headers,
+                      const immer::box<state::AppState> &state) {
+  if (!state->host->rtsp_require_encryption || client_supports_encrypted_rtsp(headers)) {
     return false;
   }
   logs::log(logs::warning, "[HTTPS] Refusing a client that doesn't support encrypted RTSP (no corever)");
@@ -557,7 +558,7 @@ void launch(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
   log_req<SimpleWeb::HTTPS>(request);
 
   SimpleWeb::CaseInsensitiveMultimap headers = request->parse_query_string();
-  if (refuse_plaintext_rtsp(response, headers)) {
+  if (refuse_plaintext_rtsp(response, headers, state)) {
     return;
   }
   auto app_id = get_header(headers, "appid");
@@ -600,7 +601,7 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
             const immer::box<state::AppState> &state) {
   log_req<SimpleWeb::HTTPS>(request);
 
-  if (refuse_plaintext_rtsp(response, request->parse_query_string())) {
+  if (refuse_plaintext_rtsp(response, request->parse_query_string(), state)) {
     return;
   }
   auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
