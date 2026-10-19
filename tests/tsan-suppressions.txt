@@ -23,7 +23,3 @@ race:boost::detail::thread_data_base::~thread_data_base
 # Test harness: for the JUnit report Catch2 captures std::clog per test, while detached servers from earlier tests
 # keep logging into it. Only the captured log text is affected.
 race:catch_output_redirect.cpp
-
-# XERK-2101: ENet packets are sent from other threads while the control thread services the same host.
-# A real bug: drop this line with its fix.
-race:control::send_packet
