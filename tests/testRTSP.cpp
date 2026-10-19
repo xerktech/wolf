@@ -433,7 +433,7 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
                                moonlight::control::ControlEncryption::V2);
                      });
 
-    // Until a control packet authenticates, an ANNOUNCE is only a hint: a later one replaces it (see control.cpp)
+    // A later (possibly spoofed) ANNOUNCE for the same stream is refused, and doesn't touch the encryption hint
     tcp_tester::create_client(ioc, port, state)
         ->run("ANNOUNCE streamid=control/13/0 RTSP/1.0\n"
               "CSeq: 7\n"
@@ -448,9 +448,9 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
               "a=x-nv-video[0].maxFPS:60 \n"sv,
               [state](std::optional<RTSP_PACKET> response) {
                 REQUIRE(response.has_value());
-                REQUIRE(response.value().response.status_code == 200);
+                REQUIRE(response.value().response.status_code == 455);
                 REQUIRE(*state->load()->front().control_stream->encryption.load() ==
-                        moonlight::control::ControlEncryption::V1);
+                        moonlight::control::ControlEncryption::V2);
                 REQUIRE_FALSE(state->load()->front().control_stream->encryption_negotiated);
               });
   }
@@ -481,8 +481,10 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
                                moonlight::control::ControlEncryption::V1);
                      });
 
-    // Once the client's first control packet has authenticated with V1, a later (spoofed) ANNOUNCE can't switch it
+    // Once the client's first control packet has authenticated with V1, a later (spoofed) ANNOUNCE can't switch it,
+    // even one that the stream would accept (its first)
     state->load()->front().control_stream->authenticate_encryption(moonlight::control::ControlEncryption::V1);
+    state->load()->front().pipelines_announced->store(false);
     tcp_tester::create_client(ioc, port, state)
         ->run("ANNOUNCE streamid=control/13/0 RTSP/1.0\n"
               "CSeq: 8\n"
@@ -852,4 +854,58 @@ TEST_CASE("RTSP server on a port that's already taken throws instead of running 
   boost::asio::ip::tcp::acceptor taken(io, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), 0));
   auto sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
   REQUIRE_THROWS(rtsp::run_server(taken.local_endpoint().port(), sessions));
+}
+
+TEST_CASE("RTSP: a stream instance starts its pipelines from one ANNOUNCE only", "[RTSP]") {
+  constexpr int port = 8080;
+  boost::asio::io_context ioc;
+  auto state = test_init_state();
+  auto wolf_server = tcp_server(ioc, port, state);
+
+  std::atomic<int> video_sessions = 0, audio_sessions = 0;
+  auto event_bus = state->load()->front().event_bus;
+  auto video_handler = event_bus->register_handler<immer::box<events::VideoSession>>(
+      [&video_sessions](const immer::box<events::VideoSession> &) { video_sessions++; });
+  auto audio_handler = event_bus->register_handler<immer::box<events::AudioSession>>(
+      [&audio_sessions](const immer::box<events::AudioSession> &) { audio_sessions++; });
+
+  auto announce = [&](int seq) {
+    std::optional<RTSP_PACKET> reply;
+    tcp_tester::create_client(ioc, port, state)
+        ->run(fmt::format("ANNOUNCE streamid=control/13/0 RTSP/1.0\n"
+                          "CSeq: {}\n"
+                          "Host: 0.0.0.0\n"
+                          "Content-type: application/sdp\n"
+                          "Content-length: 145\n"
+                          "\n"
+                          "v=0\n"
+                          "a=x-ss-general.encryptionEnabled:1 \n"
+                          "a=x-nv-video[0].clientViewportWd:1920 \n"
+                          "a=x-nv-video[0].clientViewportHt:1080 \n"
+                          "a=x-nv-video[0].maxFPS:60 \n",
+                          seq),
+              [&reply](std::optional<RTSP_PACKET> response) { reply = response; });
+    REQUIRE(reply.has_value());
+    return reply->response.status_code;
+  };
+
+  REQUIRE(announce(1) == 200);
+  // Each accepted ANNOUNCE starts a new set of pipelines: a flood of them crashed Wolf (XERK-2096)
+  for (int seq = 2; seq <= 20; seq++) {
+    REQUIRE(announce(seq) == 455);
+  }
+  REQUIRE(video_sessions == 1);
+  REQUIRE(audio_sessions == 1);
+
+  // A /resume's new instance (same session_id) negotiates its own stream
+  state->update([](const immer::vector<events::StreamSession> &sessions) {
+    auto resumed = sessions.front();
+    resumed.pipelines_announced = std::make_shared<std::atomic<bool>>(false);
+    resumed.control_stream = std::make_shared<events::ControlStreamState>();
+    return immer::vector<events::StreamSession>{resumed};
+  });
+  REQUIRE(announce(21) == 200);
+  REQUIRE(announce(22) == 455);
+  REQUIRE(video_sessions == 2);
+  REQUIRE(audio_sessions == 2);
 }
