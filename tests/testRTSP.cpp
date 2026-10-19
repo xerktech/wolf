@@ -1055,17 +1055,18 @@ TEST_CASE("Commands (Encrypted RTSP)", "[RTSP]") {
   tampered[encryption::HEADER_SIZE] ^= 0x01;
   REQUIRE(rtsp_raw_exchange(port, tampered).empty());
 
-  // An oversized length is dropped without waiting for the payload
+  // An oversized or truncated message gets the same plaintext 400 as a malformed plaintext one: it says nothing
   auto start = std::chrono::steady_clock::now();
   auto huge = encryption::seal(describe, key, 4, encryption::CLIENT_ORIGINATED).substr(0, encryption::HEADER_SIZE);
   huge[1] = '\x7f'; // ~8MB claimed length
-  REQUIRE(rtsp_raw_exchange(port, huge).empty());
+  REQUIRE_THAT(rtsp_raw_exchange(port, huge), Catch::Matchers::StartsWith("RTSP/1.0 400"));
   REQUIRE(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
 
-  // A truncated message is dropped once the deadline passes
+  // ...and is dropped without waiting for the payload, or once the deadline passes when it's truncated
   start = std::chrono::steady_clock::now();
   auto sealed = encryption::seal(describe, key, 5, encryption::CLIENT_ORIGINATED);
-  REQUIRE(rtsp_raw_exchange(port, sealed.substr(0, sealed.size() - 10)).empty());
+  REQUIRE_THAT(rtsp_raw_exchange(port, sealed.substr(0, sealed.size() - 10)),
+               Catch::Matchers::StartsWith("RTSP/1.0 400"));
   REQUIRE(std::chrono::steady_clock::now() - start < std::chrono::seconds(5));
 
   // The session still answers its client afterwards
