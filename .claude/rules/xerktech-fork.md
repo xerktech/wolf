@@ -16,8 +16,10 @@ pods run (`ghcr.io/xerktech/wolf`, XERK-1944).
 
 ## Image
 
-- `.github/workflows/docker-build.yml` (fork-only) builds on every branch push and tags
-  `:<branch>` and `:<branch>-<short sha>`; the run summary prints the digest.
+- `.github/workflows/docker-build.yml` (fork-only) builds and pushes only on a push to `xerktech`
+  (or a manual `workflow_dispatch` on a branch), tagging `:<branch>` and `:<branch>-<short sha>`;
+  the run summary prints the digest.
+  - Never trigger it from PR branches or pull_request: PR CI must not publish images.
   - fenrir pins the image by digest in `charts/direwolf-operator/values.yaml` (`WOLF_IMAGE`).
 - `docker/wolf.Dockerfile` builds gst-wayland-display from xerktech/gst-wayland-display, pinned
   to a commit on a `xerk-*` tag (tags keep the commit fetchable whatever its branch does).
@@ -34,7 +36,8 @@ pods run (`ghcr.io/xerktech/wolf`, XERK-1944).
 3. If upstream moved `docker/wolf.Dockerfile`'s gst-wayland-display pin or its GStreamer
    `BASE_IMAGE`, update the fork's equivalents (see Image) in the commits that own them.
 4. Also refresh the `stable` branch on the fork: `git push origin upstream/stable:stable`.
-5. Push the branch, let Docker build produce an image, and test it in fenrir (a talos04
+5. Push the branch, run Docker build on it by hand (`gh workflow run docker-build.yml --ref
+   <branch>`), and test that image in fenrir (a talos04
    session streams and survives repeated `/resume`, the XERK-1740 check).
 6. Only then move `xerktech`: `git push --force-with-lease=xerktech:<old sha> origin
    <branch>:xerktech`. Tag the old tip first (`xerktech-<yyyy-mm-dd>`) so fenrir's pinned image
