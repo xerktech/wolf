@@ -492,6 +492,25 @@ std::string get_rtsp_ip_string(const std::string &local_ip, const events::Stream
   return use_fake_ip ? session.rtsp_fake_ip : local_ip;
 }
 
+/**
+ * /launch without the HTTP: creates the client's StreamSession and starts it. Returns it, or nullptr if the query is
+ * invalid.
+ */
+inline std::shared_ptr<events::StreamSession> launch_session(const SimpleWeb::CaseInsensitiveMultimap &query,
+                                                             const std::string &client_ip,
+                                                             const state::PairedClient &current_client,
+                                                             const immer::box<state::AppState> &state,
+                                                             const events::App &app) {
+  auto new_session = create_run_session(query, client_ip, current_client, state, app);
+  if (new_session) {
+    // Listed before its handlers run: a runner they start treats a session that isn't listed as stopped
+    state->running_sessions->update(
+        [new_session](const immer::vector<events::StreamSession> &ses_v) { return ses_v.push_back(*new_session); });
+    state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
+  }
+  return new_session;
+}
+
 // Forward declaration so launch() can delegate to resume() when a session is already running.
 void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::Response> &response,
             const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::Request> &request,
@@ -532,15 +551,11 @@ void launch(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
   }
 
   auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
-  auto new_session = create_run_session(request->parse_query_string(), client_ip, current_client, state, app.value());
+  auto new_session = launch_session(request->parse_query_string(), client_ip, current_client, state, app.value());
   if (!new_session) {
     server_error<SimpleWeb::HTTPS>(response);
     return;
   }
-  // Listed before its handlers run: a runner they start treats a session that isn't listed as stopped
-  state->running_sessions->update(
-      [new_session](const immer::vector<events::StreamSession> &ses_v) { return ses_v.push_back(*new_session); });
-  state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
 
   auto rtsp_ip = get_rtsp_ip_string(get_host_ip<SimpleWeb::HTTPS>(request, state), *new_session);
   auto xml = moonlight::launch_success(rtsp_ip, std::to_string(get_port(state::RTSP_SETUP_PORT)));

@@ -157,16 +157,24 @@ TEST_CASE("PulseAudio virtual sinks", "[PULSE]") {
   }
 
   SECTION("leftover sinks are removed by prefix") {
-    auto stale = create_sink(server, fmt::format("{}1234", sessions::VIRTUAL_SINK_PREFIX));
-    auto live = create_sink(server, fmt::format("{}5678", sessions::VIRTUAL_SINK_PREFIX));
+    auto stale_name = fmt::format("{}1234", sessions::VIRTUAL_SINK_PREFIX);
+    auto stale = create_sink(server, stale_name);
     auto other = create_sink(server, "wolf_test_not_ours");
     settle(server);
 
-    audio::remove_stale_virtual_sinks(server, sessions::VIRTUAL_SINK_PREFIX, [](std::string_view sink_name) {
-      return sink_name.ends_with("5678"); // a session of this Wolf that's running
-    });
+    auto found = audio::find_virtual_sinks(server, sessions::VIRTUAL_SINK_PREFIX, 2s);
+    REQUIRE(found.size() == 1);
+
+    // Sessions started after the snapshot: one new, one of the same client as the leftover (session ids are stable
+    // across restarts), whose sink PulseAudio names <name>.2 since the leftover still holds the name
+    auto live = create_sink(server, fmt::format("{}5678", sessions::VIRTUAL_SINK_PREFIX));
+    auto same_client = create_sink(server, stale_name);
     settle(server);
-    REQUIRE_FALSE(sink_exists(server, fmt::format("{}1234", sessions::VIRTUAL_SINK_PREFIX)));
+
+    audio::unload_virtual_sinks(server, found);
+    settle(server);
+    REQUIRE_FALSE(sink_exists(server, stale_name));
+    REQUIRE(sink_exists(server, fmt::format("{}.2", stale_name)));
     REQUIRE(sink_exists(server, fmt::format("{}5678", sessions::VIRTUAL_SINK_PREFIX)));
     REQUIRE(sink_exists(server, "wolf_test_not_ours"));
   }

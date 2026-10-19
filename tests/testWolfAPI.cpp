@@ -1219,6 +1219,25 @@ TEST_CASE("Runners: many concurrent starts on one session that exit at once", "[
   }
 }
 
+/**
+ * Whether a process runs `<binary> <arg>` (e.g. "sleep 30.123"); if so, it's killed so the test doesn't leak it.
+ */
+static bool app_left_running(const std::string &cmd) {
+  bool found = false;
+  for (const auto &proc : std::filesystem::directory_iterator("/proc")) {
+    std::ifstream cmdline(proc.path() / "cmdline");
+    std::string arg0, arg1;
+    if (std::getline(cmdline, arg0, '\0') && std::getline(cmdline, arg1, '\0') &&
+        fmt::format("{} {}", std::filesystem::path(arg0).filename().string(), arg1) == cmd) {
+      found = true;
+    }
+  }
+  if (found) {
+    std::system(fmt::format("pkill -f '^{}$'", cmd).c_str());
+  }
+  return found;
+}
+
 TEST_CASE("Runners: a session stopped while its runner starts doesn't leave the app running", "[API]") {
   using namespace std::chrono_literals;
   auto event_bus = std::make_shared<events::EventBusType>();
@@ -1235,17 +1254,6 @@ TEST_CASE("Runners: a session stopped while its runner starts doesn't leave the 
 
   // A command line unique to this run, to find the app's process by
   auto app_cmd = fmt::format("sleep 30.{}", getpid());
-  auto app_running = [&app_cmd]() {
-    for (const auto &proc : std::filesystem::directory_iterator("/proc")) {
-      std::ifstream cmdline(proc.path() / "cmdline");
-      std::string arg0, arg1;
-      if (std::getline(cmdline, arg0, '\0') && std::getline(cmdline, arg1, '\0') &&
-          fmt::format("{} {}", std::filesystem::path(arg0).filename().string(), arg1) == app_cmd) {
-        return true;
-      }
-    }
-    return false;
-  };
   auto app = std::make_shared<events::App>(
       events::App{.base = {.title = "sleep", .id = "sleep", .support_hdr = false},
                   .start_virtual_compositor = false,
@@ -1261,12 +1269,64 @@ TEST_CASE("Runners: a session stopped while its runner starts doesn't leave the 
 
   // The runner spawns the app, then sees the session is gone and ends it (it used to run on, an orphan)
   std::this_thread::sleep_for(2s);
-  auto orphan = app_running();
-  if (orphan) {
-    std::system(fmt::format("pkill -f '^{}$'", app_cmd).c_str());
-  }
-  REQUIRE_FALSE(orphan);
+  REQUIRE_FALSE(app_left_running(app_cmd));
   std::this_thread::sleep_for(200ms); // let the runner thread finish before the bus goes away
+}
+
+TEST_CASE("Runners: a lobby stopped while its runner starts doesn't leave the app running", "[API]") {
+  using namespace std::chrono_literals;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .lobbies = lobbies,
+      .running_sessions = running_sessions});
+  auto handlers = sessions::setup_lobbies_handlers(app_state, api_runtime_dir(), {});
+
+  auto app_cmd = fmt::format("sleep 31.{}", getpid());
+  auto lobby_id = fmt::format("lobby-{}", getpid());
+  auto create = events::CreateLobbyEvent{
+      .id = lobby_id,
+      .profile_id = "test_profile",
+      .name = "test_lobby",
+      .multi_user = false,
+      .stop_when_everyone_leaves = false,
+      .video_settings = {.width = 640,
+                         .height = 480,
+                         .refresh_rate = 30,
+                         .wayland_render_node = "software",
+                         .runner_render_node = "runner_render_node",
+                         .video_producer_buffer_caps = "video/x-raw"},
+      .audio_settings = {.channel_count = 2},
+      .runner_state_folder = "runner_state_folder",
+      .runner = state::get_runner(wolf::config::AppCMD{.run_cmd = app_cmd}, event_bus)};
+  auto setup_over = create.on_setup_over.get()->get_future();
+  event_bus->fire_event(immer::box<events::CreateLobbyEvent>(create)); // the runner starts once the desktop is up
+
+  // Gone before its runner registered its stop handlers: only the lobby being gone tells the runner
+  lobbies->update([&](const immer::vector<events::Lobby> &all) {
+    immer::vector<events::Lobby> kept;
+    for (const auto &lobby : all) {
+      if (lobby.id != lobby_id) {
+        kept = kept.push_back(lobby);
+      }
+    }
+    return kept;
+  });
+
+  // Needs gst-wayland-display (waylanddisplaysrc) on GST_PLUGIN_PATH, like "Lobbies APIs"
+  REQUIRE(setup_over.wait_for(20s) == std::future_status::ready);
+  std::this_thread::sleep_for(2s);
+  auto orphan = app_left_running(app_cmd);
+  // Ends the lobby's desktop and audio producers, which listen for its stop
+  event_bus->fire_event(immer::box<events::StopLobbyEvent>(events::StopLobbyEvent{.lobby_id = lobby_id}));
+  std::this_thread::sleep_for(500ms);
+  REQUIRE_FALSE(orphan);
 }
 
 TEST_CASE("Session APIs without app_id or client_id", "[API]") {

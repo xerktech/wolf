@@ -285,32 +285,34 @@ static std::string_view null_sink_name(std::string_view module_args) {
   return {};
 }
 
-void remove_stale_virtual_sinks(const std::shared_ptr<Server> &server,
-                                std::string_view sink_name_prefix,
-                                const std::function<bool(std::string_view)> &in_use) {
+std::vector<unsigned int> find_virtual_sinks(const std::shared_ptr<Server> &server,
+                                             std::string_view sink_name_prefix,
+                                             std::chrono::milliseconds timeout) {
   struct Request {
     std::string prefix;
-    std::function<bool(std::string_view)> in_use;
+    std::vector<unsigned int> modules;
+    boost::promise<std::vector<unsigned int>> done; // broken (destroyed unset) if the request is dropped or cancelled
   };
-  auto request = std::make_shared<Request>(Request{.prefix = std::string(sink_name_prefix), .in_use = in_use});
-  queue_op(server, [server, request]() {
+  auto request = std::make_shared<Request>(Request{.prefix = std::string(sink_name_prefix)});
+  auto result = request->done.get_future();
+  queue_op(server, [server, request = std::move(request)]() {
     auto request_ref = new std::shared_ptr<Request>(request); // released at eol
     auto operation = pa_context_get_module_info_list(
         server->ctx,
         [](pa_context *c, const pa_module_info *info, int eol, void *data) {
           auto request = static_cast<std::shared_ptr<Request> *>(data);
           if (eol) { // the last call, also on error
+            (*request)->done.set_value((*request)->modules);
             delete request;
             return;
           }
-          if (!info || !info->name || !info->argument || std::string_view(info->name) != "module-null-sink") {
-            return;
-          }
-          auto sink_name = null_sink_name(info->argument);
-          // Checked now, not when the cleanup was asked for: a session started since then has its sink in this list
-          if (sink_name.starts_with((*request)->prefix) && !((*request)->in_use && (*request)->in_use(sink_name))) {
-            logs::log(logs::info, "[PULSE] Removing leftover virtual sink: {}", sink_name);
-            unload_sink(c, info->index);
+          if (info && info->name && info->argument && std::string_view(info->name) == "module-null-sink" &&
+              null_sink_name(info->argument).starts_with((*request)->prefix)) {
+            logs::log(logs::info,
+                      "[PULSE] Found leftover virtual sink: {} (module {})",
+                      null_sink_name(info->argument),
+                      info->index);
+            (*request)->modules.push_back(info->index);
           }
         },
         request_ref);
@@ -319,6 +321,22 @@ void remove_stale_virtual_sinks(const std::shared_ptr<Server> &server,
       pa_operation_unref(operation);
     } else { // The callback will never run
       delete request_ref;
+    }
+  });
+  if (result.wait_for(boost::chrono::milliseconds(timeout.count())) == boost::future_status::ready) {
+    try {
+      return result.get();
+    } catch (const std::exception &) { // broken promise: the connection went away first
+    }
+  }
+  return {};
+}
+
+void unload_virtual_sinks(const std::shared_ptr<Server> &server, const std::vector<unsigned int> &modules) {
+  queue_op(server, [server, modules]() {
+    for (auto module : modules) {
+      logs::log(logs::info, "[PULSE] Removing leftover virtual sink (module {})", module);
+      unload_sink(server->ctx, module);
     }
   });
 }

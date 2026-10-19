@@ -308,6 +308,43 @@ TEST_CASE("/resume keeps what still runs for the stream", "[Sessions]") {
   std::filesystem::remove_all(state_dir);
 }
 
+TEST_CASE("/launch lists the session before starting it", "[Sessions]") {
+  using namespace wolf::core;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto state_dir = std::filesystem::temp_directory_path() / fmt::format("wolf-launch-{}", getpid());
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions)),
+      .host = immer::box<state::Host>(
+          state::Host{.host_base_state_folder = state_dir.string(), .local_base_state_folder = state_dir.string()}),
+      .event_bus = event_bus,
+      .running_sessions = running_sessions});
+
+  // The StreamSession handlers start the app's runner, which treats a session that isn't listed as already stopped
+  std::atomic_int started = 0, listed_when_started = 0;
+  auto handler = event_bus->register_handler<immer::box<events::StreamSession>>(
+      [&](const immer::box<events::StreamSession> &session) {
+        started++;
+        if (state::get_session_by_id(*running_sessions->load(), session->session_id)) {
+          listed_when_started++;
+        }
+      });
+
+  SimpleWeb::CaseInsensitiveMultimap query = {{"mode", "1280x720x30"},
+                                              {"rikey", "00112233445566778899aabbccddeeff"},
+                                              {"rikeyid", "1"}};
+  auto client = state::PairedClient{.client_cert = "launch-test-cert", .app_state_folder = "client"};
+  auto launched = endpoints::https::launch_session(query,
+                                                   "127.0.0.1",
+                                                   client,
+                                                   app_state,
+                                                   events::App{.base = {.title = "app", .id = "app"}});
+  REQUIRE(launched);
+  REQUIRE(started == 1);
+  REQUIRE(listed_when_started == 1);
+  std::filesystem::remove_all(state_dir);
+}
+
 TEST_CASE("PulseAudio server name to socket path", "[Sessions]") {
   using wolf::core::sessions::audio_server_socket_path;
   REQUIRE(audio_server_socket_path("/tmp/sockets/pulse-socket") == "/tmp/sockets/pulse-socket");

@@ -197,30 +197,19 @@ std::optional<sessions::AudioServer> setup_audio_server(const std::string &host_
 }
 
 /**
- * A Wolf that crashed or was killed left its sessions' sinks behind; a new session's sink of the same name would then
- * fail to load. Removes them, but only from a PulseAudio server that this Wolf owns: the one embedded next to it
- * (WOLF_EMBED_PULSE, one Wolf per container under supervisord) or the container it started itself. Any other server
- * may be shared with a running Wolf, whose live sinks have the same names.
+ * A Wolf that crashed or was killed left its sessions' sinks behind. Finds them, only on a PulseAudio server that this
+ * Wolf owns: the one embedded next to it (WOLF_EMBED_PULSE, one Wolf per container under supervisord) or the container
+ * it started itself. Any other server may be shared with a running Wolf, whose live sinks have the same names.
+ *
+ * Must run before any session can start: what it finds is unloaded later by module index, so a session's sink loaded
+ * since (with a new index, even under a leftover's name) is never touched.
  */
-void remove_stale_sinks(const sessions::AudioServer &audio_server, const immer::box<state::AppState> &app_state) {
+std::vector<unsigned int> find_stale_sinks(const sessions::AudioServer &audio_server) {
   if (!audio_server.container && utils::get_env("WOLF_EMBED_PULSE", "") != "true"s) {
     logs::log(logs::info, "PulseAudio server isn't Wolf's own, leaving any leftover virtual sinks alone");
-    return;
+    return {};
   }
-  audio::remove_stale_virtual_sinks(
-      audio_server.server,
-      sessions::VIRTUAL_SINK_PREFIX,
-      [sessions = app_state->running_sessions, lobbies = app_state->lobbies](std::string_view sink_name) {
-        auto id = sink_name.substr(sessions::VIRTUAL_SINK_PREFIX.size());
-        auto running = sessions->load();
-        auto lobbies_now = lobbies->load();
-        return std::any_of(running->begin(),
-                           running->end(),
-                           [id](const auto &session) { return std::to_string(session.session_id) == id; }) ||
-               std::any_of(lobbies_now->begin(), lobbies_now->end(), [id](const auto &lobby) {
-                 return lobby.id == id;
-               });
-      });
+  return audio::find_virtual_sinks(audio_server.server, sessions::VIRTUAL_SINK_PREFIX, 2s);
 }
 
 /**
@@ -251,6 +240,9 @@ void run() {
   auto moonlight_sess_handlers = sessions::setup_moonlight_handlers(local_state, runtime_dir, audio_server);
   // Setup event handlers for player Lobbies
   auto lobbies_handlers = sessions::setup_lobbies_handlers(local_state, runtime_dir, audio_server);
+  // Before the servers start, so that no session's sink can be among them
+  auto stale_sinks = audio_server && audio_server->server ? find_stale_sinks(*audio_server)
+                                                          : std::vector<unsigned int>{};
 
   // HTTP APIs
   std::thread([local_state]() {
@@ -313,14 +305,14 @@ void run() {
 
   // Only once the servers had their chance to bind: a second Wolf started by mistake fails to bind and exits, and
   // must not have touched the running Wolf's sinks first. The servers bind as their threads start, they don't say when.
-  if (audio_server && audio_server->server) {
-    std::thread([audio_server = *audio_server, local_state]() {
+  if (!stale_sinks.empty()) {
+    std::thread([server = audio_server->server, stale_sinks]() {
       std::this_thread::sleep_for(3s);
       if (shutdown_requested.load()) {
         logs::log(logs::info, "Wolf is shutting down, leaving any leftover virtual sinks alone");
         return;
       }
-      remove_stale_sinks(audio_server, local_state);
+      audio::unload_virtual_sinks(server, stale_sinks);
     }).detach();
   }
 

@@ -23,12 +23,14 @@ paths:
     (drives `endpoints::https::resume_session`, which the HTTPS handler calls).
   - A lobby has exactly one runner, so its runner's exit still removes the lobby's sink.
 - At startup Wolf unloads `virtual_sink_*` null sinks left by a Wolf that crashed or was killed
-  (`remove_stale_sinks` in `wolf.cpp`). Another Wolf's live sinks have the same names, so:
+  (`find_stale_sinks` in `wolf.cpp`). Another Wolf's live sinks have the same names, so:
   - only on a server Wolf owns: embedded (`WOLF_EMBED_PULSE=true`) or the PA container it started;
     an external `PULSE_SERVER` may be shared, and is left alone.
-  - only ~3 s after the servers started, and not if one failed to bind (`shutdown_requested`): a
-    second Wolf started by mistake binds nothing and exits, and must not unload the running one's sinks.
-  - never a sink of a session/lobby this Wolf is running: checked in the module-list callback.
+  - the leftovers' module indices are taken before any server starts (no session exists yet), and
+    unloaded by index later. Never match by name: session ids are stable across restarts, so a client
+    relaunching right away gets a live sink under a leftover's name (PA calls it `<name>.2`).
+  - unloaded only ~3 s after the servers started, and not if one failed to bind
+    (`shutdown_requested`): a second Wolf started by mistake must not unload the running one's sinks.
 - Runners mount the socket by its bare path: libpulse reports it as `unix:<path>` when it came from
   `PULSE_SERVER`, and Docker splits binds on ':' (`audio_server_socket_path`).
 - Tests: `tests/platforms/linux/pulse.cpp` (`[PULSE]`, CMake `TEST_PULSE`) starts its own
