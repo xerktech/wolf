@@ -35,6 +35,45 @@ TEST_CASE("Process runner doesn't leak Wolf's sockets to the child", "[PROCESS]"
   REQUIRE_THAT(child_fds.str(), !ContainsSubstring(listen_socket));
 }
 
+TEST_CASE("Process runner passes the app's environment without changing Wolf's", "[PROCESS]") {
+  auto var = fmt::format("WOLF_TEST_APP_ENV_{}", getpid());
+  auto out_file = std::filesystem::temp_directory_path() / fmt::format("wolf-process-env-{}", getpid());
+  std::filesystem::remove(out_file);
+
+  auto runner = process::RunProcess(std::make_shared<wolf::core::events::EventBusType>(),
+                                    fmt::format("/bin/sh -c \"echo ${} > {}\"", var, out_file.string()));
+  runner.run("1", "", "", std::make_shared<wolf::core::events::devices_atom_queue>(), {}, {}, {{var, "app"}}, "", {});
+
+  std::ifstream in(out_file);
+  std::string child_value;
+  std::getline(in, child_value);
+  std::filesystem::remove(out_file);
+
+  REQUIRE(child_value == "app");
+  // Setting it in Wolf would race every thread reading the environment, and leak into the next app
+  REQUIRE(std::getenv(var.c_str()) == nullptr);
+}
+
+TEST_CASE("Process runner handles stops fired on two threads at once", "[PROCESS]") {
+  using namespace std::chrono_literals;
+  auto ev_bus = std::make_shared<wolf::core::events::EventBusType>();
+  auto runner = process::RunProcess(ev_bus, "sleep 10");
+  auto start = std::chrono::steady_clock::now();
+  std::thread run_thread([&runner]() {
+    runner.run("43", "", "", std::make_shared<wolf::core::events::devices_atom_queue>(), {}, {}, {}, "", {});
+  });
+  std::this_thread::sleep_for(500ms); // let the runner spawn the app and register its stop handlers
+
+  // Both terminate the same process group: under TSan an unserialised terminate() is a race on its pgid
+  auto stop = immer::box<wolf::core::events::StopStreamEvent>(wolf::core::events::StopStreamEvent{.session_id = 43});
+  std::thread other_stop([&]() { ev_bus->fire_event(stop); });
+  ev_bus->fire_event(stop);
+  other_stop.join();
+
+  run_thread.join();
+  REQUIRE(std::chrono::steady_clock::now() - start < 5s);
+}
+
 TEST_CASE("Process runner survives a repeated stop", "[PROCESS]") {
   using namespace std::chrono_literals;
   auto ev_bus = std::make_shared<wolf::core::events::EventBusType>();

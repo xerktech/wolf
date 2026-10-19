@@ -6,6 +6,7 @@
 #ifdef __linux__
 #include <algorithm>
 #include <fcntl.h>
+#include <mutex>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -61,9 +62,14 @@ struct close_inherited_fds : bp::extend::handler {
  * handler after this one (the pipelines' and the session's own stop). killpg fails once the group is gone, e.g. a stop
  * that races the app's own exit, or a second stop of the same session (EINVAL: terminate() invalidated the group).
  */
-static void terminate_group(bp::group &group_proc) {
+static void terminate_group(bp::group &group_proc, std::mutex &terminate_lock) {
   std::error_code ec;
-  group_proc.terminate(ec); // Manually terminate the process
+  {
+    // Stops fired on two threads at once (a StopStreamEvent and a StopLobbyEvent, or two stops) would race on the
+    // group's pgid, which terminate() reads and then resets
+    std::lock_guard lock(terminate_lock);
+    group_proc.terminate(ec); // Manually terminate the process
+  }
   if (ec) {
     logs::log(logs::debug, "[PROCESS] Unable to terminate process group: {}", ec.message());
   }
@@ -82,6 +88,7 @@ void RunProcess::run(std::string_view session_id,
 
   bp::child child_proc;
   bp::group group_proc;
+  std::mutex terminate_lock;
 
   try {
     // A copy: this_process::environment() is Wolf's own, and assigning to it would setenv() in Wolf while other
@@ -105,16 +112,16 @@ void RunProcess::run(std::string_view session_id,
   }
 
   auto terminate_handler = this->ev_bus->register_handler<immer::box<StopStreamEvent>>(
-      [&group_proc, session_id](const immer::box<StopStreamEvent> &terminate_ev) {
+      [&group_proc, &terminate_lock, session_id](const immer::box<StopStreamEvent> &terminate_ev) {
         if (std::to_string(terminate_ev->session_id) == session_id) {
-          terminate_group(group_proc);
+          terminate_group(group_proc, terminate_lock);
         }
       });
 
   auto terminate_lobby_handler = this->ev_bus->register_handler<immer::box<StopLobbyEvent>>(
-      [&group_proc, session_id](const immer::box<StopLobbyEvent> &terminate_ev) {
+      [&group_proc, &terminate_lock, session_id](const immer::box<StopLobbyEvent> &terminate_ev) {
         if (terminate_ev->lobby_id == session_id) {
-          terminate_group(group_proc);
+          terminate_group(group_proc, terminate_lock);
         }
       });
 
@@ -122,7 +129,7 @@ void RunProcess::run(std::string_view session_id,
   // app now instead of leaving it running with nobody to end it. Registering waited for any stop still being fired.
   if (is_stopped && is_stopped()) {
     logs::log(logs::debug, "[PROCESS] Session {} was stopped while starting, terminating", session_id);
-    terminate_group(group_proc);
+    terminate_group(group_proc, terminate_lock);
   }
 
   // This will stop here until the process is over

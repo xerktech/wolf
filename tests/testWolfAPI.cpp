@@ -2059,7 +2059,9 @@ TEST_CASE("SSE APIs", "[API]") {
 
   auto queue = std::make_shared<TSQueue<SSEEvent>>();
 
-  std::thread sse_thread(listen_sse, curl.get(), queue, "http://localhost/api/v1/events");
+  // The thread owns the handle: it never returns from curl_easy_perform, so the test must not free it
+  std::thread sse_thread(
+      [curl = std::move(curl), queue]() { listen_sse(curl.get(), queue, "http://localhost/api/v1/events"); });
   sse_thread.detach();
   std::this_thread::sleep_for(std::chrono::milliseconds(42)); // Wait for the SSE client to start
 
