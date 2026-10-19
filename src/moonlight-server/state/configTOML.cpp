@@ -548,20 +548,30 @@ static void write_config_file(const std::string &source, const std::string &cont
 
 /**
  * Loads the config file, applies update_fn to it and saves it back; the caller must hold config_file_mutex.
- * A failure is logged, never thrown: the in-memory state has already been updated and must not be torn down
- * because the file couldn't be persisted.
+ * A failure is logged and returned as false, never thrown: the in-memory state has already been updated and must not
+ * be torn down because the file couldn't be persisted.
  */
-template <typename F> static void update_config_file(const Config &cfg, F &&update_fn) {
+template <typename F> static bool update_config_file(const Config &cfg, F &&update_fn) {
   try {
     auto tml = rfl::toml::load<WolfConfig, rfl::DefaultIfMissing>(cfg.config_source).value();
+    // A file emptied or replaced under us loads as all defaults (DefaultIfMissing): saving it back would write an
+    // empty uuid and hostname and drop everything this update doesn't rewrite (e.g. the other paired clients)
+    if (tml.uuid.empty() && !cfg.uuid.empty()) {
+      logs::log(logs::error,
+                "Unable to save {}: it no longer holds this host's config (no uuid), leaving it untouched",
+                cfg.config_source);
+      return false;
+    }
     update_fn(tml);
     write_config_file(cfg.config_source, rfl::toml::write(tml));
+    return true;
   } catch (const std::exception &e) {
     logs::log(logs::error, "Unable to save {}: {}", cfg.config_source, e.what());
+    return false;
   }
 }
 
-void pair(const Config &cfg, const PairedClient &client) {
+bool pair(const Config &cfg, const PairedClient &client) {
   std::lock_guard lock(config_file_mutex);
   // Update CFG
   cfg.paired_clients->update([&client](const PairedClientList &paired_clients) {
@@ -575,10 +585,10 @@ void pair(const Config &cfg, const PairedClient &client) {
   });
 
   // Update TOML
-  update_config_file(cfg, [&client](WolfConfig &tml) { tml.paired_clients.push_back(client); });
+  return update_config_file(cfg, [&client](WolfConfig &tml) { tml.paired_clients.push_back(client); });
 }
 
-void unpair(const Config &cfg, const PairedClient &client) {
+bool unpair(const Config &cfg, const PairedClient &client) {
   std::lock_guard lock(config_file_mutex);
   // Update CFG
   cfg.paired_clients->update([&client](const PairedClientList &paired_clients) {
@@ -590,7 +600,7 @@ void unpair(const Config &cfg, const PairedClient &client) {
   });
 
   // Update TOML
-  update_config_file(cfg, [&client](WolfConfig &tml) {
+  return update_config_file(cfg, [&client](WolfConfig &tml) {
     tml.paired_clients.erase(std::remove_if(tml.paired_clients.begin(),
                                             tml.paired_clients.end(),
                                             [&client](const auto &v) { return v.client_cert == client.client_cert; }),
@@ -598,9 +608,9 @@ void unpair(const Config &cfg, const PairedClient &client) {
   });
 }
 
-bool update_client_settings(const Config &cfg,
-                            std::size_t client_id,
-                            const std::function<PairedClient(const PairedClient &)> &update_fn) {
+ConfigUpdate update_client_settings(const Config &cfg,
+                                    std::size_t client_id,
+                                    const std::function<PairedClient(const PairedClient &)> &update_fn) {
   // Held from reading the current client to saving, so concurrent updates apply in turn
   std::lock_guard lock(config_file_mutex);
   auto paired_clients = cfg.paired_clients->load();
@@ -608,7 +618,7 @@ bool update_client_settings(const Config &cfg,
     return get_client_id(*client) == client_id;
   });
   if (current == paired_clients->end()) {
-    return false;
+    return ConfigUpdate::NOT_FOUND;
   }
   auto updated_client = update_fn(**current);
 
@@ -626,12 +636,12 @@ bool update_client_settings(const Config &cfg,
   });
 
   // Update the TOML file
-  update_config_file(cfg, [&](WolfConfig &tml) {
+  auto saved = update_config_file(cfg, [&](WolfConfig &tml) {
     tml.paired_clients = tml.paired_clients |                         //
                          ranges::views::transform(update_client_fn) | //
                          ranges::to<std::vector<PairedClient>>();
   });
-  return true;
+  return saved ? ConfigUpdate::SAVED : ConfigUpdate::NOT_SAVED;
 }
 
 // Ignores the runners, see parse_app()
@@ -660,7 +670,8 @@ static events::RunnerTypes normalize_runner(const events::RunnerTypes &runner) {
 static BaseApp to_base_app(const Config &cfg, const events::App &app, const std::vector<BaseApp> &existing_apps) {
   auto runner = app.runner->serialize();
   for (const auto &existing : existing_apps) {
-    if (existing.title == app.base.title &&
+    // title and id are cheap to compare: parse_app() is not, and many apps can share a title
+    if (existing.title == app.base.title && existing.id.value_or(generate_app_id(existing)) == app.base.id &&
         rfl::json::write(normalize_runner(existing.runner)) == rfl::json::write(runner) &&
         same_settings(cfg.parse_app(existing), app)) {
       return existing;
@@ -702,13 +713,13 @@ static BaseApp to_base_app(const Config &cfg, const events::App &app, const std:
   return base_app;
 }
 
-void update_profiles(const Config &cfg, const std::function<ProfilesList(const ProfilesList &)> &update_fn) {
+bool update_profiles(const Config &cfg, const std::function<ProfilesList(const ProfilesList &)> &update_fn) {
   // Held across load and store too, so that concurrent updates apply in turn instead of overwriting each other
   std::lock_guard lock(config_file_mutex);
   auto profiles = update_fn(cfg.profiles->load());
   cfg.profiles->store(profiles);
 
-  update_config_file(cfg, [&](WolfConfig &tml) {
+  return update_config_file(cfg, [&](WolfConfig &tml) {
     tml.profiles = profiles | //
                    ranges::views::transform([&](const immer::box<events::Profile> &p) {
                      auto existing = std::find_if(tml.profiles.begin(), tml.profiles.end(), [&](const Profile &tp) {

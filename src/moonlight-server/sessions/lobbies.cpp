@@ -201,10 +201,23 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         }
         logs::log(logs::info, "[LOBBY] Session {} joining lobby {}", session->session_id, lobby->id);
 
+        auto current_lobby = state::get_lobby_by_connected_session(lobbies.get(), std::to_string(session->session_id));
+        if (current_lobby && current_lobby->id == lobby->id) {
+          logs::log(logs::debug, "[LOBBY] Session {} is already in lobby {}", session->session_id, lobby->id);
+          join_lobby_event->error_message.get()->set_value("");
+          return;
+        }
+
         if (!lobby->multi_user && lobby->connected_sessions->load()->size() >= 1) {
           logs::log(logs::error, "[LOBBY] Lobby {} is full", lobby->id);
           join_lobby_event->error_message.get()->set_value("Lobby is full");
           return;
+        }
+
+        // A session is in one lobby at most: a new stream resolves its producers to the first lobby that lists it
+        // (state::stream_producer_name), while a running one follows the last switch
+        if (current_lobby) {
+          leave_lobby(app_state->event_bus, *current_lobby, *session);
         }
 
         // Migrate joypads BEFORE adding the session to connected_sessions, or the relayed unplug races the queued plug

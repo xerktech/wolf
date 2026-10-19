@@ -370,6 +370,16 @@
             },
             "description": ""
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
+                }
+              }
+            },
+            "description": ""
+          },
           "500": {
             "content": {
               "application/json": {
@@ -643,6 +653,26 @@
             },
             "description": ""
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
+                }
+              }
+            },
+            "description": ""
+          },
           "500": {
             "content": {
               "application/json": {
@@ -677,6 +707,36 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/wolf__api__StreamSessionCreated"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
                 }
               }
             },
@@ -721,6 +781,26 @@
             },
             "description": ""
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
+                }
+              }
+            },
+            "description": ""
+          },
           "500": {
             "content": {
               "application/json": {
@@ -755,6 +835,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/wolf__api__GenericSuccessResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
                 }
               }
             },
@@ -799,6 +899,26 @@
             },
             "description": ""
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
+                }
+              }
+            },
+            "description": ""
+          },
           "500": {
             "content": {
               "application/json": {
@@ -838,6 +958,26 @@
             },
             "description": ""
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
+                }
+              }
+            },
+            "description": ""
+          },
           "500": {
             "content": {
               "application/json": {
@@ -872,6 +1012,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/wolf__api__GenericSuccessResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/wolf__api__GenericErrorResponse"
                 }
               }
             },
@@ -1456,6 +1616,22 @@
                 "type": "null"
               }
             ]
+          },
+          "motion_controller_override": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "XBOX",
+                  "PS",
+                  "NINTENDO",
+                  "AUTO"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": []
@@ -1872,6 +2048,15 @@
           },
           "h_scroll_acceleration": {
             "type": "number"
+          },
+          "motion_controller_override": {
+            "type": "string",
+            "enum": [
+              "XBOX",
+              "PS",
+              "NINTENDO",
+              "AUTO"
+            ]
           }
         },
         "required": [
@@ -1880,7 +2065,8 @@
           "controllers_override",
           "mouse_acceleration",
           "v_scroll_acceleration",
-          "h_scroll_acceleration"
+          "h_scroll_acceleration",
+          "motion_controller_override"
         ]
       },
       "wolf__core__audio__AudioMode": {

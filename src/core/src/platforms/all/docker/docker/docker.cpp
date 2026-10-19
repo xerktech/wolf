@@ -361,7 +361,8 @@ bool DockerAPI::pull_image(std::string_view image_name,
             auto &obj = data.as_object();
             DockerProgressEvent event{};
 
-            if (auto error = obj.find("error"); error != obj.end() && error->value().is_object()) {
+            // Docker reports a failed pull as a final {"error": "<message>", "errorDetail": {...}} line
+            if (auto error = obj.find("error"); error != obj.end() && error->value().is_string()) {
               pull_state->error_msg = error->value().as_string().c_str();
             }
 

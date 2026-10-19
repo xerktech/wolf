@@ -25,3 +25,8 @@ paths:
   input (failed ~1/2 runs under load). Don't remove that wait.
   - The client is single-threaded and its queues only fill while it dispatches: pop with
     `pop_event`, not a bare `queue->pop()` after one roundtrip.
+- API tests bind `wolf.sock` in `api_runtime_dir()`, one short mkdtemp dir per run, never
+  `XDG_RUNTIME_DIR`: a long
+  path overflows sun_path and aborts the binary, a shared one lets concurrent runs on a host reach each other's
+  server. Start servers with `start_api_server` (waits until it accepts), never a fixed sleep.
+- Don't `setenv()` in a test: earlier tests' detached server threads may be reading the environment.

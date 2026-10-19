@@ -24,6 +24,12 @@ paths:
   - The temp file is unlinked and opened `O_EXCL | O_NOFOLLOW`: a planted symlink or FIFO at
     `<config>.tmp` must not be followed.
 - A failed save is logged, not thrown: an exception from an API handler terminates Wolf.
+  - It is returned instead (`pair`/`unpair`/`update_profiles` → false, `update_client_settings` →
+    `ConfigUpdate::NOT_SAVED`): the API answers 500, since the change is lost on the next restart.
+- A config.toml that loads without a uuid while Wolf has one was emptied or replaced under us: never save
+  over it (DefaultIfMissing would write an empty uuid/hostname and drop the other paired clients).
+- Tests: `tests/testMoonlight.cpp` "LocalState reports a config file it couldn't save"; `tests/testWolfAPI.cpp`
+  "API reports a config change that couldn't be saved".
 - Tests: `tests/testMoonlight.cpp` "LocalState concurrent updates" (lost updates, mode, planted
   temp symlink/FIFO).
 

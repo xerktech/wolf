@@ -281,6 +281,47 @@ TEST_CASE("Wayland socket wait", "[Sessions]") {
   }
 }
 
+TEST_CASE("LocalState reports a config file it couldn't save", "[LocalState]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  const std::string cfg_file = "config.test.EMPTIED.toml";
+  std::filesystem::copy_file("config.test.toml", cfg_file, std::filesystem::copy_options::overwrite_existing);
+  auto cfg = state::load_or_default(cfg_file, event_bus, running_sessions);
+  auto client_id = state::get_client_id(*cfg.paired_clients->load()->front());
+  auto keep_client = [](const state::PairedClient &client) { return client; };
+  auto keep_profiles = [](const state::ProfilesList &profiles) { return profiles; };
+
+  REQUIRE(state::pair(cfg, {.client_cert = "saved-cert"}));
+  REQUIRE(state::update_client_settings(cfg, client_id, keep_client) == state::ConfigUpdate::SAVED);
+  REQUIRE(state::update_client_settings(cfg, 42, keep_client) == state::ConfigUpdate::NOT_FOUND);
+  REQUIRE(state::update_profiles(cfg, keep_profiles));
+
+  // Emptied under us: it loads as all defaults, and saving that back would write an empty uuid and hostname and
+  // keep only the client being paired
+  { std::ofstream(cfg_file, std::ios::trunc); }
+  REQUIRE_FALSE(state::pair(cfg, {.client_cert = "unsaved-cert"}));
+  REQUIRE_FALSE(state::unpair(cfg, {.client_cert = "saved-cert"}));
+  REQUIRE(state::update_client_settings(cfg, client_id, keep_client) == state::ConfigUpdate::NOT_SAVED);
+  REQUIRE_FALSE(state::update_profiles(cfg, keep_profiles));
+  REQUIRE(std::filesystem::file_size(cfg_file) == 0);
+  std::filesystem::remove(cfg_file);
+}
+
+TEST_CASE("LocalState: blank producer caps fall back to the default", "[LocalState]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto cfg = state::load_or_default("config.test.toml", event_bus, running_sessions);
+  auto app = wolf::config::BaseApp{.title = "caps", .runner = wolf::config::AppCMD{.run_cmd = "true"}};
+  auto default_caps = cfg.parse_app(app).video_producer_buffer_caps;
+  REQUIRE_FALSE(default_caps.empty());
+  for (auto caps : {"", " ", "\t\n "}) {
+    app.video = wolf::config::BaseAppVideoOverride{.producer_buffer_caps = caps};
+    REQUIRE_THAT(cfg.parse_app(app).video_producer_buffer_caps, Equals(default_caps));
+  }
+  app.video = wolf::config::BaseAppVideoOverride{.producer_buffer_caps = " video/x-raw(memory:DMABuf)"};
+  REQUIRE_THAT(cfg.parse_app(app).video_producer_buffer_caps, Equals(" video/x-raw(memory:DMABuf)"));
+}
+
 TEST_CASE("Encoder video_params fall back to the embedded default", "[LocalState]") {
   constexpr char const *default_toml =
 #include <state/default/config.include.toml>
