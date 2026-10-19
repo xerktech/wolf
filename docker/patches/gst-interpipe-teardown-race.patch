@@ -1,0 +1,721 @@
+gst-interpipe: fix crashes when a node is torn down while listeners are active
+
+Applies on top of games-on-whales/gst-interpipe 0c454917cb3cf4f2b2f2729f5f72a4dee072c7c9
+(GST_INTERPIPE_REF in docker/wolf.Dockerfile). Wolf ticket XERK-2114.
+
+Use-after-free races when an interpipesink (node) is destroyed while
+interpipesrc listeners on other threads start, stop, or forward events:
+
+1. gst_inter_pipe_add_node / gst_inter_pipe_remove_node walked the global
+   listeners table without listeners_mutex while listen_node / leave_node
+   inserted and freed entries (SIGSEGV in gst_inter_pipe_ilistener_node_removed
+   <- gst_inter_pipe_sink_finalize). They now hold listeners_mutex (made
+   recursive: the callbacks re-enter listen_node / leave_node) and iterate a
+   snapshot of the listeners.
+2. listen_node / leave_node could call into a sink that was mid-teardown. The
+   sink now unregisters in dispose, before its pads are released, and removal
+   is serialized with listen/leave by listeners_mutex.
+3. interpipesrc forwarded upstream events / context queries to a raw node
+   pointer with no lock. Forwards now pin the node (in-flight count under
+   nodes_mutex) and remove_node waits for them. No lock is held while
+   forwarding: holding listeners_mutex there deadlocks against a producer
+   streaming thread blocked on a consumer's preroll.
+4. A sink whose name was already taken (add_node failed) still unregistered
+   that name on dispose, removing the live owner and orphaning its listeners
+   (use-after-free on push). remove_node now only removes the entry if it is
+   the given node, and a sink that failed to register forgets its node name.
+5. interpipesrc's listen-to string was freed by the setter without the
+   listeners lock while node_added / node_removed, start / stop and the
+   registry's own entry (which aliased it) still used it (use-after-free when
+   a consumer switches producers while it or a producer starts or stops). The
+   setter, getter, start and stop now run under the listeners lock
+   (gst_inter_pipe_lock_listeners), and the registry keeps its own copy.
+6. interpipesrc's pending serial events queue was pushed by the node's
+   streaming thread and popped by the listener's own streaming thread with no
+   lock (SIGSEGV in g_queue_push_tail <- gst_inter_pipe_ilistener_push_event).
+   It now has its own mutex; the event is pushed downstream outside it.
+
+diff --git a/gst/interpipe/gstinterpipe.c b/gst/interpipe/gstinterpipe.c
+index 69a5f84..24ae4c9 100644
+--- a/gst/interpipe/gstinterpipe.c
++++ b/gst/interpipe/gstinterpipe.c
+@@ -44,19 +44,22 @@ typedef struct _GstInterPipeListenerPriv GstInterPipeListenerPriv;
+ struct _GstInterPipeListenerPriv
+ {
+   GstInterPipeIListener *listener;
+-  const gchar *listen_to;
++  /* Owned copy: the listener may free its own listen-to string at any time */
++  gchar *listen_to;
+ };
+ 
+ /* Global mutexes for singletons */
+-static GMutex listeners_mutex;
++static GRecMutex listeners_mutex;
+ static GMutex nodes_mutex;
++/* Signalled (under nodes_mutex) when a node's in-flight count drops to 0 */
++static GCond nodes_cond;
+ 
+ static GHashTable *gst_inter_pipe_get_listeners ();
+ static GHashTable *gst_inter_pipe_get_nodes ();
+-static void gst_inter_pipe_notify_node_added (gpointer listener_name,
+-    gpointer _listener, gpointer data);
+-static void gst_inter_pipe_notify_node_removed (gpointer _listener_name,
+-    gpointer _listener, gpointer data);
++static void gst_inter_pipe_notify_node_added (gpointer _listener,
++    gpointer data);
++static void gst_inter_pipe_notify_node_removed (gpointer _listener,
++    gpointer data);
+ static gboolean gst_inter_pipe_leave_listeners_table (GstInterPipeIListener *
+     listener);
+ static gboolean gst_inter_pipe_leave_node_priv (GstInterPipeIListener *
+@@ -86,6 +89,58 @@ gst_inter_pipe_get_nodes (void)
+   return gst_inter_pipe_nodes;
+ }
+ 
++/* Node -> number of event/query forwards currently using it. Guarded by
++ * nodes_mutex. remove_node waits for a node's count to drop to zero, so a
++ * node cannot be torn down under a forward in progress. Forwards do not hold
++ * any lock while they run, since they may block on the producer pipeline. */
++static GHashTable *
++gst_inter_pipe_get_inflight (void)
++{
++  static GHashTable *gst_inter_pipe_inflight = NULL;
++
++  if (!gst_inter_pipe_inflight) {
++    gst_inter_pipe_inflight = g_hash_table_new (g_direct_hash, g_direct_equal);
++  }
++  return gst_inter_pipe_inflight;
++}
++
++static GstInterPipeINode *
++gst_inter_pipe_acquire_node (const gchar * node_name)
++{
++  GHashTable *inflight;
++  GstInterPipeINode *node;
++  guint count;
++
++  g_mutex_lock (&nodes_mutex);
++  node = g_hash_table_lookup (gst_inter_pipe_get_nodes (), node_name);
++  if (node) {
++    inflight = gst_inter_pipe_get_inflight ();
++    count = GPOINTER_TO_UINT (g_hash_table_lookup (inflight, node));
++    g_hash_table_insert (inflight, node, GUINT_TO_POINTER (count + 1));
++  }
++  g_mutex_unlock (&nodes_mutex);
++
++  return node;
++}
++
++static void
++gst_inter_pipe_release_node (GstInterPipeINode * node)
++{
++  GHashTable *inflight;
++  guint count;
++
++  g_mutex_lock (&nodes_mutex);
++  inflight = gst_inter_pipe_get_inflight ();
++  count = GPOINTER_TO_UINT (g_hash_table_lookup (inflight, node));
++  if (count <= 1) {
++    g_hash_table_remove (inflight, node);
++    g_cond_broadcast (&nodes_cond);
++  } else {
++    g_hash_table_insert (inflight, node, GUINT_TO_POINTER (count - 1));
++  }
++  g_mutex_unlock (&nodes_mutex);
++}
++
+ GstInterPipeINode *
+ gst_inter_pipe_get_node (const gchar * node_name)
+ {
+@@ -115,7 +170,7 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
+   g_return_val_if_fail (listener != NULL, FALSE);
+   g_return_val_if_fail (node_name != NULL, FALSE);
+ 
+-  g_mutex_lock (&listeners_mutex);
++  g_rec_mutex_lock (&listeners_mutex);
+ 
+   listeners = gst_inter_pipe_get_listeners ();
+   listener_name = gst_inter_pipe_ilistener_get_name (listener);
+@@ -133,7 +188,7 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
+       gst_inter_pipe_leave_node_priv (listener);
+ 
+   } else {
+-    listener_priv = g_malloc (sizeof (GstInterPipeListenerPriv));
++    listener_priv = g_new0 (GstInterPipeListenerPriv, 1);
+     listener_priv->listener = listener;
+   }
+ 
+@@ -145,30 +200,32 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
+      when it connects */
+   if (node == NULL) {
+     GST_INFO ("Node is not available yet, connecting later.");
++    g_free (listener_priv->listen_to);
+     listener_priv->listen_to = NULL;
+   } else {
+     if (!gst_inter_pipe_inode_add_listener (node, listener))
+       goto add_failed;
+-    listener_priv->listen_to = node_name;
++    g_free (listener_priv->listen_to);
++    listener_priv->listen_to = g_strdup (node_name);
+   }
+ 
+   g_hash_table_insert (listeners, (gchar *) listener_name,
+       (gpointer) listener_priv);
+ 
+-  g_mutex_unlock (&listeners_mutex);
++  g_rec_mutex_unlock (&listeners_mutex);
+ 
+   return TRUE;
+ already_listen:
+   {
+     GST_INFO ("Already listening to node %s", node_name);
+-    g_mutex_unlock (&listeners_mutex);
++    g_rec_mutex_unlock (&listeners_mutex);
+     return TRUE;
+   }
+ add_failed:
+   {
+     GST_WARNING ("Could not add listener %s to node %s", listener_name,
+         node_name);
+-    g_mutex_unlock (&listeners_mutex);
++    g_rec_mutex_unlock (&listeners_mutex);
+     return FALSE;
+   }
+ }
+@@ -187,6 +244,7 @@ gst_inter_pipe_leave_listeners_table (GstInterPipeIListener * listener)
+   if (!g_hash_table_remove (listeners, listener_name))
+     return FALSE;
+ 
++  g_free (listener_priv->listen_to);
+   g_free (listener_priv);
+ 
+   return TRUE;
+@@ -235,6 +293,7 @@ no_node:
+   {
+     GST_WARNING ("Node %s not found. Could not leave node.",
+         listener_priv->listen_to);
++    g_free (listener_priv->listen_to);
+     listener_priv->listen_to = NULL;
+     return FALSE;
+   }
+@@ -243,6 +302,7 @@ remove_error:
+     GST_WARNING
+         ("The listener %s was not listening to %s, there's something very wrong",
+         listener_name, listener_priv->listen_to);
++    g_free (listener_priv->listen_to);
+     listener_priv->listen_to = NULL;
+     return FALSE;
+   }
+@@ -254,7 +314,7 @@ gst_inter_pipe_leave_node (GstInterPipeIListener * listener)
+ {
+   gboolean ret = TRUE;
+ 
+-  g_mutex_lock (&listeners_mutex);
++  g_rec_mutex_lock (&listeners_mutex);
+ 
+   ret = gst_inter_pipe_leave_node_priv (listener);
+   if (!ret)
+@@ -264,23 +324,41 @@ gst_inter_pipe_leave_node (GstInterPipeIListener * listener)
+     goto list_error;
+ 
+ out:
+-  g_mutex_unlock (&listeners_mutex);
++  g_rec_mutex_unlock (&listeners_mutex);
+   return ret;
+ 
+ list_error:
+   {
+     GST_WARNING ("Could not leave node");
+-    g_mutex_unlock (&listeners_mutex);
++    g_rec_mutex_unlock (&listeners_mutex);
+     return FALSE;
+   }
+ }
+ 
++/* Must be called with listeners_mutex held. Returns the listeners as a
++ * plain list so callbacks may add or remove listener table entries (e.g.
++ * leave_node) without invalidating the iteration. The listener objects
++ * stay valid while listeners_mutex is held: a listener leaves the table
++ * (on stop) under the same lock before it can be finalized. */
++static GList *
++gst_inter_pipe_snapshot_listeners (void)
++{
++  GList *privs, *l, *snapshot = NULL;
++
++  privs = g_hash_table_get_values (gst_inter_pipe_get_listeners ());
++  for (l = privs; l != NULL; l = l->next) {
++    GstInterPipeListenerPriv *listener_priv = l->data;
++    snapshot = g_list_prepend (snapshot, listener_priv->listener);
++  }
++  g_list_free (privs);
++
++  return snapshot;
++}
++
+ static void
+-gst_inter_pipe_notify_node_added (gpointer listener_name, gpointer _listener,
+-    gpointer data)
++gst_inter_pipe_notify_node_added (gpointer _listener, gpointer data)
+ {
+-  GstInterPipeListenerPriv *listener_priv = _listener;
+-  GstInterPipeIListener *listener = listener_priv->listener;
++  GstInterPipeIListener *listener = _listener;
+   gchar *node_name = data;
+ 
+   GST_INFO ("Notifying new node added: %s", node_name);
+@@ -292,11 +370,16 @@ gboolean
+ gst_inter_pipe_add_node (GstInterPipeINode * node, const gchar * node_name)
+ {
+   GHashTable *nodes;
+-  GHashTable *listeners;
++  GList *listeners;
+ 
+   g_return_val_if_fail (node != NULL, FALSE);
+   g_return_val_if_fail (node_name != NULL, FALSE);
+ 
++  /* Lock order is listeners_mutex -> nodes_mutex, same as listen_node. The
++   * listeners lock is held across the notification so no listener can join,
++   * leave or be freed while we walk them. It is recursive because the
++   * callbacks re-enter listen_node / leave_node. */
++  g_rec_mutex_lock (&listeners_mutex);
+   g_mutex_lock (&nodes_mutex);
+ 
+   nodes = gst_inter_pipe_get_nodes ();
+@@ -310,11 +393,12 @@ gst_inter_pipe_add_node (GstInterPipeINode * node, const gchar * node_name)
+ 
+   g_mutex_unlock (&nodes_mutex);
+ 
+-  listeners = gst_inter_pipe_get_listeners ();
+-  g_hash_table_foreach (listeners, gst_inter_pipe_notify_node_added,
++  listeners = gst_inter_pipe_snapshot_listeners ();
++  g_list_foreach (listeners, gst_inter_pipe_notify_node_added,
+       (gpointer) node_name);
++  g_list_free (listeners);
+ 
+-
++  g_rec_mutex_unlock (&listeners_mutex);
+ 
+   return TRUE;
+ 
+@@ -322,23 +406,23 @@ no_unique:
+   {
+     GST_WARNING ("Could not add node %s, it is not unique.", node_name);
+     g_mutex_unlock (&nodes_mutex);
++    g_rec_mutex_unlock (&listeners_mutex);
+     return FALSE;
+   }
+ add_error:
+   {
+     GST_INFO ("Could not add node %s", node_name);
+     g_mutex_unlock (&nodes_mutex);
++    g_rec_mutex_unlock (&listeners_mutex);
+     return FALSE;
+   }
+ }
+ 
+ static void
+-gst_inter_pipe_notify_node_removed (gpointer _listener_name, gpointer _listener,
+-    gpointer data)
++gst_inter_pipe_notify_node_removed (gpointer _listener, gpointer data)
+ {
++  GstInterPipeIListener *listener = _listener;
+   gchar *node_name = data;
+-  GstInterPipeListenerPriv *listener_priv = _listener;
+-  GstInterPipeIListener *listener = listener_priv->listener;
+ 
+   GST_INFO ("Notifying node removed: %s", node_name);
+ 
+@@ -349,25 +433,93 @@ gboolean
+ gst_inter_pipe_remove_node (GstInterPipeINode * node, const gchar * node_name)
+ {
+   GHashTable *nodes;
+-  GHashTable *listeners;
++  GList *listeners;
+ 
+   g_return_val_if_fail (node != NULL, FALSE);
+   g_return_val_if_fail (node_name != NULL, FALSE);
+ 
++  /* Holding listeners_mutex also serializes removal against listen_node /
++   * leave_node, which look the node up and call into it under that lock:
++   * once we return, nobody is using the node and nobody can find it. */
++  g_rec_mutex_lock (&listeners_mutex);
+   g_mutex_lock (&nodes_mutex);
+ 
+   nodes = gst_inter_pipe_get_nodes ();
+   GST_INFO ("Removing node %s", node_name);
+-  if (!g_hash_table_remove (nodes, (gconstpointer) node_name)) {
++  /* Only remove the entry if it is this node: a sink whose add_node failed
++   * because the name was taken must not unregister the owner of that name */
++  if (g_hash_table_lookup (nodes, node_name) != node
++      || !g_hash_table_remove (nodes, (gconstpointer) node_name)) {
+     GST_WARNING ("Node %s not found. Could not remove it.", node_name);
+     g_mutex_unlock (&nodes_mutex);
++    g_rec_mutex_unlock (&listeners_mutex);
+     return FALSE;
+   }
+   g_mutex_unlock (&nodes_mutex);
+ 
+-  listeners = gst_inter_pipe_get_listeners ();
+-  g_hash_table_foreach (listeners, gst_inter_pipe_notify_node_removed,
++  listeners = gst_inter_pipe_snapshot_listeners ();
++  g_list_foreach (listeners, gst_inter_pipe_notify_node_removed,
+       (gpointer) node_name);
++  g_list_free (listeners);
++
++  g_rec_mutex_unlock (&listeners_mutex);
++
++  /* The node can no longer be found; wait out forwards that already have
++   * it. Done without listeners_mutex, which a forward may need to finish. */
++  g_mutex_lock (&nodes_mutex);
++  while (g_hash_table_contains (gst_inter_pipe_get_inflight (), node))
++    g_cond_wait (&nodes_cond, &nodes_mutex);
++  g_mutex_unlock (&nodes_mutex);
+ 
+   return TRUE;
+ }
++
++gboolean
++gst_inter_pipe_node_send_event (const gchar * node_name, GstEvent * event)
++{
++  GstInterPipeINode *node;
++  gboolean ret;
++
++  g_return_val_if_fail (event != NULL, FALSE);
++
++  node = node_name ? gst_inter_pipe_acquire_node (node_name) : NULL;
++  if (!node) {
++    gst_event_unref (event);
++    return FALSE;
++  }
++
++  ret = gst_inter_pipe_inode_receive_event (node, event);
++  gst_inter_pipe_release_node (node);
++
++  return ret;
++}
++
++gboolean
++gst_inter_pipe_node_send_query (const gchar * node_name, GstQuery * query)
++{
++  GstInterPipeINode *node;
++  gboolean ret;
++
++  g_return_val_if_fail (query != NULL, FALSE);
++
++  node = node_name ? gst_inter_pipe_acquire_node (node_name) : NULL;
++  if (!node)
++    return FALSE;
++
++  ret = gst_inter_pipe_inode_receive_query (node, query);
++  gst_inter_pipe_release_node (node);
++
++  return ret;
++}
++
++void
++gst_inter_pipe_lock_listeners (void)
++{
++  g_rec_mutex_lock (&listeners_mutex);
++}
++
++void
++gst_inter_pipe_unlock_listeners (void)
++{
++  g_rec_mutex_unlock (&listeners_mutex);
++}
+diff --git a/gst/interpipe/gstinterpipe.h b/gst/interpipe/gstinterpipe.h
+index a99ff70..2ba7f60 100644
+--- a/gst/interpipe/gstinterpipe.h
++++ b/gst/interpipe/gstinterpipe.h
+@@ -88,5 +88,46 @@ gboolean gst_inter_pipe_add_node (GstInterPipeINode * node,
+ gboolean gst_inter_pipe_remove_node (GstInterPipeINode * node,
+     const gchar * node_name);
+ 
++/**
++ * gst_inter_pipe_node_send_event:
++ * @node_name:(transfer none)(nullable): The name of the node to send to
++ * @event:(transfer full)(not nullable): The upstream event to forward
++ *
++ * Forward @event to the node named @node_name, if it exists. The node is
++ * pinned for the duration of the call: gst_inter_pipe_remove_node() waits for
++ * it, so the node cannot be torn down while the event is being delivered.
++ *
++ * Returns: TRUE if the node existed and handled the event, FALSE otherwise.
++ */
++gboolean gst_inter_pipe_node_send_event (const gchar * node_name,
++    GstEvent * event);
++
++/**
++ * gst_inter_pipe_node_send_query:
++ * @node_name:(transfer none)(nullable): The name of the node to query
++ * @query:(transfer none)(not nullable): The query to forward
++ *
++ * Like gst_inter_pipe_node_send_event(), for queries.
++ *
++ * Returns: TRUE if the node existed and answered the query, FALSE otherwise.
++ */
++gboolean gst_inter_pipe_node_send_query (const gchar * node_name,
++    GstQuery * query);
++
++/**
++ * gst_inter_pipe_lock_listeners:
++ *
++ * Take the (recursive) lock that guards listener registration. Listeners
++ * hold it while changing state that node_added / node_removed read.
++ */
++void gst_inter_pipe_lock_listeners (void);
++
++/**
++ * gst_inter_pipe_unlock_listeners:
++ *
++ * Release the lock taken by gst_inter_pipe_lock_listeners().
++ */
++void gst_inter_pipe_unlock_listeners (void);
++
+ G_END_DECLS
+ #endif // __GST_INTER_PIPE_H__
+diff --git a/gst/interpipe/gstinterpipesink.c b/gst/interpipe/gstinterpipesink.c
+index 4e0acfc..2305137 100644
+--- a/gst/interpipe/gstinterpipesink.c
++++ b/gst/interpipe/gstinterpipesink.c
+@@ -64,6 +64,7 @@ static void gst_inter_pipe_sink_set_property (GObject * object, guint prop_id,
+     const GValue * value, GParamSpec * pspec);
+ static void gst_inter_pipe_sink_get_property (GObject * object, guint prop_id,
+     GValue * value, GParamSpec * pspec);
++static void gst_inter_pipe_sink_dispose (GObject * object);
+ static void gst_inter_pipe_sink_finalize (GObject * object);
+ static GstFlowReturn gst_inter_pipe_sink_new_buffer (GstAppSink * sink,
+     gpointer data);
+@@ -158,6 +159,7 @@ gst_inter_pipe_sink_class_init (GstInterPipeSinkClass * klass)
+ 
+   gobject_class->set_property = gst_inter_pipe_sink_set_property;
+   gobject_class->get_property = gst_inter_pipe_sink_get_property;
++  gobject_class->dispose = gst_inter_pipe_sink_dispose;
+   gobject_class->finalize = gst_inter_pipe_sink_finalize;
+ 
+   g_object_class_install_property (gobject_class, PROP_FORWARD_EOS,
+@@ -196,7 +198,11 @@ gst_inter_pipe_sink_update_node_name (GstInterPipeSink * sink,
+   }
+ 
+   sink->node_name = gst_object_get_name (GST_OBJECT (sink));
+-  gst_inter_pipe_add_node (node, sink->node_name);
++  if (!gst_inter_pipe_add_node (node, sink->node_name)) {
++    /* Name already registered by another sink: we are not that node */
++    g_free (sink->node_name);
++    sink->node_name = NULL;
++  }
+ }
+ 
+ static void
+@@ -287,7 +293,7 @@ gst_inter_pipe_sink_get_property (GObject * object, guint prop_id,
+ }
+ 
+ static void
+-gst_inter_pipe_sink_finalize (GObject * object)
++gst_inter_pipe_sink_dispose (GObject * object)
+ {
+   GstInterPipeSink *sink;
+   GstInterPipeINode *node;
+@@ -295,13 +301,27 @@ gst_inter_pipe_sink_finalize (GObject * object)
+   sink = GST_INTER_PIPE_SINK (object);
+   node = GST_INTER_PIPE_INODE (sink);
+ 
++  /* Unregister before chaining up: the parent dispose releases our pads,
++   * and listeners joining or forwarding to this node must not see it in
++   * that half-torn-down state. */
+   if (sink->node_name != NULL) {
+     GST_DEBUG_OBJECT (sink, "Removing node %s and associated listeners",
+         sink->node_name);
+     gst_inter_pipe_remove_node (node, sink->node_name);
+     g_free (sink->node_name);
++    sink->node_name = NULL;
+   }
+ 
++  G_OBJECT_CLASS (gst_inter_pipe_sink_parent_class)->dispose (object);
++}
++
++static void
++gst_inter_pipe_sink_finalize (GObject * object)
++{
++  GstInterPipeSink *sink;
++
++  sink = GST_INTER_PIPE_SINK (object);
++
+   if (sink->caps) {
+     gst_caps_unref (sink->caps);
+   }
+diff --git a/gst/interpipe/gstinterpipesrc.c b/gst/interpipe/gstinterpipesrc.c
+index ff983e5..675eff8 100644
+--- a/gst/interpipe/gstinterpipesrc.c
++++ b/gst/interpipe/gstinterpipesrc.c
+@@ -139,6 +139,9 @@ struct _GstInterPipeSrc
+ 
+   /* Pending serial events queue */
+   GQueue *pending_serial_events;
++  /* pending_serial_events is pushed by the node's streaming thread and
++   * popped by ours */
++  GMutex pending_serial_events_mutex;
+ 
+   /* Block switch */
+   gboolean block_switch;
+@@ -240,6 +243,7 @@ gst_inter_pipe_src_init (GstInterPipeSrc * src)
+   src->listen_to = NULL;
+   src->listening = FALSE;
+   src->pending_serial_events = g_queue_new ();
++  g_mutex_init (&src->pending_serial_events_mutex);
+   src->block_switch = FALSE;
+   src->allow_renegotiation = TRUE;
+   src->first_switch = TRUE;
+@@ -263,6 +267,9 @@ gst_inter_pipe_src_set_property (GObject * object, guint prop_id,
+ 
+   switch (prop_id) {
+     case PROP_LISTEN_TO:
++      /* node_added / node_removed read listen_to from other threads under
++       * the listeners lock, so it must only change under that lock too */
++      gst_inter_pipe_lock_listeners ();
+       node_name = g_strdup (g_value_get_string (value));
+       if (!g_strcmp0 (src->listen_to, node_name)) {
+         /* We are already listening to that node, so nothing to do */
+@@ -302,6 +309,7 @@ gst_inter_pipe_src_set_property (GObject * object, guint prop_id,
+           src->listen_to = NULL;
+         }
+       }
++      gst_inter_pipe_unlock_listeners ();
+       break;
+     case PROP_BLOCK_SWITCH:
+       src->block_switch = g_value_get_boolean (value);
+@@ -336,7 +344,9 @@ gst_inter_pipe_src_get_property (GObject * object, guint prop_id,
+ 
+   switch (prop_id) {
+     case PROP_LISTEN_TO:
++      gst_inter_pipe_lock_listeners ();
+       g_value_set_string (value, src->listen_to);
++      gst_inter_pipe_unlock_listeners ();
+       break;
+     case PROP_BLOCK_SWITCH:
+       g_value_set_boolean (value, src->block_switch);
+@@ -369,6 +379,7 @@ gst_inter_pipe_src_finalize (GObject * object)
+   /* Free pending serial events queue */
+   g_queue_free_full (src->pending_serial_events,
+       (GDestroyNotify) gst_event_unref);
++  g_mutex_clear (&src->pending_serial_events_mutex);
+ 
+   if (src->listen_to) {
+     g_free (src->listen_to);
+@@ -392,9 +403,12 @@ gst_inter_pipe_src_start (GstBaseSrc * base)
+   if (!basesrc_class->start (base))
+     goto start_fail;
+ 
++  /* listen-to may be set concurrently (under the listeners lock) */
++  gst_inter_pipe_lock_listeners ();
+   if (src->listen_to) {
+     if (!gst_inter_pipe_src_listen_node (src, src->listen_to)) {
+       GST_ERROR_OBJECT (src, "Could not listen to node %s", src->listen_to);
++      gst_inter_pipe_unlock_listeners ();
+       goto start_fail;
+     } else {
+       GST_INFO_OBJECT (src, "Listening to node %s", src->listen_to);
+@@ -407,6 +421,7 @@ gst_inter_pipe_src_start (GstBaseSrc * base)
+   }
+ 
+ start_done:
++  gst_inter_pipe_unlock_listeners ();
+   if (GST_INTER_PIPE_SRC_RESTART_TIMESTAMP == src->stream_sync)
+     gst_base_src_set_do_timestamp (base, TRUE);
+ 
+@@ -426,11 +441,13 @@ gst_inter_pipe_src_stop (GstBaseSrc * base)
+   src = GST_INTER_PIPE_SRC (base);
+   listener = GST_INTER_PIPE_ILISTENER (src);
+ 
++  gst_inter_pipe_lock_listeners ();
+   if (src->listening) {
+     GST_INFO_OBJECT (src, "Removing listener from node %s", src->listen_to);
+     gst_inter_pipe_leave_node (listener);
+     src->listening = FALSE;
+   }
++  gst_inter_pipe_unlock_listeners ();
+ 
+   return basesrc_class->stop (base);
+ }
+@@ -440,21 +457,18 @@ gst_inter_pipe_src_event (GstBaseSrc * base, GstEvent * event)
+ {
+   GstBaseSrcClass *basesrc_class;
+   GstInterPipeSrc *src;
+-  GstInterPipeINode *node;
+ 
+   basesrc_class = GST_BASE_SRC_CLASS (gst_inter_pipe_src_parent_class);
+   src = GST_INTER_PIPE_SRC (base);
+-  node = gst_inter_pipe_get_node (src->listen_to);
+ 
+   if (GST_EVENT_IS_UPSTREAM (event)) {
+ 
+     GST_INFO_OBJECT (src, "Incoming upstream event %s",
+         GST_EVENT_TYPE_NAME (event));
+ 
+-    if (node) {
+-      gst_inter_pipe_inode_receive_event (node, gst_event_ref (event));
+-    } else
+-      GST_WARNING_OBJECT (src, "Node doesn't exist, event won't be forwarded");
++    if (!gst_inter_pipe_node_send_event (src->listen_to, gst_event_ref (event)))
++      GST_WARNING_OBJECT (src, "Event wasn't forwarded to node %s",
++          GST_STR_NULL (src->listen_to));
+   }
+ 
+   return basesrc_class->event (base, event);
+@@ -465,7 +479,6 @@ gst_inter_pipe_src_query (GstBaseSrc * base, GstQuery * query)
+ {
+   GstBaseSrcClass *basesrc_class;
+   GstInterPipeSrc *src;
+-  GstInterPipeINode *node;
+ 
+   basesrc_class = GST_BASE_SRC_CLASS (gst_inter_pipe_src_parent_class);
+   src = GST_INTER_PIPE_SRC (base);
+@@ -479,8 +492,7 @@ gst_inter_pipe_src_query (GstBaseSrc * base, GstQuery * query)
+    * and events are already shared. Everything else falls through to the
+    * default GstBaseSrc handling. */
+   if (GST_QUERY_TYPE (query) == GST_QUERY_CONTEXT) {
+-    node = gst_inter_pipe_get_node (src->listen_to);
+-    if (node && gst_inter_pipe_inode_receive_query (node, query)) {
++    if (gst_inter_pipe_node_send_query (src->listen_to, query)) {
+       GST_DEBUG_OBJECT (src,
+           "Answered %s query across the interpipe boundary",
+           GST_QUERY_TYPE_NAME (query));
+@@ -517,6 +529,8 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
+       "Dequeue buffer %p with timestamp (PTS) %" GST_TIME_FORMAT, *buf,
+       GST_TIME_ARGS (GST_BUFFER_PTS (*buf)));
+ 
++  serial_event = NULL;
++  g_mutex_lock (&src->pending_serial_events_mutex);
+   if (!g_queue_is_empty (src->pending_serial_events)) {
+     guint curr_bytes;
+     /*Pending Serial Events Queue */
+@@ -534,13 +548,18 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
+           GST_EVENT_TYPE_NAME (serial_event));
+ 
+       serial_event = g_queue_pop_head (src->pending_serial_events);
+-      gst_pad_push_event (srcpad, serial_event);
+     } else {
+       GST_DEBUG_OBJECT (src, "Event %s timestamp is greater than the "
+           "buffer timestamp, can't send serial event yet",
+           GST_EVENT_TYPE_NAME (serial_event));
++      serial_event = NULL;
+     }
+   }
++  g_mutex_unlock (&src->pending_serial_events_mutex);
++
++  /* Push outside the lock: downstream may block */
++  if (serial_event)
++    gst_pad_push_event (srcpad, serial_event);
+ 
+   return ret;
+ }
+@@ -780,7 +799,9 @@ gst_inter_pipe_src_push_event (GstInterPipeIListener * iface, GstEvent * event,
+         " enqueued on serial pending events", GST_EVENT_TYPE_NAME (event),
+         GST_TIME_ARGS (GST_EVENT_TIMESTAMP (event)));
+ 
++    g_mutex_lock (&src->pending_serial_events_mutex);
+     g_queue_push_tail (src->pending_serial_events, event);
++    g_mutex_unlock (&src->pending_serial_events_mutex);
+   }
+   return ret;
+ no_events:

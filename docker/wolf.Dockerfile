@@ -54,6 +54,26 @@ RUN <<_GST_WAYLAND_DISPLAY
     cargo cinstall --features="cuda" --prefix=/usr/local/lib/x86_64-linux-gnu/ --libdir=/usr/local/lib/x86_64-linux-gnu
 _GST_WAYLAND_DISPLAY
 
+# gst-interpipe with our teardown-race fixes (XERK-2114), replacing the base image's copy:
+# installs into the same /usr/local/lib/x86_64-linux-gnu/gstreamer-1.0 the runner copies from.
+# Pinned so the patches keep applying; bump the ref and patches together.
+ARG GST_INTERPIPE_REF=0c454917cb3cf4f2b2f2729f5f72a4dee072c7c9
+COPY docker/patches/gst-interpipe-*.patch /tmp/gst-interpipe-patches/
+RUN <<_GST_INTERPIPE
+    #!/bin/bash
+    set -e
+
+    apt-get update -y
+    apt-get install -y --no-install-recommends meson
+    git clone https://github.com/games-on-whales/gst-interpipe.git
+    cd gst-interpipe
+    git checkout $GST_INTERPIPE_REF
+    git apply /tmp/gst-interpipe-patches/gst-interpipe-*.patch
+    meson setup build -Denable-gtk-doc=false -Dtests=disabled --prefix=/usr/local --libdir=lib/x86_64-linux-gnu
+    meson install -C build
+    cd .. && rm -rf gst-interpipe /var/lib/apt/lists/*
+_GST_INTERPIPE
+
 COPY . /wolf/
 WORKDIR /wolf
 
@@ -117,6 +137,8 @@ COPY docker/supervisord.conf /etc/supervisord.conf
 ENV GST_PLUGIN_PATH=/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0/
 # Copying out our custom compositor from the build stage
 COPY --from=wolf-builder /usr/local/lib/x86_64-linux-gnu/gstreamer-1.0/* $GST_PLUGIN_PATH
+# The patched gst-interpipe must be the only one GStreamer can find (XERK-2114)
+RUN test "$(find / -xdev -name 'libgstinterpipe.so' | wc -l)" = 1
 
 WORKDIR /wolf
 
