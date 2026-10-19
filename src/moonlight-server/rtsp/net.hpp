@@ -88,7 +88,7 @@ public:
     if (auto host = packet.options.find("Host"); host != packet.options.end()) {
       host_option = host->second;
     }
-    std::optional<std::string> rejected_ip;
+    std::optional<events::StreamSession> rejected;
     for (const events::StreamSession &session : sessions) {
       bool fake_ip_match = session.rtsp_fake_ip == packet.request.uri.ip || host_option == session.rtsp_fake_ip;
       // RTSP is unauthenticated and the fake IP is no secret (e.g. an orchestrator may set it to the pod IP), so
@@ -96,7 +96,7 @@ public:
       // could otherwise read the session's ping payload (and steal its video) or ANNOUNCE before the real client.
       if (!same_ip(session.ip, user_ip)) {
         if (fake_ip_match) {
-          rejected_ip = session.ip;
+          rejected = session;
         }
         continue;
       }
@@ -108,12 +108,12 @@ public:
         return session;
       }
     }
-    if (rejected_ip) {
+    if (rejected) {
       logs::log(logs::warning,
                 "[RTSP] rejecting request for {} from {}, the session belongs to {}",
-                host_option,
+                rejected->rtsp_fake_ip,
                 user_ip,
-                *rejected_ip);
+                rejected->ip);
     }
     return std::nullopt;
   }
