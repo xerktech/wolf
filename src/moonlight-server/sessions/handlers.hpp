@@ -21,9 +21,19 @@ struct AudioServer {
  * The video/audio pipelines of a stream. Each call blocks until its pipeline has ended (on pause, stop, or when a
  * resumed stream supersedes it).
  */
+/**
+ * Runs a stream's pipeline once its client pinged. `stopped` is set by a pause/stop of the stream that may have fired
+ * before the pipeline registered its own handlers: the pipeline must not start once it is set.
+ */
 struct StreamPipelines {
-  std::function<void(const immer::box<events::VideoSession> &, const immer::box<events::RTPVideoPingEvent> &)> video;
-  std::function<void(const immer::box<events::AudioSession> &, const immer::box<events::RTPAudioPingEvent> &)> audio;
+  std::function<void(const immer::box<events::VideoSession> &,
+                     const immer::box<events::RTPVideoPingEvent> &,
+                     const std::shared_ptr<std::atomic_bool> &stopped)>
+      video;
+  std::function<void(const immer::box<events::AudioSession> &,
+                     const immer::box<events::RTPAudioPingEvent> &,
+                     const std::shared_ptr<std::atomic_bool> &stopped)>
+      audio;
 };
 
 /**

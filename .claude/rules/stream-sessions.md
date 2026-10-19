@@ -79,6 +79,16 @@ paths:
   - Tests: `tests/testWolfAPI.cpp` "Sessions API: the listed state follows the stream's events"
     (pause → API start mid-teardown, resume + `EndSupersededStreamEvent`); "Sessions APIs" covers
     the listing only.
+- A stream's pipelines register their own Pause/Stop/EndSuperseded handlers only once the client
+  pinged and the pipeline is built; anything fired earlier would never reach them (XERK-2111).
+  - So `setup_stream_pipeline_handlers` gives each Video/AudioSession a `stopped` flag at once, flipped
+    by those events; the waiter gives up on its ping, and `run_pipeline` checks it after its handlers
+    are registered and before PLAYING. Never check it after PLAYING: ending mid state change is racy.
+  - The flag is per Video/AudioSession, not per instance: an API start after a pause reuses the
+    secret, and the paused waiter must not grab the restart's ping too.
+  - Never register those handlers from inside the Video/AudioSession handler (see event-bus.md).
+  - Tests: `tests/testWolfAPI.cpp` "sessions: a stream ended before its first ping never starts its
+    pipelines"; `tests/testGSTPlugin.cpp` "A pipeline whose stream already ended is never played".
 - The control stream uses Sunshine's V2 encryption when the client enables it in the RTSP ANNOUNCE
   (`x-ss-general.encryptionEnabled`, offered in DESCRIBE); state is `StreamSession::control_stream`.
   - V1 (Nvidia's) only puts seq's low byte in the IV: seq bits 8..31 are not authenticated and

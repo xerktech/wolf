@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <boost/asio.hpp>
 #include <core/gstreamer.hpp>
 #include <core/virtual-display.hpp>
@@ -94,7 +95,8 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
                            std::string client_ip,
                            unsigned short client_port,
                            std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
-                           std::shared_ptr<udp::socket> video_socket);
+                           std::shared_ptr<udp::socket> video_socket,
+                           std::shared_ptr<std::atomic_bool> stopped = nullptr);
 
 void start_streaming_audio(immer::box<events::AudioSession> audio_session,
                            const std::function<std::string()> &producer_name,
@@ -103,10 +105,12 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
                            unsigned short client_port,
                            std::shared_ptr<udp::socket> audio_socket,
                            const std::string &sink_name,
-                           const std::string &server_name);
+                           const std::string &server_name,
+                           std::shared_ptr<std::atomic_bool> stopped = nullptr);
 
 static bool run_pipeline(
     const std::string &pipeline_desc,
+    const std::shared_ptr<std::atomic_bool> &stopped,
     const std::function<immer::array<immer::box<events::EventBusHandlers>>(gstreamer::gst_element_ptr /* pipeline */)>
         &on_pipeline_ready) {
   GError *error = nullptr;
@@ -131,6 +135,17 @@ static bool run_pipeline(
 
   /* Let the calling thread set extra things */
   auto handlers = on_pipeline_ready(pipeline);
+
+  /*
+   * `stopped` is set by a Pause/Stop that may have fired before on_pipeline_ready() registered its handlers.
+   * Checking it only now means any such event is seen by one or the other.
+   * Don't start the pipeline at all rather than ending it mid state change.
+   */
+  if (stopped && stopped->load()) {
+    logs::log(logs::debug, "[GSTREAMER] Stream ended before the pipeline started, not starting it");
+    g_main_context_pop_thread_default(context.get());
+    return true;
+  }
 
   /*
    * adds a watch for new message on our pipeline's message bus to
