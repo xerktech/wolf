@@ -16,6 +16,10 @@ race:libgstwaylanddisplaysrc.so
 # OpenSSL initialises its RNG lazily with atomics TSan can't see: two first RAND_bytes calls at once are reported
 race:libcrypto.so
 
+# Test harness: for the JUnit report Catch2 captures std::clog per test, while detached servers from earlier tests
+# keep logging into it. Only the captured log text is affected.
+race:catch_output_redirect.cpp
+
 # XERK-2101: ENet packets are sent from other threads while the control thread services the same host.
 # A real bug: drop this line with its fix.
 race:control::send_packet

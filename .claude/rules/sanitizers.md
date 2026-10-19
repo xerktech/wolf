@@ -12,6 +12,7 @@ paths:
   red step means races were reported. Grep the log for `WARNING: ThreadSanitizer`.
   - Detached server threads outlive their test, so a report may name a later test. Read the stacks.
 - `tests/tsan-suppressions.txt` (`race:` = any frame of either racing stack, by function/file/library):
+  - Catch2's per-test std::clog capture (JUnit reporter, CI only) races detached servers' logging.
   - Uninstrumented libs (GLib, GStreamer, gst-wayland-display, libcrypto) sync through futexes or
     atomics TSan can't see: hundreds of reports otherwise, all crossing their threads.
   - So Wolf code running on a GStreamer thread (pipeline callbacks, the RTP payloaders) is not covered.
