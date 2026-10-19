@@ -6,10 +6,12 @@ name: Docker build
 
 on:
   push:
-    # Branches only: a tag has no {{branch}}, so the sha tag would be an invalid ":-<sha>".
-    branches: ["**"]
+    # Only the fork's main branch publishes images: PR branches must not push to ghcr.io.
+    # (A tag has no {{branch}}, so the sha tag would be an invalid ":-<sha>".)
+    branches: ["xerktech"]
     paths-ignore:
       - "docs/**"
+  # Manual run on a branch builds :<branch> on purpose (e.g. testing a rebase in fenrir before moving xerktech)
   workflow_dispatch:
 
 concurrency:
