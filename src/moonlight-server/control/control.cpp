@@ -3,6 +3,7 @@
 #include <control/input_handler.hpp>
 #include <events/events.hpp>
 #include <immer/box.hpp>
+#include <mutex>
 #include <state/sessions.hpp>
 #include <stdexcept>
 #include <sys/socket.h>
@@ -24,6 +25,19 @@ void free_host(ENetHost *host) {
 
   enet_host_destroy(host);
 }
+
+/**
+ * ENet isn't thread-safe: enet_peer_send() appends to the lists that enet_host_service() drains. Feedback (rumble,
+ * LEDs) and the StopStreamEvent's termination are sent from other threads, so every ENet call on a control host, except
+ * the socket wait, holds this lock.
+ */
+static std::mutex enet_mutex;
+
+/**
+ * The longest run_control() waits for a client packet outside enet_mutex. ENet's own wait would also wake up for its
+ * retransmit and ping timers, which we can't compute (enet_protocol_compute_wait_timeout is private).
+ */
+constexpr std::chrono::milliseconds max_unlocked_wait = 10ms;
 
 using enet_host = std::unique_ptr<ENetHost, decltype(&free_host)>;
 using enet_packet = std::unique_ptr<ENetPacket, decltype(&enet_packet_destroy)>;
@@ -72,6 +86,9 @@ std::pair<std::string /* ip */, int /* port */> get_ip(const sockaddr *const ip_
   return {std::string{data}, port};
 }
 
+/**
+ * Call with enet_mutex held. Flushes right away: run_control() may be waiting for a client packet.
+ */
 bool send_packet(std::string_view payload, ENetPeer *peer) {
   logs::log(logs::trace, "[ENET] Sending packet");
   auto packet = enet_packet_create(payload.data(), payload.size(), ENET_PACKET_FLAG_RELIABLE);
@@ -80,6 +97,7 @@ bool send_packet(std::string_view payload, ENetPeer *peer) {
     enet_packet_destroy(packet);
     return false;
   }
+  enet_host_flush(peer->host);
   return true;
 }
 
@@ -89,6 +107,7 @@ bool encrypt_and_send(std::string_view payload,
                       immer::box<std::shared_ptr<ENetPeer>> connected_client) {
   if (auto enet_client = connected_client->get()) {
     auto send = [&](control::ControlEncryption mode) {
+      std::lock_guard lock(enet_mutex); // also keeps packets on the wire in send_seq order
       auto encrypted = control::encrypt_packet(aes_key, control_stream->send_seq++, payload, mode);
       return send_packet({(char *)encrypted.get(), encrypted->full_size()}, enet_client);
     };
@@ -248,7 +267,16 @@ void run_control(int port,
       });
 
   while (true) {
-    if (enet_host_service(host.get(), &event, timeout.count()) > 0) {
+    int serviced;
+    {
+      std::lock_guard lock(enet_mutex);
+      serviced = enet_host_service(host.get(), &event, 0);
+    }
+    if (serviced <= 0) {
+      // Wait outside the lock, so that other threads can send meanwhile
+      enet_uint32 condition = ENET_SOCKET_WAIT_RECEIVE;
+      enet_socket_wait(host->socket, &condition, std::min(timeout, max_unlocked_wait).count());
+    } else {
       auto [client_ip, client_port] = get_ip((sockaddr *)&event.peer->address.address);
       auto client_session = get_current_session(connected_clients, running_sessions, client_ip, event);
       if (client_session) {
@@ -271,7 +299,10 @@ void run_control(int port,
             });
             for (auto stale_peer : stale) {
               logs::log(logs::debug, "[ENET] Dropping superseded peer for session: {}", client_session->session_id);
-              enet_peer_disconnect_now(stale_peer, 0);
+              {
+                std::lock_guard lock(enet_mutex);
+                enet_peer_disconnect_now(stale_peer, 0);
+              }
               // Same stream instance reconnecting: its pipelines are the ones this peer is attached to, keep them
               auto stale_session = connected->at(stale_peer);
               if (stale_session->enet_secret_payload != client_session->enet_secret_payload) {
@@ -389,6 +420,7 @@ void run_control(int port,
         }
       } else {
         logs::log(logs::warning, "[ENET] Received packet from unrecognised client {}:{}", client_ip, client_port);
+        std::lock_guard lock(enet_mutex);
         enet_peer_disconnect_now(event.peer, 0);
       }
     }
