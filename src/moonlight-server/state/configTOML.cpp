@@ -571,9 +571,16 @@ template <typename F> static bool update_config_file(const Config &cfg, F &&upda
   }
 }
 
-bool pair(const Config &cfg, const PairedClient &client) {
+bool pair(const Config &cfg, const PairedClient &new_client) {
   std::lock_guard lock(config_file_mutex);
   auto previous_clients = cfg.paired_clients->load();
+  // A re-pair of the same cert keeps the client's settings (they were customised for this client)
+  auto client = new_client;
+  for (const auto &paired_client : *previous_clients) {
+    if (paired_client->client_cert == client.client_cert) {
+      client.settings = paired_client->settings;
+    }
+  }
   // Update CFG
   cfg.paired_clients->update([&client](const PairedClientList &paired_clients) {
     // Removing the client if already present (see: https://github.com/games-on-whales/wolf/issues/211)
