@@ -1671,10 +1671,11 @@ TEST_CASE("Lobbies APIs", "[API]") {
       .event_bus = event_bus,
       .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
       .running_sessions = running_sessions});
-  auto runtime_dir = api_runtime_dir();
   auto socket_path = api_socket_path();
-  // Setup the event bus handlers for the lobbies events
-  auto lobbies_handlers = sessions::setup_lobbies_handlers(app_state, runtime_dir, {});
+  // Setup the event bus handlers for the lobbies events.
+  // gst-wayland-display creates the desktop's socket in $XDG_RUNTIME_DIR: wait for it there. This passed with
+  // api_runtime_dir() only while process runners leaked their XDG_RUNTIME_DIR into the test's own environment.
+  auto lobbies_handlers = sessions::setup_lobbies_handlers(app_state, utils::get_env("XDG_RUNTIME_DIR", "/tmp"), {});
   start_api_server(app_state);
 
   auto curl = curl_ptr(curl_easy_init(), ::curl_easy_cleanup);
@@ -1948,7 +1949,9 @@ TEST_CASE("SSE APIs", "[API]") {
 
   auto queue = std::make_shared<TSQueue<SSEEvent>>();
 
-  std::thread sse_thread(listen_sse, curl.get(), queue, "http://localhost/api/v1/events");
+  // The thread owns the handle: it never returns from curl_easy_perform, so the test must not free it
+  std::thread sse_thread(
+      [curl = std::move(curl), queue]() { listen_sse(curl.get(), queue, "http://localhost/api/v1/events"); });
   sse_thread.detach();
   std::this_thread::sleep_for(std::chrono::milliseconds(42)); // Wait for the SSE client to start
 

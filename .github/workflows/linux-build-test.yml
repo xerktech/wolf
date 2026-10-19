@@ -15,6 +15,8 @@ env:
   # Only read by the ASan leg. allow_user_segv_handler=0: a SIGSEGV handler installed by the code under test (wolf.cpp
   # has one) would otherwise swallow ASan's report. detect_leaks=0: detached server threads leak by design.
   WOLFTESTS_ASAN_OPTIONS: allow_user_segv_handler=0:detect_leaks=0
+  # Only read by the TSan leg. A report doesn't stop the run; the suite then exits 66, failing the step.
+  WOLFTESTS_TSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/tsan-suppressions.txt second_deadlock_stack=1
 
 jobs:
   # Build the Rust-based libgstwaylanddisplay for both architectures
@@ -151,6 +153,20 @@ jobs:
             test_virtual_input: OFF
             test_exceptions: ON
             name: ASan - g++ - STD 20 - Shared false
+          # ThreadSanitizer: unsynchronised access across threads, e.g. API sockets touched off the io_context thread.
+          # tests/tsan-suppressions.txt lists what it ignores and why.
+          - runner: ubuntu-26.04
+            arch: x86_64
+            cxx: g++
+            shared: false
+            std: 20
+            sanitize: thread
+            timeout: 60
+            test_docker: ON
+            test_nvidia: OFF
+            test_virtual_input: OFF
+            test_exceptions: ON
+            name: TSan - g++ - STD 20 - Shared false
 
     steps:
       - uses: actions/checkout@v6
@@ -236,6 +252,7 @@ jobs:
         env:
           # The build runs wolftests --list-tests (catch_discover_tests)
           ASAN_OPTIONS: ${{ env.WOLFTESTS_ASAN_OPTIONS }}
+          TSAN_OPTIONS: ${{ env.WOLFTESTS_TSAN_OPTIONS }}
         run: ninja -j $(nproc) wolftests
 
       - name: Run tests
@@ -247,6 +264,7 @@ jobs:
           RUST_BACKTRACE: FULL
           RUST_LOG: FATAL
           ASAN_OPTIONS: ${{ env.WOLFTESTS_ASAN_OPTIONS }}
+          TSAN_OPTIONS: ${{ env.WOLFTESTS_TSAN_OPTIONS }}
         run: ./wolftests --reporter JUnit::out=${{runner.workspace}}/report.xml --reporter console::out=-::colour-mode=ansi
 
       - name: Test Report
