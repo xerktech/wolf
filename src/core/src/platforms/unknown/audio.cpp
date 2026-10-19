@@ -16,6 +16,14 @@ std::shared_ptr<VSink> create_virtual_sink(const std::shared_ptr<Server> &server
 
 void delete_virtual_sink(const std::shared_ptr<Server> &server, const std::shared_ptr<VSink> &vsink) {}
 
+std::size_t find_leftover_virtual_sinks(const std::shared_ptr<Server> &server,
+                                        std::string_view sink_name_prefix,
+                                        std::chrono::milliseconds timeout) {
+  return 0;
+}
+
+void unload_leftover_virtual_sinks(const std::shared_ptr<Server> &server) {}
+
 bool connected(const std::shared_ptr<Server> &server) {
   return false;
 }

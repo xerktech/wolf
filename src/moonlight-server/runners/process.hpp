@@ -38,7 +38,8 @@ public:
            const immer::array<std::string> &virtual_inputs,
            const immer::array<std::pair<std::string, std::string>> &paths,
            const immer::map<std::string, std::string> &env_variables,
-           std::string_view render_node) override;
+           std::string_view render_node,
+           const std::function<bool()> &is_stopped) override;
 
   events::RunnerTypes serialize() const override {
     return wolf::config::AppCMD{.run_cmd = run_cmd};

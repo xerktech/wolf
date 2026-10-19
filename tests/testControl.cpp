@@ -5,6 +5,7 @@
 
 using Catch::Matchers::Equals;
 
+#include <algorithm>
 #include <array>
 #include <control/control.hpp>
 #include <control/input_handler.hpp>
@@ -13,6 +14,7 @@ using Catch::Matchers::Equals;
 #include <immer/vector_transient.hpp>
 #include <moonlight/control.hpp>
 #include <mutex>
+#include <sessions/handlers.hpp>
 #include <set>
 #include <state/sessions.hpp>
 #include <streaming/streaming.hpp>
@@ -175,6 +177,14 @@ TEST_CASE("Control replay window", "CONTROL") {
     REQUIRE(accept_seq(window, UINT32_MAX - 1));
   }
 
+  SECTION("seq doesn't wrap around") {
+    // Past UINT32_MAX the client would reuse seq 0.. and so the GCM nonces of its first packets under the same key:
+    // accepting them would also accept a replay of those packets. The stream needs a /resume (new key) by then.
+    auto window = accept_all({UINT32_MAX - 1, UINT32_MAX});
+    REQUIRE_FALSE(accept_seq(window, 0));
+    REQUIRE_FALSE(accept_seq(window, 1));
+  }
+
   SECTION("the low byte repeats every 256 packets, the full seq doesn't") {
     auto window = accept_all({1});
     REQUIRE(accept_seq(window, 257));
@@ -296,6 +306,10 @@ struct TestENetClient {
     send_encrypted(aes_key, seq, {(char *)&pkt, sizeof(pkt)}, encryption);
   }
 
+  void disconnect() {
+    enet_peer_disconnect(peer, 0);
+  }
+
   ~TestENetClient() {
     enet_host_destroy(host);
   }
@@ -382,7 +396,7 @@ TEST_CASE("control: a dead client's late pause doesn't end its resumed stream", 
   event_bus->fire_event(
       immer::box<wolf::core::events::StopStreamEvent>(wolf::core::events::StopStreamEvent{.session_id = 42}));
   resumed_client.service(200ms);
-  REQUIRE(resumed_client.received == 1);
+  REQUIRE(resumed_client.received == 2); // in both modes: no packet of this stream has authenticated yet
 
   // A real pause from the current client still goes through
   resumed_client.send_termination(new_key);
@@ -403,6 +417,215 @@ TEST_CASE("control: a dead client's late pause doesn't end its resumed stream", 
   reconnected_client.service(200ms);
   REQUIRE(pauses == 1);
   REQUIRE(ended() == std::vector<char>{1, 1});
+}
+
+TEST_CASE("control: a peer matched only by IP can't take over a live stream", "[ENET]") {
+  using wolf::core::events::StreamSession;
+  constexpr int port = 47996;
+  StreamSession session{.session_id = 42};
+  session.enet_secret_payload = 1;
+  session.aes_key = "EDF04A215C4FBEA20934120C8480D855";
+  session.ip = "127.0.0.1"; // the IP fallback matches anyone connecting over loopback
+
+  auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
+  std::atomic<int> pauses = 0, resumes = 0;
+  auto pause_handler = event_bus->register_handler<immer::box<wolf::core::events::PauseStreamEvent>>(
+      [&pauses](const immer::box<wolf::core::events::PauseStreamEvent> &ev) { pauses++; });
+  auto resume_handler = event_bus->register_handler<immer::box<wolf::core::events::ResumeStreamEvent>>(
+      [&resumes](const immer::box<wolf::core::events::ResumeStreamEvent> &ev) { resumes++; });
+  state::SessionsAtoms running_sessions =
+      std::make_shared<immer::atom<immer::vector<StreamSession>>>(immer::vector{session});
+
+  REQUIRE(control::init());
+  std::thread([=] { control::run_control(port, running_sessions, event_bus, 20, 10ms, "127.0.0.1"); }).detach();
+  std::this_thread::sleep_for(200ms);
+
+  TestENetClient live_client(port, 1);
+  live_client.service(100ms);
+  REQUIRE(resumes == 1);
+
+  // Same IP (e.g. behind the same NAT), unknown secret: refused, the live peer stays connected
+  TestENetClient intruder(port, 99);
+  intruder.service(200ms);
+  live_client.service(200ms);
+  REQUIRE(intruder.disconnected);
+  REQUIRE_FALSE(live_client.disconnected);
+  REQUIRE(resumes == 1);
+  REQUIRE(pauses == 0);
+
+  // Once the live peer is gone, the fallback still lets a client that doesn't send the secret (legacy) connect
+  live_client.disconnect();
+  live_client.service(200ms);
+  REQUIRE(pauses == 1);
+  TestENetClient legacy_client(port, 0);
+  legacy_client.service(200ms);
+  REQUIRE_FALSE(legacy_client.disconnected);
+  REQUIRE(resumes == 2);
+
+  // The legacy client crashes and /resumes while its dead peer is still listed: that peer belongs to the stream
+  // instance the resume replaced, so the fallback lets the client's new connection in, and it supersedes the dead one
+  auto resumed = session;
+  resumed.enet_secret_payload = 2;
+  resumed.aes_key = "00112233445566778899AABBCCDDEEFF";
+  running_sessions->store(immer::vector{resumed});
+  TestENetClient resumed_client(port, 0);
+  resumed_client.service(200ms);
+  legacy_client.service(200ms);
+  REQUIRE_FALSE(resumed_client.disconnected);
+  REQUIRE(legacy_client.disconnected);
+  REQUIRE(resumes == 3);
+
+  // ...and the resumed stream's live peer is protected like the first one was
+  TestENetClient second_intruder(port, 99);
+  second_intruder.service(200ms);
+  resumed_client.service(200ms);
+  REQUIRE(second_intruder.disconnected);
+  REQUIRE_FALSE(resumed_client.disconnected);
+}
+
+TEST_CASE("control: joypad feedback reaches the resumed stream's client", "[ENET]") {
+  using wolf::core::events::StreamSession;
+  constexpr int port = 47995;
+  const std::string old_key = "EDF04A215C4FBEA20934120C8480D855", new_key = "00112233445566778899AABBCCDDEEFF";
+  auto make_session = [](std::uint32_t enet_secret, const std::string &aes_key) {
+    StreamSession session{.session_id = 42};
+    session.enet_secret_payload = enet_secret;
+    session.aes_key = aes_key;
+    session.ip = "10.255.255.1"; // never matches loopback, keep the IP fallback out of the way
+    return session;
+  };
+  // What a joypad's rumble callback does (see create_new_joypad)
+  auto rumble = [](const StreamSession &session, std::string_view plaintext) {
+    if (auto feedback = session.control_feedback->load(); feedback->send) {
+      feedback->send(plaintext);
+    }
+  };
+  auto decrypt = [](const std::string &packet, const std::string &key) {
+    return decrypt_packet(*(ControlEncryptedPacket *)packet.data(),
+                          key,
+                          ControlEncryption::V1,
+                          ControlPacketOrigin::HOST);
+  };
+
+  auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
+  auto first = make_session(1, old_key);
+  state::SessionsAtoms running_sessions =
+      std::make_shared<immer::atom<immer::vector<StreamSession>>>(immer::vector{first});
+
+  REQUIRE(control::init());
+  std::thread([=] { control::run_control(port, running_sessions, event_bus, 20, 10ms, "127.0.0.1"); }).detach();
+  std::this_thread::sleep_for(200ms);
+
+  TestENetClient first_client(port, 1);
+  first_client.service(100ms);
+  // A first authenticated packet fixes the mode, so that what Wolf sends goes out once (not in both modes)
+  first_client.send_idr(old_key, 0, ControlEncryption::V1);
+  first_client.service(100ms);
+  rumble(first, "rumble 1");
+  first_client.service(200ms);
+  REQUIRE(first_client.received_packets.size() == 1);
+  REQUIRE_THAT(decrypt(first_client.received_packets[0], old_key), Equals("rumble 1"));
+
+  // /resume carries the joypads over to a new stream instance with a new key and, once it connects, a new peer
+  auto resumed = make_session(2, new_key);
+  resumed.joypads = first.joypads;
+  resumed.control_feedback = first.control_feedback;
+  running_sessions->store(immer::vector{resumed});
+  TestENetClient resumed_client(port, 2);
+  resumed_client.service(100ms);
+  resumed_client.send_idr(new_key, 0, ControlEncryption::V1);
+  resumed_client.service(100ms);
+
+  rumble(first, "rumble 2"); // the joypad still holds what it captured when it was created
+  resumed_client.service(200ms);
+  first_client.service(100ms);
+  REQUIRE(first_client.received_packets.size() == 1);
+  REQUIRE(resumed_client.received_packets.size() == 1);
+  REQUIRE_THAT(decrypt(resumed_client.received_packets[0], new_key), Equals("rumble 2"));
+
+  // Once the client disconnects there's nowhere to send it
+  resumed_client.disconnect();
+  resumed_client.service(200ms);
+  REQUIRE_FALSE(resumed.control_feedback->load()->send);
+}
+
+TEST_CASE("control: the first packet that authenticates fixes the encryption mode", "[ENET]") {
+  using wolf::core::events::StreamSession;
+  constexpr int port = 47994;
+  const std::string key = "EDF04A215C4FBEA20934120C8480D855", wrong_key = "00112233445566778899AABBCCDDEEFF";
+  // Two streams whose (unauthenticated) RTSP ANNOUNCE got the client's mode wrong, e.g. a spoofed one won the race
+  auto make_session = [&](std::size_t id, ControlEncryption announced) {
+    StreamSession session{.session_id = id};
+    session.enet_secret_payload = id;
+    session.aes_key = key;
+    session.ip = "10.255.255.1"; // never matches loopback, keep the IP fallback out of the way
+    REQUIRE(session.control_stream->announce_encryption(announced));
+    return session;
+  };
+  auto v2_stream = make_session(1, ControlEncryption::V1), v1_stream = make_session(2, ControlEncryption::V2);
+
+  auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
+  std::mutex idr_mutex;
+  std::vector<std::size_t> idr_sessions;
+  auto idr_handler = event_bus->register_handler<immer::box<wolf::core::events::IDRRequestEvent>>(
+      [&](const immer::box<wolf::core::events::IDRRequestEvent> &ev) {
+        std::lock_guard lock(idr_mutex);
+        idr_sessions.push_back(ev->session_id);
+      });
+  auto idrs = [&]() {
+    std::lock_guard lock(idr_mutex);
+    return idr_sessions;
+  };
+  state::SessionsAtoms running_sessions =
+      std::make_shared<immer::atom<immer::vector<StreamSession>>>(immer::vector{v2_stream, v1_stream});
+
+  REQUIRE(control::init());
+  std::thread([=] { control::run_control(port, running_sessions, event_bus, 20, 10ms, "127.0.0.1"); }).detach();
+  std::this_thread::sleep_for(200ms);
+
+  TestENetClient v2_client(port, 1), v1_client(port, 2);
+  v2_client.service(100ms);
+  v1_client.service(100ms);
+
+  // Until a packet authenticates, what Wolf sends goes out in both modes: a wrong hint mustn't hide e.g. a stop
+  event_bus->fire_event(
+      immer::box<wolf::core::events::StopStreamEvent>(wolf::core::events::StopStreamEvent{.session_id = 1}));
+  v2_client.service(200ms);
+  REQUIRE(v2_client.received_packets.size() == 2);
+  auto decrypts_as_v2 = [&](const std::string &packet) {
+    try {
+      decrypt_packet(*(ControlEncryptedPacket *)packet.data(), key, ControlEncryption::V2, ControlPacketOrigin::HOST);
+      return true;
+    } catch (const std::runtime_error &) {
+      return false;
+    }
+  };
+  REQUIRE(std::ranges::count_if(v2_client.received_packets, decrypts_as_v2) == 1);
+
+  // A packet that doesn't authenticate under the session key decides nothing
+  v2_client.send_idr(wrong_key, 0, ControlEncryption::V2);
+  v2_client.service(200ms);
+  REQUIRE(idrs().empty());
+  REQUIRE_FALSE(v2_stream.control_stream->encryption_negotiated);
+
+  // Each client's first genuine packet gets through and fixes its stream's mode, whatever the ANNOUNCE said
+  v2_client.send_idr(key, 1, ControlEncryption::V2);
+  v2_client.service(200ms);
+  v1_client.send_idr(key, 0, ControlEncryption::V1);
+  v1_client.service(200ms);
+  REQUIRE(idrs() == std::vector<std::size_t>{1, 2});
+  REQUIRE(v2_stream.control_stream->encryption_negotiated);
+  REQUIRE(*v2_stream.control_stream->encryption.load() == ControlEncryption::V2);
+  REQUIRE(*v1_stream.control_stream->encryption.load() == ControlEncryption::V1);
+
+  // From then on: a later (spoofed) ANNOUNCE is ignored, and a packet in the other mode doesn't decrypt
+  REQUIRE_FALSE(v2_stream.control_stream->announce_encryption(ControlEncryption::V1));
+  REQUIRE(*v2_stream.control_stream->encryption.load() == ControlEncryption::V2);
+  v2_client.send_idr(key, 2, ControlEncryption::V1);
+  v2_client.service(200ms);
+  v2_client.send_idr(key, 3, ControlEncryption::V2);
+  v2_client.service(200ms);
+  REQUIRE(idrs() == std::vector<std::size_t>{1, 2, 1});
 }
 
 TEST_CASE("streaming: a superseded stream instance ends only its own pipelines", "[GSTREAMER]") {
@@ -1032,6 +1255,129 @@ TEST_CASE("control: a replayed encrypted packet is dropped", "[ENET]") {
   v1_client.send_idr(old_key, 7, ControlEncryption::V1);
   v1_client.service(200ms);
   REQUIRE(idr_requests == 7);
+}
+
+TEST_CASE("control: a port that's already taken throws instead of crashing", "[ENET]") {
+  boost::asio::io_context io;
+  // Port 0: the kernel picks a free one, which this socket then holds
+  boost::asio::ip::udp::socket taken(io, boost::asio::ip::udp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+  auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<wolf::core::events::StreamSession>>>();
+  REQUIRE(control::init());
+  REQUIRE_THROWS(
+      control::run_control(taken.local_endpoint().port(), running_sessions, event_bus, 20, 10ms, "127.0.0.1"));
+}
+
+/*
+ * The pipelines Wolf itself starts for a Moonlight stream (setup_moonlight_handlers) must resolve their producer with
+ * the session's lobby: a stream whose session joined a lobby before its pipelines started (e.g. a /resume) shows the
+ * lobby, not the session's own app (XERK-2045). Only gst-interpipe tells the two apart, hence the real pipelines.
+ */
+TEST_CASE("sessions: Moonlight's pipelines start on the lobby their session joined", "[GSTREAMER]") {
+  using namespace wolf::core;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  boost::asio::io_context io;
+
+  // Live producers, each sending datagrams of its own size: the session's own app, and the lobby it joined
+  auto start_producer = [](const std::string &name, int size, int samples) {
+    auto producer = gst_parse_launch(
+        fmt::format("videotestsrc is-live=true ! video/x-raw,format=I420,width={0},height={0} ! "
+                    "interpipesink name={2}_video sync=false "
+                    "audiotestsrc is-live=true samplesperbuffer={1} ! audio/x-raw,format=S16LE,channels=1,rate=48000 ! "
+                    "interpipesink name={2}_audio sync=false",
+                    size,
+                    samples,
+                    name)
+            .c_str(),
+        nullptr);
+    REQUIRE(producer);
+    gst_element_set_state(producer, GST_STATE_PLAYING);
+    return producer;
+  };
+  auto own = start_producer("42_cafe", 16, 100), lobby_producer = start_producer("some-lobby", 32, 300);
+
+  events::StreamSession session{.event_bus = event_bus, .session_id = 42};
+  session.producer_name = "42_cafe";
+  events::Lobby lobby{.id = "some-lobby"};
+  lobby.connected_sessions->store(immer::vector<immer::box<std::string>>{immer::box<std::string>{"42"}});
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>(immer::vector{session});
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions)),
+      .host = immer::box<state::Host>(state::Host{}),
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(immer::vector{lobby}),
+      .running_sessions = running_sessions});
+  auto handlers = sessions::setup_moonlight_handlers(app_state, "/tmp", {});
+
+  std::array<char, 16> secret{9};
+  events::VideoSession video{.gst_pipeline = "interpipesrc name=interpipesrc_{session_id}_video "
+                                             "listen-to={session_id}_video is-live=true ! "
+                                             "appsink name=wolf_udp_sink sync=false",
+                             .session_id = 42};
+  video.display_mode = {.width = 16, .height = 16, .refreshRate = 30};
+  video.bitrate_kbps = 1000;
+  video.packet_size = 1024;
+  video.rtp_secret_payload = secret;
+  events::AudioSession audio{.gst_pipeline = "interpipesrc name=interpipesrc_{session_id}_audio "
+                                             "listen-to={session_id}_audio is-live=true ! "
+                                             "appsink name=wolf_udp_sink sync=false",
+                             .session_id = 42};
+  audio.rtp_secret_payload = secret;
+  event_bus->fire_event(immer::box<events::VideoSession>(video));
+  event_bus->fire_event(immer::box<events::AudioSession>(audio));
+
+  auto client = [&] {
+    auto socket = std::make_shared<boost::asio::ip::udp::socket>(
+        io,
+        boost::asio::ip::udp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+    socket->non_blocking(true);
+    return socket;
+  };
+  // The sizes of the datagrams that reach `socket` over the next 500 ms
+  auto received = [](const std::shared_ptr<boost::asio::ip::udp::socket> &socket) {
+    std::array<char, 65536> buf{};
+    std::set<std::size_t> sizes;
+    for (auto until = std::chrono::steady_clock::now() + 500ms; std::chrono::steady_clock::now() < until;) {
+      boost::system::error_code ec;
+      if (auto size = socket->receive(boost::asio::buffer(buf), 0, ec); size > 0) {
+        sizes.insert(size);
+      } else {
+        std::this_thread::sleep_for(5ms);
+      }
+    }
+    return sizes;
+  };
+  auto video_client = client(), audio_client = client();
+  auto send_socket = std::make_shared<boost::asio::ip::udp::socket>(io, boost::asio::ip::udp::v4());
+  // The client's first pings start the pipelines; repeat them until the pipelines' threads are waiting for them
+  for (int i = 0; i < 20; i++) {
+    event_bus->fire_event(immer::box<events::RTPVideoPingEvent>(
+        events::RTPVideoPingEvent{.client_ip = "127.0.0.1",
+                                  .client_port = video_client->local_endpoint().port(),
+                                  .video_socket = send_socket,
+                                  .payload = secret}));
+    event_bus->fire_event(immer::box<events::RTPAudioPingEvent>(
+        events::RTPAudioPingEvent{.client_ip = "127.0.0.1",
+                                  .client_port = audio_client->local_endpoint().port(),
+                                  .audio_socket = send_socket,
+                                  .payload = secret}));
+    std::this_thread::sleep_for(50ms);
+  }
+  std::this_thread::sleep_for(500ms);
+  received(video_client);
+  received(audio_client);
+
+  CHECK(received(video_client) == std::set<std::size_t>{32 * 32 * 3 / 2});
+  CHECK(received(audio_client) == std::set<std::size_t>{300 * 2});
+
+  event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = 42}));
+  std::this_thread::sleep_for(500ms);
+  for (auto pipeline : {own, lobby_producer}) {
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+  }
 }
 
 TEST_CASE("control: a connecting peer's session lookup racing session updates", "[ENET]") {

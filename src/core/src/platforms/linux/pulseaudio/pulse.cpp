@@ -1,7 +1,9 @@
 #include <core/audio.hpp>
 #include <helpers/logger.hpp>
+#include <map>
 #include <memory>
 #include <pulse/pulseaudio.h>
+#include <pulse/rtclock.h>
 #include <vector>
 
 namespace fmt {
@@ -68,6 +70,9 @@ struct Server {
   bool ready_set = false;
   // Operations queued while still connecting; run by the state callback once READY. Guarded by the mainloop lock.
   std::vector<std::function<void()>> pending_ops;
+  // Sinks a Wolf that crashed left behind (sink name -> module index), see find_leftover_virtual_sinks().
+  // Guarded by the mainloop lock.
+  std::map<std::string, uint32_t> leftovers;
 };
 
 /**
@@ -179,6 +184,23 @@ void queue_op(const std::shared_ptr<Server> &server, const std::function<void()>
 }
 
 /**
+ * `ref` is owned by `op`'s result callback, which deletes it. When the connection fails or closes while the request is
+ * pending, libpulse cancels the operation without ever calling that callback: release `ref` then instead, or it leaks
+ * (and anything waiting on what it holds, like a promise, is never woken up).
+ * Must be called with the mainloop lock held, right after the request was sent.
+ */
+template <typename T> static void release_if_cancelled(pa_operation *op, std::shared_ptr<T> *ref) {
+  pa_operation_set_state_callback(
+      op,
+      [](pa_operation *o, void *data) {
+        if (pa_operation_get_state(o) == PA_OPERATION_CANCELLED) {
+          delete static_cast<std::shared_ptr<T> *>(data);
+        }
+      },
+      ref);
+}
+
+/**
  * Must be called with the mainloop lock held; doesn't wait for the module to be unloaded.
  */
 static void unload_sink(pa_context *ctx, uint32_t sink_idx) {
@@ -198,39 +220,139 @@ static void unload_sink(pa_context *ctx, uint32_t sink_idx) {
   }
 }
 
+/**
+ * Must be called with the mainloop lock held.
+ */
+static void
+load_sink(const std::shared_ptr<Server> &server, const std::shared_ptr<VSink> &vsink, const std::string &channel_spec) {
+  auto vsink_ref = new std::shared_ptr<VSink>(vsink); // released by the callback below
+  auto operation = pa_context_load_module(
+      server->ctx,
+      "module-null-sink",
+      channel_spec.c_str(),
+      [](pa_context *c, uint32_t idx, void *data) {
+        // Owns a reference: delete_virtual_sink() no longer waits for this callback, so the session may already
+        // have dropped its last reference to the VSink by the time PulseAudio replies.
+        std::unique_ptr<std::shared_ptr<VSink>> result((std::shared_ptr<VSink> *)data);
+        logs::log(logs::debug, "[PULSE] Created virtual sink: {}", idx);
+        (*result)->sink_idx.set_value(idx);
+        if ((*result)->unload_on_load) { // delete_virtual_sink() ran before the module was loaded
+          unload_sink(c, idx);
+        }
+      },
+      vsink_ref);
+  if (operation) {
+    release_if_cancelled(operation, vsink_ref);
+    pa_operation_unref(operation);
+  } else { // The callback will never run
+    logs::log(logs::warning, "[PULSE] Unable to create virtual sink: {}", pa_strerror(pa_context_errno(server->ctx)));
+    delete vsink_ref;
+  }
+}
+
+/**
+ * A new sink waiting for a leftover of the same name to be gone, see create_virtual_sink().
+ */
+struct Reclaim {
+  std::shared_ptr<Server> server;
+  std::shared_ptr<VSink> vsink;
+  std::string sink_name;
+  std::string channel_spec;
+  int checks = 0;
+  bool name_taken = false;
+};
+
+constexpr int RECLAIM_MAX_CHECKS = 100;             // ~1 s
+constexpr pa_usec_t RECLAIM_CHECK_INTERVAL = 10000; // 10 ms
+
+/**
+ * Loads the reclaim's sink once no sink has its name any more, checking every RECLAIM_CHECK_INTERVAL; after
+ * RECLAIM_MAX_CHECKS, loads it anyway (as "<name>.2"). Must be called with the mainloop lock held.
+ */
+static void load_when_name_free(const std::shared_ptr<Reclaim> &reclaim) {
+  auto load = [](const std::shared_ptr<Reclaim> &reclaim) {
+    load_sink(reclaim->server, reclaim->vsink, reclaim->channel_spec);
+  };
+  reclaim->name_taken = false;
+  auto reclaim_ref = new std::shared_ptr<Reclaim>(reclaim); // released at eol
+  auto operation = pa_context_get_sink_info_by_name(
+      reclaim->server->ctx,
+      reclaim->sink_name.c_str(),
+      [](pa_context *c, const pa_sink_info *info, int eol, void *data) {
+        auto reclaim = static_cast<std::shared_ptr<Reclaim> *>(data);
+        if (!eol) { // the sink is still there
+          (*reclaim)->name_taken = true;
+          return;
+        }
+        std::unique_ptr<std::shared_ptr<Reclaim>> owned(reclaim); // eol is the last call, also on "no such entity"
+        if (!(*owned)->name_taken) {
+          load_sink((*owned)->server, (*owned)->vsink, (*owned)->channel_spec);
+        } else if (++(*owned)->checks >= RECLAIM_MAX_CHECKS) {
+          logs::log(logs::warning,
+                    "[PULSE] Leftover sink {} is still there, creating the new one anyway",
+                    (*owned)->sink_name);
+          load_sink((*owned)->server, (*owned)->vsink, (*owned)->channel_spec);
+        } else { // check again in a moment
+          pa_context_rttime_new(
+              c,
+              pa_rtclock_now() + RECLAIM_CHECK_INTERVAL,
+              [](pa_mainloop_api *api, pa_time_event *event, const struct timeval *, void *data) {
+                api->time_free(event);
+                std::unique_ptr<std::shared_ptr<Reclaim>> reclaim((std::shared_ptr<Reclaim> *)data);
+                load_when_name_free(*reclaim);
+              },
+              new std::shared_ptr<Reclaim>(*owned));
+        }
+      },
+      reclaim_ref);
+  if (operation) {
+    release_if_cancelled(operation, reclaim_ref);
+    pa_operation_unref(operation);
+  } else { // The callback will never run: the connection is gone, this load fails (and logs) too
+    delete reclaim_ref;
+    load(reclaim);
+  }
+}
+
 std::shared_ptr<VSink> create_virtual_sink(const std::shared_ptr<Server> &server, const AudioDevice &device) {
 
   auto vsink = std::make_shared<VSink>();
   vsink->device = device;
 
-  queue_op(server, [server, vsink]() {
-    auto device = vsink->device;
-    auto channel_spec = fmt::format("rate={} sink_name={} channels={} channel_map={}",
-                                    device.mode.sample_rate,
-                                    device.sink_name,
-                                    device.mode.channels,
-                                    fmt::join(device.mode.speakers, ","));
-    auto vsink_ref = new std::shared_ptr<VSink>(vsink); // released by the callback below
-    auto operation = pa_context_load_module(
+  // Formatted now: device.sink_name is a view of the caller's string, which is gone by the time a queued op runs
+  auto channel_spec = fmt::format("rate={} sink_name={} channels={} channel_map={}",
+                                  device.mode.sample_rate,
+                                  device.sink_name,
+                                  device.mode.channels,
+                                  fmt::join(device.mode.speakers, ","));
+  queue_op(server, [server, vsink, channel_spec, sink_name = std::string(device.sink_name)]() {
+    auto leftover = server->leftovers.find(sink_name);
+    if (leftover == server->leftovers.end()) {
+      load_sink(server, vsink, channel_spec);
+      return;
+    }
+    // A Wolf that crashed left a sink of this very name (session ids are stable across restarts). The app and Wolf's
+    // pulsesrc attach to the sink by name, so it must go first: loaded while the name is taken, the new one would be
+    // "<name>.2". PulseAudio acks the unload before the module is actually gone, so load only once the name is free.
+    auto module = leftover->second;
+    server->leftovers.erase(leftover);
+    logs::log(logs::info, "[PULSE] Replacing leftover virtual sink: {} (module {})", sink_name, module);
+    auto pending_ref = new std::shared_ptr<Reclaim>(std::make_shared<Reclaim>(
+        Reclaim{.server = server, .vsink = vsink, .sink_name = sink_name, .channel_spec = channel_spec}));
+    auto operation = pa_context_unload_module(
         server->ctx,
-        "module-null-sink",
-        channel_spec.c_str(),
-        [](pa_context *c, uint32_t idx, void *data) {
-          // Owns a reference: delete_virtual_sink() no longer waits for this callback, so the session may already
-          // have dropped its last reference to the VSink by the time PulseAudio replies.
-          std::unique_ptr<std::shared_ptr<VSink>> result((std::shared_ptr<VSink> *)data);
-          logs::log(logs::debug, "[PULSE] Created virtual sink: {}", idx);
-          (*result)->sink_idx.set_value(idx);
-          if ((*result)->unload_on_load) { // delete_virtual_sink() ran before the module was loaded
-            unload_sink(c, idx);
-          }
+        module,
+        [](pa_context *, int, void *data) {
+          std::unique_ptr<std::shared_ptr<Reclaim>> pending((std::shared_ptr<Reclaim> *)data);
+          load_when_name_free(*pending);
         },
-        vsink_ref);
+        pending_ref);
     if (operation) {
+      release_if_cancelled(operation, pending_ref);
       pa_operation_unref(operation);
     } else { // The callback will never run
-      logs::log(logs::warning, "[PULSE] Unable to create virtual sink: {}", pa_strerror(pa_context_errno(server->ctx)));
-      delete vsink_ref;
+      delete pending_ref;
+      load_sink(server, vsink, channel_spec);
     }
   });
 
@@ -253,6 +375,77 @@ void delete_virtual_sink(const std::shared_ptr<Server> &server, const std::share
   });
 }
 
+/**
+ * The sink_name=<name> argument of a module-null-sink as create_virtual_sink() loads it, or "" if it has none.
+ */
+static std::string_view null_sink_name(std::string_view module_args) {
+  constexpr std::string_view key = "sink_name=";
+  for (auto pos = module_args.find(key); pos != std::string_view::npos; pos = module_args.find(key, pos + 1)) {
+    if (pos == 0 || module_args[pos - 1] == ' ') {
+      auto value = module_args.substr(pos + key.size());
+      return value.substr(0, value.find(' '));
+    }
+  }
+  return {};
+}
+
+std::size_t find_leftover_virtual_sinks(const std::shared_ptr<Server> &server,
+                                        std::string_view sink_name_prefix,
+                                        std::chrono::milliseconds timeout) {
+  struct Request {
+    std::shared_ptr<Server> server;
+    std::string prefix;
+    std::size_t found = 0;
+    boost::promise<std::size_t> done; // broken (destroyed unset) if the request is dropped or cancelled
+  };
+  auto request = std::make_shared<Request>(Request{.server = server, .prefix = std::string(sink_name_prefix)});
+  auto result = request->done.get_future();
+  queue_op(server, [server, request = std::move(request)]() {
+    auto request_ref = new std::shared_ptr<Request>(request); // released at eol
+    auto operation = pa_context_get_module_info_list(
+        server->ctx,
+        [](pa_context *c, const pa_module_info *info, int eol, void *data) {
+          auto request = static_cast<std::shared_ptr<Request> *>(data);
+          if (eol) { // the last call, also on error
+            (*request)->done.set_value((*request)->found);
+            delete request;
+            return;
+          }
+          if (info && info->name && info->argument && std::string_view(info->name) == "module-null-sink" &&
+              null_sink_name(info->argument).starts_with((*request)->prefix)) {
+            auto sink_name = std::string(null_sink_name(info->argument));
+            logs::log(logs::info, "[PULSE] Found leftover virtual sink: {} (module {})", sink_name, info->index);
+            (*request)->server->leftovers[sink_name] = info->index; // runs on the mainloop thread: lock held
+            (*request)->found++;
+          }
+        },
+        request_ref);
+    if (operation) {
+      release_if_cancelled(operation, request_ref);
+      pa_operation_unref(operation);
+    } else { // The callback will never run
+      delete request_ref;
+    }
+  });
+  if (result.wait_for(boost::chrono::milliseconds(timeout.count())) == boost::future_status::ready) {
+    try {
+      return result.get();
+    } catch (const std::exception &) { // broken promise: the connection went away first
+    }
+  }
+  return 0;
+}
+
+void unload_leftover_virtual_sinks(const std::shared_ptr<Server> &server) {
+  queue_op(server, [server]() {
+    for (const auto &[sink_name, module] : server->leftovers) {
+      logs::log(logs::info, "[PULSE] Removing leftover virtual sink: {} (module {})", sink_name, module);
+      unload_sink(server->ctx, module);
+    }
+    server->leftovers.clear();
+  });
+}
+
 bool flush(const std::shared_ptr<Server> &server, std::chrono::milliseconds timeout) {
   auto done = std::make_shared<boost::promise<void>>();
   auto done_fut = done->get_future();
@@ -269,6 +462,7 @@ bool flush(const std::shared_ptr<Server> &server, std::chrono::milliseconds time
         },
         done_ref);
     if (operation) {
+      release_if_cancelled(operation, done_ref); // breaks the promise, so a dying server doesn't wait out the timeout
       pa_operation_unref(operation);
     } else { // The callback will never run
       delete done_ref;

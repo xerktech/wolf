@@ -1,5 +1,6 @@
 #pragma once
 
+#include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
 #include <helpers/logger.hpp>
 
@@ -42,17 +43,64 @@ static void send_message(GstElement *recipient, GstStructure *message) {
 }
 
 /**
+ * Like send_message, from GStreamer's own thread pool: returns immediately (see send_eos_async).
+ */
+static void send_message_async(GstElement *recipient, GstStructure *message) {
+  if (!recipient) {
+    gst_structure_free(message);
+    return;
+  }
+  gst_element_call_async(
+      recipient,
+      [](GstElement *element, gpointer message) { send_message(element, static_cast<GstStructure *>(message)); },
+      message,
+      nullptr);
+}
+
+/**
  * Sends EOS to the pipeline from GStreamer's own thread pool and returns immediately.
  *
  * A synchronous gst_element_send_event(EOS) blocks on the source's streaming lock, so a stuck
  * streaming thread hangs the caller too. Event-bus handlers run while the bus holds its lock,
  * which means a blocked handler stalls every register/unregister in the whole server.
  * gst_element_call_async keeps a ref on the element until the call has run.
+ *
+ * The EOS goes to each source, not to the pipeline: sending it to a bin holds the bin's STATE_LOCK
+ * until the sources have taken it, and a pipeline still prerolling needs that lock to finish its
+ * state change, so a stop during preroll would deadlock the pipeline forever.
+ *
+ * An appsrc (interpipesrc is one) gets gst_app_src_end_of_stream instead: an EOS event only reaches
+ * its streaming thread with the next buffer, so a consumer whose producer never sends one (an app
+ * without an audio server) would never end.
  */
 static void send_eos_async(GstElement *pipeline) {
   gst_element_call_async(
       pipeline,
-      [](GstElement *element, gpointer) { gst_element_send_event(element, gst_event_new_eos()); },
+      [](GstElement *element, gpointer) {
+        if (!GST_IS_BIN(element)) {
+          gst_element_send_event(element, gst_event_new_eos());
+          return;
+        }
+        GstIterator *sources = gst_bin_iterate_sources(GST_BIN(element));
+        GValue source = G_VALUE_INIT;
+        bool sent = false;
+        // A source added mid-iteration (GST_ITERATOR_RESYNC) is ignored: Wolf's pipelines are static
+        while (gst_iterator_next(sources, &source) == GST_ITERATOR_OK) {
+          auto src = GST_ELEMENT(g_value_get_object(&source));
+          if (GST_IS_APP_SRC(src)) {
+            gst_app_src_end_of_stream(GST_APP_SRC(src));
+          } else {
+            gst_element_send_event(src, gst_event_new_eos());
+          }
+          sent = true;
+          g_value_reset(&source);
+        }
+        g_value_unset(&source);
+        gst_iterator_free(sources);
+        if (!sent) {
+          gst_element_send_event(element, gst_event_new_eos());
+        }
+      },
       nullptr,
       nullptr);
 }

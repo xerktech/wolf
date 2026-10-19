@@ -226,11 +226,12 @@ public:
    */
   void send_message(const rtsp::RTSP_PACKET &response,
                     const std::function<void(int /* bytes_transferred */)> &on_sent) {
-    auto raw_response = rtsp::to_string(response);
-    logs::log(logs::trace, "[RTSP] sending reply: \n{}", raw_response);
+    // async_write returns before the bytes are sent: the handler owns the buffer until it's done
+    auto raw_response = std::make_shared<std::string>(rtsp::to_string(response));
+    logs::log(logs::trace, "[RTSP] sending reply: \n{}", *raw_response);
     boost::asio::async_write(socket(),
-                             boost::asio::buffer(raw_response),
-                             [on_sent](auto error_code, auto bytes_transferred) {
+                             boost::asio::buffer(*raw_response),
+                             [on_sent, raw_response](auto error_code, auto bytes_transferred) {
                                if (error_code) {
                                  logs::log(logs::error, "[RTSP] error during transmission: {}", error_code.message());
                                }
@@ -333,6 +334,7 @@ void run_server(int port, const state::SessionsAtoms &running_sessions) {
     }
   } catch (std::exception &e) {
     logs::log(logs::error, "Unable to create RTSP server on port: {} ex: {}", port, e.what());
+    throw; // Wolf can't stream without it: let the caller shut down
   }
 }
 

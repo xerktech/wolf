@@ -1,7 +1,5 @@
-#include <boost/asio/io_context.hpp>
 #include <control/control.hpp>
 #include <events/events.hpp>
-#include <future>
 #include <helpers/logger.hpp>
 #include <immer/atom.hpp>
 #include <runners/process.hpp>
@@ -58,6 +56,19 @@ struct close_inherited_fds : bp::extend::handler {
   }
 };
 
+/**
+ * Runs inside an event-bus handler, so it must not throw: the bus swallows a std::system_error by skipping every
+ * handler after this one (the pipelines' and the session's own stop). killpg fails once the group is gone, e.g. a stop
+ * that races the app's own exit, or a second stop of the same session (EINVAL: terminate() invalidated the group).
+ */
+static void terminate_group(bp::group &group_proc) {
+  std::error_code ec;
+  group_proc.terminate(ec); // Manually terminate the process
+  if (ec) {
+    logs::log(logs::debug, "[PROCESS] Unable to terminate process group: {}", ec.message());
+  }
+}
+
 void RunProcess::run(std::string_view session_id,
                      std::string_view app_state_folder,
                      std::string_view host_xdg_runtime_dir,
@@ -65,11 +76,10 @@ void RunProcess::run(std::string_view session_id,
                      const immer::array<std::string> &virtual_inputs,
                      const immer::array<std::pair<std::string, std::string>> &paths,
                      const immer::map<std::string, std::string> &env_variables,
-                     std::string_view render_node) {
+                     std::string_view render_node,
+                     const std::function<bool()> &is_stopped) {
   logs::log(logs::debug, "[PROCESS] Starting process: {}", this->run_cmd);
 
-  std::future<std::string> std_out = {}, err_out = {};
-  boost::asio::io_context ios;
   bp::child child_proc;
   bp::group group_proc;
 
@@ -82,13 +92,9 @@ void RunProcess::run(std::string_view session_id,
     child_proc = bp::child(this->run_cmd,
                            env,
                            bp::std_in.close(),
-#if BOOST_VERSION < 108800
-                           bp::std_out > std_out,
-                           bp::std_err > err_out,
-                           ios,
-#endif
+                           // stdout/stderr are inherited, so the app's output lands in Wolf's own log
                            group_proc,
-                           // last, so it runs after the stdio redirects have set up fds 0-2
+                           // last, so it runs after any stdio redirect has set up fds 0-2
                            close_inherited_fds{});
 
   } catch (const std::system_error &e) {
@@ -99,21 +105,25 @@ void RunProcess::run(std::string_view session_id,
   auto terminate_handler = this->ev_bus->register_handler<immer::box<StopStreamEvent>>(
       [&group_proc, session_id](const immer::box<StopStreamEvent> &terminate_ev) {
         if (std::to_string(terminate_ev->session_id) == session_id) {
-          group_proc.terminate(); // Manually terminate the process
+          terminate_group(group_proc);
         }
       });
 
   auto terminate_lobby_handler = this->ev_bus->register_handler<immer::box<StopLobbyEvent>>(
       [&group_proc, session_id](const immer::box<StopLobbyEvent> &terminate_ev) {
         if (terminate_ev->lobby_id == session_id) {
-          group_proc.terminate(); // Manually terminate the process
+          terminate_group(group_proc);
         }
       });
 
+  // A stop fired while the app was being spawned never reached the handlers above: the session is gone, so stop the
+  // app now instead of leaving it running with nobody to end it. Registering waited for any stop still being fired.
+  if (is_stopped && is_stopped()) {
+    logs::log(logs::debug, "[PROCESS] Session {} was stopped while starting, terminating", session_id);
+    terminate_group(group_proc);
+  }
+
   // This will stop here until the process is over
-#if BOOST_VERSION < 108800
-  ios.run();
-#endif
   child_proc.wait(); // to avoid a zombie process & get the exit code
 
   auto ex_code = child_proc.exit_code();

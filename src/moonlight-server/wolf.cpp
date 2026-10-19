@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <exceptions/exceptions.h>
 #include <filesystem>
+#include <functional>
 #include <immer/array_transient.hpp>
 #include <immer/map_transient.hpp>
 #include <immer/vector_transient.hpp>
@@ -21,6 +22,7 @@
 #include <memory>
 #include <rest/rest.hpp>
 #include <rtsp/net.hpp>
+#include <sessions/common.hpp>
 #include <sessions/handlers.hpp>
 #include <state/config.hpp>
 #include <streaming/streaming.hpp>
@@ -42,6 +44,23 @@ static std::atomic_bool shutdown_requested = false;
 
 static void graceful_shutdown_handler(int signum) {
   shutdown_requested.store(true, std::memory_order_relaxed);
+}
+
+/** What Wolf exits with once shut down: set when a server couldn't run */
+static std::atomic_int exit_code = EXIT_SUCCESS;
+
+/**
+ * Runs a server; if it throws (e.g. its port is already taken), logs why and shuts Wolf down with an error.
+ * An exception escaping a server thread would otherwise std::terminate Wolf as if it had crashed.
+ */
+static void run_server(std::string_view name, const std::function<void()> &server) {
+  try {
+    server();
+  } catch (const std::exception &e) {
+    logs::log(logs::error, "Unable to run the {} server, shutting down: {}", name, e.what());
+    exit_code.store(EXIT_FAILURE);
+    shutdown_requested.store(true);
+  }
 }
 
 /**
@@ -165,13 +184,32 @@ std::optional<sessions::AudioServer> setup_audio_server(const std::string &host_
     if (container && docker_api.start_by_id(container.value().id)) {
       auto ms = std::stoi(utils::get_env("WOLF_PULSE_CONTAINER_TIMEOUT_MS", "2000"));
       std::this_thread::sleep_for(std::chrono::milliseconds(ms)); // TODO: Better way of knowing when ready?
-      return {{.server = audio::connect(fmt::format("{}/pulse-socket", runtime_dir)), .container = container}};
+      auto container_server = audio::connect(fmt::format("{}/pulse-socket", runtime_dir));
+      if (audio::connected(container_server)) {
+        return {{.server = container_server, .container = container}};
+      }
     }
   }
 
   logs::log(logs::warning, "Failed to connect to any PulseAudio server, audio will not be available!");
 
   return {};
+}
+
+/**
+ * A Wolf that crashed or was killed left its sessions' sinks behind. Finds them, only on a PulseAudio server that this
+ * Wolf owns: the one embedded next to it (WOLF_EMBED_PULSE, one Wolf per container under supervisord) or the container
+ * it started itself. Any other server may be shared with a running Wolf, whose live sinks have the same names.
+ *
+ * Must run before any session can start: a session's sink then replaces a leftover of the same name (its client's,
+ * session ids being stable), and the rest is unloaded later by module index, so a sink loaded since is never touched.
+ */
+std::size_t find_stale_sinks(const sessions::AudioServer &audio_server) {
+  if (!audio_server.container && utils::get_env("WOLF_EMBED_PULSE", "") != "true"s) {
+    logs::log(logs::info, "PulseAudio server isn't Wolf's own, leaving any leftover virtual sinks alone");
+    return 0;
+  }
+  return audio::find_leftover_virtual_sinks(audio_server.server, sessions::VIRTUAL_SINK_PREFIX, 2s);
 }
 
 /**
@@ -191,34 +229,60 @@ void run() {
   auto p_cert_file = utils::get_env("WOLF_PRIVATE_CERT_FILE", "cert.pem");
   auto local_state = initialize(config_file, p_key_file, p_cert_file);
 
+  // Before any server starts: a request handled before the handlers are registered is lost (e.g. an API sessions/add
+  // while Wolf waits for the PulseAudio container would find no devices queue for its runner)
+  auto audio_server = setup_audio_server(local_state->host->host_xdg_runtime_dir, runtime_dir);
+  // PulseAudio sink-input router (hostname -> session_id -> virtual_sink_<session>)
+  auto pulse_router_state =
+      std::make_shared<audio::PulseAudioRouterState>(audio_server ? audio_server->server : nullptr);
+  auto pulse_router_handlers = audio::setup_pulseaudio_router_handlers(local_state, pulse_router_state);
+  // Setup event handlers for Moonlight related events (Start/Stop stream, hotplug, etc)
+  auto moonlight_sess_handlers = sessions::setup_moonlight_handlers(local_state, runtime_dir, audio_server);
+  // Setup event handlers for player Lobbies
+  auto lobbies_handlers = sessions::setup_lobbies_handlers(local_state, runtime_dir, audio_server);
+  // Before the servers start, so that no session's sink can be among them
+  auto stale_sinks = audio_server && audio_server->server ? find_stale_sinks(*audio_server) : 0;
+
   // HTTP APIs
   std::thread([local_state]() {
-    HttpServer server = HttpServer();
-    HTTPServers::startServer(&server, local_state, state::get_port(state::HTTP_PORT));
+    run_server("HTTP", [&]() {
+      HttpServer server = HttpServer();
+      HTTPServers::startServer(&server, local_state, state::get_port(state::HTTP_PORT));
+    });
   }).detach();
 
   // HTTPS APIs
   std::thread([local_state, p_key_file, p_cert_file]() {
-    HttpsServer server = HttpsServer(p_cert_file, p_key_file);
-    HTTPServers::startServer(&server, local_state, state::get_port(state::HTTPS_PORT));
+    run_server("HTTPS", [&]() {
+      HttpsServer server = HttpsServer(p_cert_file, p_key_file);
+      HTTPServers::startServer(&server, local_state, state::get_port(state::HTTPS_PORT));
+    });
   }).detach();
 
   // RTSP
   std::thread([sessions = local_state->running_sessions]() {
-    rtsp::run_server(state::get_port(state::RTSP_SETUP_PORT), sessions);
+    run_server("RTSP", [&]() { rtsp::run_server(state::get_port(state::RTSP_SETUP_PORT), sessions); });
   }).detach();
 
   // Control
   std::thread([sessions = local_state->running_sessions, ev_bus = local_state->event_bus]() {
-    control::run_control(state::get_port(state::CONTROL_PORT), sessions, ev_bus);
+    run_server("control", [&]() { control::run_control(state::get_port(state::CONTROL_PORT), sessions, ev_bus); });
   }).detach();
 
   // RTP
-  rtp::start_rtp_ping(state::get_port(state::VIDEO_PING_PORT),
-                      state::get_port(state::AUDIO_PING_PORT),
-                      local_state->event_bus);
-  // Wolf API server
-  std::thread([local_state, runtime_dir]() { wolf::api::start_server(runtime_dir, local_state); }).detach();
+  run_server("RTP ping", [&]() {
+    rtp::start_rtp_ping(state::get_port(state::VIDEO_PING_PORT),
+                        state::get_port(state::AUDIO_PING_PORT),
+                        local_state->event_bus);
+  });
+  // Wolf API server: Moonlight clients don't need it, so Wolf keeps streaming without it
+  std::thread([local_state, runtime_dir]() {
+    try {
+      wolf::api::start_server(runtime_dir, local_state);
+    } catch (const std::exception &e) {
+      logs::log(logs::error, "Unable to start the Wolf API server, the API won't be available: {}", e.what());
+    }
+  }).detach();
 
   // mDNS
   std::thread([hostname = local_state->config->hostname]() {
@@ -238,15 +302,18 @@ void run() {
     }
   }).detach();
 
-  auto audio_server = setup_audio_server(local_state->host->host_xdg_runtime_dir, runtime_dir);
-  // PulseAudio sink-input router (hostname -> session_id -> virtual_sink_<session>)
-  auto pulse_router_state =
-      std::make_shared<audio::PulseAudioRouterState>(audio_server ? audio_server->server : nullptr);
-  auto pulse_router_handlers = audio::setup_pulseaudio_router_handlers(local_state, pulse_router_state);
-  // Setup event handlers for Moonlight related events (Start/Stop stream, hotplug, etc)
-  auto moonlight_sess_handlers = sessions::setup_moonlight_handlers(local_state, runtime_dir, audio_server);
-  // Setup event handlers for player Lobbies
-  auto lobbies_handlers = sessions::setup_lobbies_handlers(local_state, runtime_dir, audio_server);
+  // Only once the servers had their chance to bind: a second Wolf started by mistake fails to bind and exits, and
+  // must not have touched the running Wolf's sinks first. The servers bind as their threads start, they don't say when.
+  if (stale_sinks > 0) {
+    std::thread([server = audio_server->server]() {
+      std::this_thread::sleep_for(3s);
+      if (shutdown_requested.load()) {
+        logs::log(logs::info, "Wolf is shutting down, leaving any leftover virtual sinks alone");
+        return;
+      }
+      audio::unload_leftover_virtual_sinks(server);
+    }).detach();
+  }
 
   // Park the main thread until a termination signal arrives. supervisord sends
   // SIGINT on container stop (stopsignal=INT) and waits stopwaitsecs for us to
@@ -255,7 +322,7 @@ void run() {
     std::this_thread::sleep_for(200ms);
   }
 
-  logs::log(logs::info, "Received shutdown signal, stopping all sessions and lobbies");
+  logs::log(logs::info, "Shutting down, stopping all sessions and lobbies");
 
   // Runner threads remove these after the app exits, which can be after we _Exit below; collect them so the
   // shutdown can remove leftovers itself (deleting a sink twice is a no-op).
@@ -310,7 +377,7 @@ void run() {
   std::clog.flush();
   std::cout.flush();
   std::fflush(nullptr);
-  std::_Exit(EXIT_SUCCESS);
+  std::_Exit(exit_code.load());
 }
 
 int main(int argc, char *argv[]) try {
