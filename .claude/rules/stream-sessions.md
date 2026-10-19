@@ -95,6 +95,8 @@ paths:
     - Never let any ANNOUNCE fix it, first or last: a spoofed one sent before the client's own locks a
       V2 client into V1 (no control, no video), one sent after flips a V1 client. Tests: "control: the
       first packet that authenticates fixes the encryption mode".
+    - Until then `encrypt_and_send` sends each host packet in both modes (the client drops the copy it
+      can't decrypt): a spoofed hint must not hide e.g. the termination from the real client.
   - A seq past UINT32_MAX is dropped on purpose (it would reuse a nonce, and accept that packet's replay).
   - Tests: `tests/testControl.cpp` "Control replay window", "Control V2 encryption", "control: a
     replayed encrypted packet is dropped"; `tests/testRTSP.cpp` DESCRIBE / "ANNOUNCE control".

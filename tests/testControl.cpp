@@ -4,6 +4,7 @@
 
 using Catch::Matchers::Equals;
 
+#include <algorithm>
 #include <control/control.hpp>
 #include <control/input_handler.hpp>
 #include <cstring>
@@ -392,7 +393,7 @@ TEST_CASE("control: a dead client's late pause doesn't end its resumed stream", 
   event_bus->fire_event(
       immer::box<wolf::core::events::StopStreamEvent>(wolf::core::events::StopStreamEvent{.session_id = 42}));
   resumed_client.service(200ms);
-  REQUIRE(resumed_client.received == 1);
+  REQUIRE(resumed_client.received == 2); // in both modes: no packet of this stream has authenticated yet
 
   // A real pause from the current client still goes through
   resumed_client.send_termination(new_key);
@@ -514,6 +515,9 @@ TEST_CASE("control: joypad feedback reaches the resumed stream's client", "[ENET
 
   TestENetClient first_client(port, 1);
   first_client.service(100ms);
+  // A first authenticated packet fixes the mode, so that what Wolf sends goes out once (not in both modes)
+  first_client.send_idr(old_key, 0, ControlEncryption::V1);
+  first_client.service(100ms);
   rumble(first, "rumble 1");
   first_client.service(200ms);
   REQUIRE(first_client.received_packets.size() == 1);
@@ -525,6 +529,8 @@ TEST_CASE("control: joypad feedback reaches the resumed stream's client", "[ENET
   resumed.control_feedback = first.control_feedback;
   running_sessions->store(immer::vector{resumed});
   TestENetClient resumed_client(port, 2);
+  resumed_client.service(100ms);
+  resumed_client.send_idr(new_key, 0, ControlEncryption::V1);
   resumed_client.service(100ms);
 
   rumble(first, "rumble 2"); // the joypad still holds what it captured when it was created
@@ -577,6 +583,21 @@ TEST_CASE("control: the first packet that authenticates fixes the encryption mod
   TestENetClient v2_client(port, 1), v1_client(port, 2);
   v2_client.service(100ms);
   v1_client.service(100ms);
+
+  // Until a packet authenticates, what Wolf sends goes out in both modes: a wrong hint mustn't hide e.g. a stop
+  event_bus->fire_event(
+      immer::box<wolf::core::events::StopStreamEvent>(wolf::core::events::StopStreamEvent{.session_id = 1}));
+  v2_client.service(200ms);
+  REQUIRE(v2_client.received_packets.size() == 2);
+  auto decrypts_as_v2 = [&](const std::string &packet) {
+    try {
+      decrypt_packet(*(ControlEncryptedPacket *)packet.data(), key, ControlEncryption::V2, ControlPacketOrigin::HOST);
+      return true;
+    } catch (const std::runtime_error &) {
+      return false;
+    }
+  };
+  REQUIRE(std::ranges::count_if(v2_client.received_packets, decrypts_as_v2) == 1);
 
   // A packet that doesn't authenticate under the session key decides nothing
   v2_client.send_idr(wrong_key, 0, ControlEncryption::V2);

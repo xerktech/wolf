@@ -88,9 +88,20 @@ bool encrypt_and_send(std::string_view payload,
                       const std::shared_ptr<events::ControlStreamState> &control_stream,
                       immer::box<std::shared_ptr<ENetPeer>> connected_client) {
   if (auto enet_client = connected_client->get()) {
-    auto encrypted =
-        control::encrypt_packet(aes_key, control_stream->send_seq++, payload, *control_stream->encryption.load());
-    return send_packet({(char *)encrypted.get(), encrypted->full_size()}, enet_client);
+    auto send = [&](control::ControlEncryption mode) {
+      auto encrypted = control::encrypt_packet(aes_key, control_stream->send_seq++, payload, mode);
+      return send_packet({(char *)encrypted.get(), encrypted->full_size()}, enet_client);
+    };
+    auto hint = *control_stream->encryption.load();
+    if (control_stream->encryption_negotiated) {
+      return send(hint);
+    }
+    // No client packet has authenticated yet, so the mode is only the (unauthenticated) ANNOUNCE's hint: a spoofed one
+    // would make e.g. the termination unreadable. Send it in both modes; the client drops the copy it can't decrypt.
+    auto other = hint == control::ControlEncryption::V1 ? control::ControlEncryption::V2
+                                                        : control::ControlEncryption::V1;
+    bool sent = send(hint);
+    return send(other) || sent;
   } else {
     logs::log(logs::warning, "[ENET] Failed to send packet, client is not connected");
     return false;
