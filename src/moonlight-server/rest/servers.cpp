@@ -23,7 +23,7 @@ using namespace wolf::core;
  */
 void startServer(HttpServer *server, const immer::box<state::AppState> state, int port) {
   server->config.port = port;
-  server->config.address = "0.0.0.0";
+  server->config.address = state::get_http_bind_address().to_string();
   server->default_resource["GET"] = endpoints::not_found<SimpleWeb::HTTP>;
   server->default_resource["POST"] = endpoints::not_found<SimpleWeb::HTTP>;
 
@@ -117,7 +117,7 @@ void reply_unauthorized(const std::shared_ptr<typename SimpleWeb::ServerBase<Sim
 
 void startServer(HttpsServer *server, const immer::box<state::AppState> state, int port) {
   server->config.port = port;
-  server->config.address = "0.0.0.0";
+  server->config.address = state::get_http_bind_address().to_string();
   server->default_resource["GET"] = endpoints::not_found<SimpleWeb::HTTPS>;
   server->default_resource["POST"] = endpoints::not_found<SimpleWeb::HTTPS>;
 
