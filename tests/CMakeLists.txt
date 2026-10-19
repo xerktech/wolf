@@ -79,6 +79,12 @@ if (UNIX AND NOT APPLE)
                 "platforms/linux/inputtino.cpp")
     endif ()
     list(APPEND SRC_LIST "platforms/linux/process.cpp")
+
+    # Starts private PulseAudio daemons: needs the `pulseaudio` binary on PATH
+    option(TEST_PULSE "Enable PulseAudio tests" ON)
+    if (TEST_PULSE)
+        list(APPEND SRC_LIST "platforms/linux/pulse.cpp")
+    endif ()
 endif ()
 
 find_package(CURL)
@@ -109,6 +115,7 @@ target_link_libraries_system(wolftests PRIVATE
 ## Test assets
 configure_file(assets/config.test.toml ${CMAKE_CURRENT_BINARY_DIR}/config.test.toml COPYONLY)
 configure_file(assets/config.test.toml ${CMAKE_CURRENT_BINARY_DIR}/config.test.EDITED.toml COPYONLY)
+configure_file(../docs/modules/dev/partials/spec.json ${CMAKE_CURRENT_BINARY_DIR}/openapi-spec.json COPYONLY)
 
 # See: https://github.com/catchorg/Catch2/blob/devel/docs/cmake-integration.md
 list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)

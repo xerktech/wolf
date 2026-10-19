@@ -171,22 +171,31 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
               | views::transform(parse_arg_line)               // turns an arg line into a pair
               | to<std::map<std::string, std::optional<int>>>; // to map
 
+  auto width = args["x-nv-video[0].clientViewportWd"];
+  auto height = args["x-nv-video[0].clientViewportHt"];
+  auto fps = args["x-nv-video[0].maxFPS"];
+  if (!width || !height || !fps || !moonlight::is_valid_display_mode(*width, *height, *fps)) {
+    logs::log(logs::warning, "[RTSP] ANNOUNCE without a valid display mode, rejecting it");
+    return error_msg(400, "BAD REQUEST", req.seq_number);
+  }
+
   auto control_encryption = (args["x-ss-general.encryptionEnabled"].value_or(0) & moonlight::control::SS_ENC_CONTROL_V2)
                                 ? moonlight::control::ControlEncryption::V2
                                 : moonlight::control::ControlEncryption::V1;
-  // Never go back from V2: RTSP isn't authenticated, a second ANNOUNCE would make every genuine packet fail to decrypt
-  session.control_stream->encryption.update([control_encryption](auto current) {
-    return current == moonlight::control::ControlEncryption::V2 ? current : control_encryption;
-  });
+  // Only a hint: RTSP isn't authenticated, so the client's first control packet that authenticates fixes the mode
+  // (see control.cpp). Once it has, a later (possibly spoofed) ANNOUNCE can't switch it.
+  if (!session.control_stream->announce_encryption(control_encryption)) {
+    logs::log(logs::warning, "[RTSP] Ignoring a control stream encryption change in a later ANNOUNCE");
+  }
 
   bool video_format_hevc = args["x-nv-vqos[0].bitStreamFormat"].value_or(0) == 1;
   bool video_format_av1 = args["x-nv-vqos[0].bitStreamFormat"].value_or(0) == 2;
   auto csc = args["x-nv-video[0].encoderCscMode"].value_or(0);
 
   // Video session
-  moonlight::DisplayMode display = {.width = args["x-nv-video[0].clientViewportWd"].value(),
-                                    .height = args["x-nv-video[0].clientViewportHt"].value(),
-                                    .refreshRate = args["x-nv-video[0].maxFPS"].value(),
+  moonlight::DisplayMode display = {.width = *width,
+                                    .height = *height,
+                                    .refreshRate = *fps,
                                     .hevc_supported = video_format_hevc,
                                     .av1_supported = video_format_av1};
 

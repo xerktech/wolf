@@ -76,6 +76,25 @@ std::shared_ptr<VSink> create_virtual_sink(const std::shared_ptr<Server> &server
 void delete_virtual_sink(const std::shared_ptr<Server> &server, const std::shared_ptr<VSink> &vsink);
 
 /**
+ * Records the null sinks whose name starts with `sink_name_prefix` as leftovers of a Wolf that crashed or was killed
+ * (it never removed its sessions' sinks); waits up to `timeout` for the answer and returns how many there are.
+ * Meant for startup, before any session exists, and only on a server no other Wolf uses: their live sinks have the
+ * same prefix.
+ *
+ * create_virtual_sink() replaces a leftover of the same name (session ids are stable across restarts), so the new sink
+ * gets that exact name; unload_leftover_virtual_sinks() removes the rest.
+ */
+std::size_t find_leftover_virtual_sinks(const std::shared_ptr<Server> &server,
+                                        std::string_view sink_name_prefix,
+                                        std::chrono::milliseconds timeout);
+
+/**
+ * Unloads the leftovers that no create_virtual_sink() replaced, by module index: a sink loaded since is never one of
+ * them. Doesn't wait for it.
+ */
+void unload_leftover_virtual_sinks(const std::shared_ptr<Server> &server);
+
+/**
  * Waits (up to timeout) until PulseAudio has handled every request sent so far on this connection.
  * Returns false on timeout.
  */

@@ -19,6 +19,30 @@ using namespace wolf::core;
 using namespace wolf::core::virtual_display;
 using namespace moonlight::control;
 
+/**
+ * Pops the next event, dispatching the client connection until it arrives.
+ *
+ * The test client is single-threaded: its listeners only push to the queue while it dispatches.
+ * Input injected through Wolf reaches the compositor on a different channel than the client's
+ * requests, so one wl_display_roundtrip() can return before the compositor has sent the events it
+ * causes; waiting on the queue alone would then never see them (the flaky first mouse event).
+ */
+template <typename T>
+static std::optional<T>
+pop_event(wl_display *wd, TSQueue<T> &queue, std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+  auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (true) {
+    if (auto ev = queue.pop(std::chrono::milliseconds(0))) {
+      return ev;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return {};
+    }
+    wl_display_roundtrip(wd);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+}
+
 TEST_CASE("Wayland virtual inputs", "[WAYLAND]") {
   const auto FPS = 60;
 
@@ -51,19 +75,19 @@ TEST_CASE("Wayland virtual inputs", "[WAYLAND]") {
     control::handle_input(session, {}, &mv_packet, sizeof(mv_packet));
     wl_display_roundtrip(wd.get());
 
-    auto m_ev = mouse_events_q->pop();
+    auto m_ev = pop_event(wd.get(), *mouse_events_q);
     REQUIRE(m_ev.has_value());
     REQUIRE(m_ev.value().type == MouseEventType::LEAVE);
 
-    m_ev = mouse_events_q->pop();
+    m_ev = pop_event(wd.get(), *mouse_events_q);
     REQUIRE(m_ev.has_value());
     REQUIRE(m_ev.value().type == MouseEventType::FRAME);
 
-    m_ev = mouse_events_q->pop();
+    m_ev = pop_event(wd.get(), *mouse_events_q);
     REQUIRE(m_ev.has_value());
     REQUIRE(m_ev.value().type == MouseEventType::ENTER);
 
-    m_ev = mouse_events_q->pop();
+    m_ev = pop_event(wd.get(), *mouse_events_q);
     REQUIRE(m_ev.has_value());
     REQUIRE(m_ev.value().type == MouseEventType::MOTION);
     // Values come from zwp_relative_pointer_v1 as wl_fixed_t.
@@ -71,7 +95,7 @@ TEST_CASE("Wayland virtual inputs", "[WAYLAND]") {
     REQUIRE(m_ev.value().x == 10 * 65536);
     REQUIRE(m_ev.value().y == 20 * 65536);
 
-    m_ev = mouse_events_q->pop();
+    m_ev = pop_event(wd.get(), *mouse_events_q);
     REQUIRE(m_ev.has_value());
     REQUIRE(m_ev.value().type == MouseEventType::FRAME);
   }
@@ -83,7 +107,7 @@ TEST_CASE("Wayland virtual inputs", "[WAYLAND]") {
     control::handle_input(session, {}, &press_A_key, sizeof(press_A_key));
     wl_display_roundtrip(wd.get());
 
-    auto k_ev = kb_events_q->pop();
+    auto k_ev = pop_event(wd.get(), *kb_events_q);
     REQUIRE(k_ev.has_value());
     REQUIRE(k_ev->keycode == 30);
     REQUIRE(k_ev->pressed);
@@ -95,7 +119,7 @@ TEST_CASE("Wayland virtual inputs", "[WAYLAND]") {
     control::handle_input(session, {}, &release_A_key, sizeof(release_A_key));
     wl_display_roundtrip(wd.get());
 
-    auto k_ev = kb_events_q->pop();
+    auto k_ev = pop_event(wd.get(), *kb_events_q);
     REQUIRE(k_ev.has_value());
     REQUIRE(k_ev->keycode == 30);
     REQUIRE(!k_ev->pressed);
@@ -108,20 +132,20 @@ TEST_CASE("Wayland virtual inputs", "[WAYLAND]") {
     control::handle_input(session, {}, &press_SHIFT_A, sizeof(press_SHIFT_A));
     wl_display_roundtrip(wd.get());
 
-    auto k_ev = kb_events_q->pop();
+    auto k_ev = pop_event(wd.get(), *kb_events_q);
     // Press SHIFT
     REQUIRE(k_ev.has_value());
     REQUIRE(k_ev->keycode == 42);
     REQUIRE(k_ev->pressed);
 
     // Press A
-    k_ev = kb_events_q->pop();
+    k_ev = pop_event(wd.get(), *kb_events_q);
     REQUIRE(k_ev.has_value());
     REQUIRE(k_ev->keycode == 30);
     REQUIRE(k_ev->pressed);
 
     // Release SHIFT
-    k_ev = kb_events_q->pop();
+    k_ev = pop_event(wd.get(), *kb_events_q);
     REQUIRE(k_ev.has_value());
     REQUIRE(k_ev->keycode == 42);
     REQUIRE(!k_ev->pressed);
@@ -145,7 +169,7 @@ TEST_CASE("Wayland virtual inputs", "[WAYLAND]") {
     std::memcpy(exact_buf.data(), &utf8_pkt, exact_buf.size());
     control::handle_input(session, {}, reinterpret_cast<pkts::INPUT_PKT *>(exact_buf.data()), exact_buf.size());
     wl_display_roundtrip(wd.get());
-    auto k_ev = kb_events_q->pop();
+    auto k_ev = pop_event(wd.get(), *kb_events_q);
     REQUIRE(k_ev.has_value());
     REQUIRE(k_ev->keycode == 29); // LEFTCTRL
     REQUIRE(k_ev->pressed);
@@ -163,19 +187,19 @@ TEST_CASE("Wayland virtual inputs", "[WAYLAND]") {
 
     // Compositor sends: axis_source, axis, axis_value120, axis_relative_direction (v9), frame.
     // axis_relative_direction is silently dropped (no queue entry) since we only log it.
-    auto s_ev = mouse_events_q->pop();
+    auto s_ev = pop_event(wd.get(), *mouse_events_q);
     REQUIRE(s_ev.has_value());
     REQUIRE(s_ev.value().type == MouseEventType::AXIS_SOURCE);
 
-    s_ev = mouse_events_q->pop();
+    s_ev = pop_event(wd.get(), *mouse_events_q);
     REQUIRE(s_ev.has_value());
     REQUIRE((s_ev.value().type == MouseEventType::AXIS_VALUE120 || s_ev.value().type == MouseEventType::AXIS));
 
-    s_ev = mouse_events_q->pop();
+    s_ev = pop_event(wd.get(), *mouse_events_q);
     REQUIRE(s_ev.has_value());
     REQUIRE((s_ev.value().type == MouseEventType::AXIS_VALUE120 || s_ev.value().type == MouseEventType::AXIS));
 
-    s_ev = mouse_events_q->pop();
+    s_ev = pop_event(wd.get(), *mouse_events_q);
     REQUIRE(s_ev.has_value());
     REQUIRE(s_ev.value().type == MouseEventType::FRAME);
   }

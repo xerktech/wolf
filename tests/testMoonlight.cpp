@@ -9,9 +9,13 @@
 
 using Catch::Matchers::Equals;
 
+#include <boost/asio/local/stream_protocol.hpp>
+#include <client_http.hpp>
+#include <client_https.hpp>
 #include <crypto/crypto.hpp>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <moonlight/protocol.hpp>
 #include <range/v3/view.hpp>
 #include <rest/helpers.hpp>
@@ -259,6 +263,98 @@ TEST_CASE("Default config: every encoder has video_params", "[LocalState]") {
   }
 }
 
+TEST_CASE("/resume keeps what still runs for the stream", "[Sessions]") {
+  using namespace wolf::core;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto state_dir = std::filesystem::temp_directory_path() / fmt::format("wolf-resume-{}", getpid());
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions)),
+      .host = immer::box<state::Host>(
+          state::Host{.host_base_state_folder = state_dir.string(), .local_base_state_folder = state_dir.string()}),
+      .event_bus = event_bus,
+      .running_sessions = running_sessions});
+
+  auto client = state::PairedClient{.client_cert = "resume-test-cert", .app_state_folder = "client"};
+  auto app = events::App{.base = {.title = "app", .id = "app"}};
+  auto old_session = *state::create_stream_session(app_state,
+                                                   app,
+                                                   client,
+                                                   {1920, 1080, 60},
+                                                   2,
+                                                   "00112233445566778899aabbccddeeff",
+                                                   "1");
+  auto sink = std::make_shared<audio::VSink>();
+  old_session.audio_sink->store(sink);
+  running_sessions->store(immer::vector<events::StreamSession>{old_session});
+
+  SimpleWeb::CaseInsensitiveMultimap query = {{"mode", "1280x720x30"},
+                                              {"rikey", "ffeeddccbbaa99887766554433221100"},
+                                              {"rikeyid", "2"}};
+  auto resumed = endpoints::https::resume_session(query, "127.0.0.1", client, app_state);
+  REQUIRE(resumed);
+  REQUIRE(running_sessions->load()->size() == 1);
+  auto running = running_sessions->load()->front();
+  // A new instance of the same client's stream...
+  REQUIRE(running.session_id == old_session.session_id);
+  REQUIRE(running.enet_secret_payload == resumed->enet_secret_payload);
+  REQUIRE(running.display_mode.width == 1280);
+  // ...that keeps the desktop, its producers and its audio sink: the sink is removed when the session stops, and a
+  // resumed session that lost it would leave it behind
+  REQUIRE(running.wayland_display == old_session.wayland_display);
+  REQUIRE(running.producer_name == old_session.producer_name);
+  REQUIRE(running.audio_sink->load() == sink);
+
+  std::filesystem::remove_all(state_dir);
+}
+
+TEST_CASE("/launch lists the session before starting it", "[Sessions]") {
+  using namespace wolf::core;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto state_dir = std::filesystem::temp_directory_path() / fmt::format("wolf-launch-{}", getpid());
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions)),
+      .host = immer::box<state::Host>(
+          state::Host{.host_base_state_folder = state_dir.string(), .local_base_state_folder = state_dir.string()}),
+      .event_bus = event_bus,
+      .running_sessions = running_sessions});
+
+  // The StreamSession handlers start the app's runner, which treats a session that isn't listed as already stopped
+  std::atomic_int started = 0, listed_when_started = 0;
+  auto handler = event_bus->register_handler<immer::box<events::StreamSession>>(
+      [&](const immer::box<events::StreamSession> &session) {
+        started++;
+        if (state::get_session_by_id(*running_sessions->load(), session->session_id)) {
+          listed_when_started++;
+        }
+      });
+
+  SimpleWeb::CaseInsensitiveMultimap query = {{"mode", "1280x720x30"},
+                                              {"rikey", "00112233445566778899aabbccddeeff"},
+                                              {"rikeyid", "1"}};
+  auto client = state::PairedClient{.client_cert = "launch-test-cert", .app_state_folder = "client"};
+  auto launched = endpoints::https::launch_session(query,
+                                                   "127.0.0.1",
+                                                   client,
+                                                   app_state,
+                                                   events::App{.base = {.title = "app", .id = "app"}});
+  REQUIRE(launched);
+  REQUIRE(started == 1);
+  REQUIRE(listed_when_started == 1);
+  std::filesystem::remove_all(state_dir);
+}
+
+TEST_CASE("PulseAudio server name to socket path", "[Sessions]") {
+  using wolf::core::sessions::audio_server_socket_path;
+  REQUIRE(audio_server_socket_path("/tmp/sockets/pulse-socket") == "/tmp/sockets/pulse-socket");
+  // Docker splits binds on ':', so the prefix must not reach the mount
+  REQUIRE(audio_server_socket_path("unix:/run/pulse/native") == "/run/pulse/native");
+  REQUIRE(audio_server_socket_path("{0123abcd}unix:/run/pulse/native") == "/run/pulse/native");
+  REQUIRE(audio_server_socket_path("tcp:localhost:4713").empty());
+  REQUIRE(audio_server_socket_path("").empty());
+}
+
 TEST_CASE("Wayland socket wait", "[Sessions]") {
   // CTest sets WOLF_SKIP_WAYLAND_SOCKET_WAIT for the whole suite; this test needs the real wait
   std::optional<std::string> skip_wait;
@@ -269,14 +365,100 @@ TEST_CASE("Wayland socket wait", "[Sessions]") {
   auto runtime_dir = std::filesystem::temp_directory_path().string();
 
   // No virtual compositor (e.g. "Test ball"): no socket name, must not wait for the runtime dir to become one
-  REQUIRE(wolf::core::sessions::wait_for_wayland_socket(runtime_dir, "", std::chrono::milliseconds(100)));
+  REQUIRE(wolf::core::sessions::wait_for_wayland_socket(runtime_dir, "", false, std::chrono::milliseconds(100)));
+  // A compositor that reports no socket can't be reached by the runner, whether or not the wait is skipped (without
+  // the skip, runtime_dir/"" is a directory, so the wait would also fail by timing out)
+  ::setenv("WOLF_SKIP_WAYLAND_SOCKET_WAIT", "TRUE", 1);
+  REQUIRE_FALSE(wolf::core::sessions::wait_for_wayland_socket(runtime_dir, "", true, std::chrono::milliseconds(100)));
+  ::unsetenv("WOLF_SKIP_WAYLAND_SOCKET_WAIT");
+  REQUIRE_FALSE(wolf::core::sessions::wait_for_wayland_socket(runtime_dir, "", true, std::chrono::milliseconds(100)));
   REQUIRE_FALSE(wolf::core::sessions::wait_for_wayland_socket(runtime_dir,
                                                               "wolf-no-such-socket",
+                                                              true,
                                                               std::chrono::milliseconds(100)));
+
+  // A timeout of 0 still finds a socket that's already there (it used to always fail)
+  auto socket_name = fmt::format("wolf-test-socket-{}", getpid());
+  auto socket_path = std::filesystem::path(runtime_dir) / socket_name;
+  std::filesystem::remove(socket_path);
+  {
+    boost::asio::io_context io;
+    boost::asio::local::stream_protocol::acceptor listener(io, socket_path.string());
+    REQUIRE(
+        wolf::core::sessions::wait_for_wayland_socket(runtime_dir, socket_name, true, std::chrono::milliseconds(0)));
+  }
+  std::filesystem::remove(socket_path);
 
   if (skip_wait) {
     ::setenv("WOLF_SKIP_WAYLAND_SOCKET_WAIT", skip_wait->c_str(), 1);
   }
+}
+
+TEST_CASE("LocalState reports a config file it couldn't save", "[LocalState]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  const std::string cfg_file = "config.test.EMPTIED.toml";
+  std::filesystem::copy_file("config.test.toml", cfg_file, std::filesystem::copy_options::overwrite_existing);
+  auto cfg = state::load_or_default(cfg_file, event_bus, running_sessions);
+  auto client_id = state::get_client_id(*cfg.paired_clients->load()->front());
+  auto keep_client = [](const state::PairedClient &client) { return client; };
+  auto keep_profiles = [](const state::ProfilesList &profiles) { return profiles; };
+
+  REQUIRE(state::pair(cfg, {.client_cert = "saved-cert"}));
+  {
+    auto clients = cfg.paired_clients->load();
+    auto saved = std::ranges::find_if(*clients, [](const auto &c) { return c->client_cert == "saved-cert"; });
+    REQUIRE(state::update_client_settings(cfg, state::get_client_id(**saved), [](state::PairedClient client) {
+              client.settings.run_uid = 4242;
+              return client;
+            }) == state::ConfigUpdate::SAVED);
+  }
+  REQUIRE(state::pair(cfg, {.client_cert = "saved-cert"})); // a re-pair replaces it, on disk too, keeping its settings
+  {
+    auto on_disk = rfl::toml::load<wolf::config::WolfConfig, rfl::DefaultIfMissing>(cfg_file).value().paired_clients;
+    REQUIRE(std::ranges::count_if(on_disk, [](const auto &c) { return c.client_cert == "saved-cert"; }) == 1);
+    auto saved = std::ranges::find_if(on_disk, [](const auto &c) { return c.client_cert == "saved-cert"; });
+    REQUIRE(saved->settings.run_uid == 4242);
+    auto clients = cfg.paired_clients->load(); // and in memory
+    auto in_memory = std::ranges::find_if(*clients, [](const auto &c) { return c->client_cert == "saved-cert"; });
+    REQUIRE((*in_memory)->settings.run_uid == 4242);
+  }
+  REQUIRE(state::update_client_settings(cfg, client_id, keep_client) == state::ConfigUpdate::SAVED);
+  REQUIRE(state::update_client_settings(cfg, 42, keep_client) == state::ConfigUpdate::NOT_FOUND);
+  REQUIRE(state::update_profiles(cfg, keep_profiles));
+
+  // Emptied under us: it loads as all defaults, and saving that back would write an empty uuid and hostname and
+  // keep only the client being paired
+  { std::ofstream(cfg_file, std::ios::trunc); }
+  REQUIRE_FALSE(state::pair(cfg, {.client_cert = "unsaved-cert"}));
+  // A failed pairing changes nothing in memory either, and a failed re-pair keeps the existing pairing
+  REQUIRE_FALSE(state::pair(cfg, {.client_cert = "saved-cert"}));
+  auto has_cert = [&](const std::string &cert) {
+    auto clients = cfg.paired_clients->load();
+    return std::ranges::any_of(*clients, [&](const auto &c) { return c->client_cert == cert; });
+  };
+  REQUIRE(has_cert("saved-cert"));
+  REQUIRE_FALSE(has_cert("unsaved-cert"));
+  REQUIRE_FALSE(state::unpair(cfg, {.client_cert = "saved-cert"}));
+  REQUIRE(state::update_client_settings(cfg, client_id, keep_client) == state::ConfigUpdate::NOT_SAVED);
+  REQUIRE_FALSE(state::update_profiles(cfg, keep_profiles));
+  REQUIRE(std::filesystem::file_size(cfg_file) == 0);
+  std::filesystem::remove(cfg_file);
+}
+
+TEST_CASE("LocalState: blank producer caps fall back to the default", "[LocalState]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto cfg = state::load_or_default("config.test.toml", event_bus, running_sessions);
+  auto app = wolf::config::BaseApp{.title = "caps", .runner = wolf::config::AppCMD{.run_cmd = "true"}};
+  auto default_caps = cfg.parse_app(app).video_producer_buffer_caps;
+  REQUIRE_FALSE(default_caps.empty());
+  for (auto caps : {"", " ", "\t\n "}) {
+    app.video = wolf::config::BaseAppVideoOverride{.producer_buffer_caps = caps};
+    REQUIRE_THAT(cfg.parse_app(app).video_producer_buffer_caps, Equals(default_caps));
+  }
+  app.video = wolf::config::BaseAppVideoOverride{.producer_buffer_caps = " video/x-raw(memory:DMABuf)"};
+  REQUIRE_THAT(cfg.parse_app(app).video_producer_buffer_caps, Equals(" video/x-raw(memory:DMABuf)"));
 }
 
 TEST_CASE("Encoder video_params fall back to the embedded default", "[LocalState]") {
@@ -911,4 +1093,131 @@ TEST_CASE("Launch rejects malformed client parameters", "[HTTP]") {
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"surroundAudioInfo", "196610junk"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "abc"}}));
   REQUIRE_FALSE(launch({})); // missing rikeyid
+}
+
+TEST_CASE("HTTP Pairing over the /pair handler", "[MoonlightProtocol]") {
+  PairingData moonlight_data;
+  ServerData server_data;
+
+  immer::box<state::AppState> app_state = {state::AppState{
+      .config = state::Config{.config_source = "config.test.PAIRING.toml",
+                              .paired_clients = std::make_shared<immer::atom<state::PairedClientList>>()},
+      .host = {state::Host{.server_cert = server_data.server_cert,
+                           .server_pkey = signature::create_key(server_data.server_pkey, true)}},
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = std::make_shared<events::EventBusType>()}};
+  auto pair_handler = app_state->event_bus->register_handler<immer::box<events::PairSignal>>(
+      [moonlight_data](const immer::box<events::PairSignal> &signal) {
+        signal->user_pin->set_value(moonlight_data.pin);
+      });
+
+  SimpleWeb::Server<SimpleWeb::HTTP> server;
+  server.config.address = "127.0.0.1";
+  server.config.port = 0;
+  server.resource["^/pair$"]["GET"] = [&app_state](auto resp, auto req) { endpoints::pair(resp, req, app_state); };
+  std::promise<unsigned short> bound_port;
+  std::thread server_thread([&] { server.start([&](unsigned short port) { bound_port.set_value(port); }); });
+  // Stops the server even when a REQUIRE below throws
+  auto stop_server = std::shared_ptr<void>(nullptr, [&](void *) {
+    server.stop();
+    server_thread.join();
+  });
+  SimpleWeb::Client<SimpleWeb::HTTP> client("127.0.0.1:" + std::to_string(bound_port.get_future().get()));
+  client.config.timeout = 5; // a handler that never replies fails the test instead of hanging it
+  auto get = [&client](const std::string &query) {
+    try {
+      auto response = client.request("GET", "/pair?" + query);
+      return std::make_pair(response->status_code, response->content.string());
+    } catch (const std::exception &e) {
+      return std::make_pair(std::string("no reply"), std::string(e.what()));
+    }
+  };
+
+  // Phase 1: the handler answers once the user has entered the PIN
+  auto [status_1, body_1] = get("uniqueid=1234&devicename=roth&updateState=1&phrase=getservercert&salt=" +
+                                moonlight_data.salt + "&clientcert=" + moonlight_data.client_cert_base64);
+  REQUIRE_THAT(status_1, Equals("200 OK"));
+  REQUIRE_THAT(body_1, Catch::Matchers::ContainsSubstring("<paired>1</paired>"));
+
+  // Phase 2 goes through pair_next_phase: the handler must send its reply
+  auto [status_2, body_2] =
+      get("uniqueid=1234&devicename=roth&updateState=1&clientchallenge=" + moonlight_data.client_challenge);
+  REQUIRE_THAT(status_2, Equals("200 OK"));
+  REQUIRE_THAT(body_2, Catch::Matchers::ContainsSubstring("<challengeresponse>"));
+
+  // Requests that match no phase are answered too
+  auto [status_3, body_3] = get("uniqueid=1234&foo=bar");
+  REQUIRE_THAT(status_3, Equals("400 Bad Request"));
+  REQUIRE_THAT(body_3, Catch::Matchers::ContainsSubstring("<paired>0</paired>"));
+  auto [status_4, body_4] = get("salt=" + moonlight_data.salt);
+  REQUIRE_THAT(status_4, Equals("400 Bad Request"));
+}
+
+TEST_CASE("HTTPS /resume carries the stream's devices over to the new instance", "[MoonlightProtocol]") {
+  // Certificates for the HTTPS server and the (already paired) client
+  char dir_template[] = "/tmp/wolf-resume-XXXXXX";
+  REQUIRE(mkdtemp(dir_template));
+  std::string dir = dir_template;
+  auto server_key = x509::generate_key();
+  REQUIRE(x509::write_to_disk(server_key, dir + "/server.key", x509::generate_x509(server_key), dir + "/server.crt"));
+  auto client_key = x509::generate_key();
+  auto client_cert = x509::generate_x509(client_key);
+  REQUIRE(x509::write_to_disk(client_key, dir + "/client.key", client_cert, dir + "/client.crt"));
+
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = state::Config{.paired_clients = std::make_shared<immer::atom<state::PairedClientList>>()},
+      .host = {},
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .event_bus = std::make_shared<events::EventBusType>(),
+      .running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>()});
+  auto client = state::PairedClient{.client_cert = x509::get_cert_pem(client_cert), .app_state_folder = "test"};
+  auto app = events::App{.base = moonlight::App{.title = "test_app"}};
+
+  // The running stream, with the devices and producers the resumed one must keep
+  auto old_session =
+      endpoints::https::create_run_session({{"rikey", "1234"}, {"rikeyid", "1"}}, "127.0.0.1", client, app_state, app);
+  REQUIRE(old_session);
+  old_session->producer_name = "the_old_producers";
+  auto kept = *old_session; // its shared state, which the resume moves out of the old session
+  app_state->running_sessions->store(immer::vector{*old_session});
+
+  HttpsServer server(dir + "/server.crt", dir + "/server.key");
+  server.config.address = "127.0.0.1";
+  server.config.port = 0;
+  server.resource["^/resume$"]["GET"] = [&](auto resp, auto req) {
+    endpoints::https::resume(resp, req, client, app_state);
+  };
+  std::promise<unsigned short> bound_port;
+  std::thread server_thread([&] { server.start([&](unsigned short port) { bound_port.set_value(port); }); });
+  auto stop_server = std::shared_ptr<void>(nullptr, [&](void *) {
+    server.stop();
+    server_thread.join();
+    std::filesystem::remove_all(dir);
+  });
+  SimpleWeb::Client<SimpleWeb::HTTPS> https_client("127.0.0.1:" + std::to_string(bound_port.get_future().get()),
+                                                   false,
+                                                   dir + "/client.crt",
+                                                   dir + "/client.key");
+  https_client.config.timeout = 5;
+  auto response = https_client.request("GET", "/resume?rikey=5678&rikeyid=2&surroundAudioInfo=196610");
+  REQUIRE_THAT(response->status_code, Equals("200 OK"));
+
+  auto sessions = app_state->running_sessions->load();
+  REQUIRE(sessions->size() == 1);
+  auto resumed = sessions->front();
+  REQUIRE(resumed.aes_key != kept.aes_key); // a new stream instance...
+  REQUIRE(resumed.session_id == kept.session_id);
+  // ...that keeps the old one's desktop, producers, audio sink and devices
+  REQUIRE(resumed.wayland_display == kept.wayland_display);
+  REQUIRE(resumed.producer_name == "the_old_producers");
+  REQUIRE(resumed.audio_sink == kept.audio_sink);
+  REQUIRE(resumed.mouse == kept.mouse);
+  REQUIRE(resumed.keyboard == kept.keyboard);
+  REQUIRE(resumed.joypads == kept.joypads);
+  REQUIRE(resumed.control_feedback == kept.control_feedback); // the joypads' feedback reaches the new peer
+  REQUIRE(resumed.pen_tablet == kept.pen_tablet);
+  REQUIRE(resumed.touch_screen == kept.touch_screen);
+  // Not carried over: the new instance negotiates its own control stream
+  REQUIRE(resumed.control_stream != kept.control_stream);
 }

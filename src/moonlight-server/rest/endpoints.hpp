@@ -286,11 +286,16 @@ std::optional<XMLResult> pair_next_phase(const immer::box<state::AppState> &stat
     auto result = pair_phase4(client_cache, client_secret.value());
 
     if (result.status == SimpleWeb::StatusCode::success_ok) {
-      state::pair(
-          state->config,
-          state::PairedClient{.client_cert = client_cache.client_cert,
-                              .app_state_folder = std::to_string(std::hash<std::string>{}(client_cache.client_cert))});
-      logs::log(logs::info, "Succesfully paired {}", client_ip);
+      auto client = state::PairedClient{
+          .client_cert = client_cache.client_cert,
+          .app_state_folder = std::to_string(std::hash<std::string>{}(client_cache.client_cert))};
+      if (state::pair(state->config, client)) {
+        logs::log(logs::info, "Succesfully paired {}", client_ip);
+      } else {
+        // Not persisted (pair() left the paired clients as they were), so fail it now: the client can retry
+        logs::log(logs::error, "Failed pairing with {}: config.toml couldn't be saved", client_ip);
+        result = {SimpleWeb::StatusCode::server_error_internal_server_error, fail_pair("Unable to save the pairing")};
+      }
     } else {
       logs::log(logs::warning, "Failed pairing with {}", client_ip);
     }
@@ -342,6 +347,10 @@ void pair(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTP>::Res
     send_xml<SimpleWeb::HTTP>(response, result->status, result->xml);
   } else {
     logs::log(logs::warning, "Unable to match pair with any phase, you can retry pairing from Moonlight");
+    // Always answer: a request left without a reply hangs the client until it times out
+    send_xml<SimpleWeb::HTTP>(response,
+                              SimpleWeb::StatusCode::client_error_bad_request,
+                              fail_pair("Unable to match pair with any phase"));
   }
 }
 
@@ -460,9 +469,45 @@ auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
   return std::move(base_session);
 }
 
+/**
+ * What a /resume's new stream instance keeps from the one it replaces (`old_session` is left without them)
+ */
+inline void carry_over_resumed_session(events::StreamSession &old_session, events::StreamSession &new_session) {
+  // Carry over the old session display handle, and the producers streaming it
+  new_session.wayland_display = std::move(old_session.wayland_display);
+  new_session.producer_name = old_session.producer_name;
+  new_session.audio_sink = old_session.audio_sink; // ...and their audio sink, removed when the session stops
+  // Carry over the old session devices, they'll be already plugged into the container
+  new_session.mouse = std::move(old_session.mouse);
+  new_session.keyboard = std::move(old_session.keyboard);
+  new_session.joypads = std::move(old_session.joypads);
+  new_session.control_feedback = std::move(old_session.control_feedback); // the joypads send through it
+  new_session.pen_tablet = std::move(old_session.pen_tablet);
+  new_session.touch_screen = std::move(old_session.touch_screen);
+}
+
 std::string get_rtsp_ip_string(const std::string &local_ip, const events::StreamSession &session) {
   auto use_fake_ip = utils::get_env("WOLF_USE_RTSP_FAKE_IP", "TRUE") == "TRUE"s;
   return use_fake_ip ? session.rtsp_fake_ip : local_ip;
+}
+
+/**
+ * /launch without the HTTP: creates the client's StreamSession and starts it. Returns it, or nullptr if the query is
+ * invalid.
+ */
+inline std::shared_ptr<events::StreamSession> launch_session(const SimpleWeb::CaseInsensitiveMultimap &query,
+                                                             const std::string &client_ip,
+                                                             const state::PairedClient &current_client,
+                                                             const immer::box<state::AppState> &state,
+                                                             const events::App &app) {
+  auto new_session = create_run_session(query, client_ip, current_client, state, app);
+  if (new_session) {
+    // Listed before its handlers run: a runner they start treats a session that isn't listed as stopped
+    state->running_sessions->update(
+        [new_session](const immer::vector<events::StreamSession> &ses_v) { return ses_v.push_back(*new_session); });
+    state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
+  }
+  return new_session;
 }
 
 // Forward declaration so launch() can delegate to resume() when a session is already running.
@@ -470,6 +515,11 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
             const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::Request> &request,
             const state::PairedClient &current_client,
             const immer::box<state::AppState> &state);
+
+inline std::shared_ptr<events::StreamSession> resume_session(const SimpleWeb::CaseInsensitiveMultimap &query,
+                                                             const std::string &client_ip,
+                                                             const state::PairedClient &current_client,
+                                                             const immer::box<state::AppState> &state);
 
 void launch(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::Response> &response,
             const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::Request> &request,
@@ -500,14 +550,11 @@ void launch(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
   }
 
   auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
-  auto new_session = create_run_session(request->parse_query_string(), client_ip, current_client, state, app.value());
+  auto new_session = launch_session(request->parse_query_string(), client_ip, current_client, state, app.value());
   if (!new_session) {
     server_error<SimpleWeb::HTTPS>(response);
     return;
   }
-  state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
-  state->running_sessions->update(
-      [new_session](const immer::vector<events::StreamSession> &ses_v) { return ses_v.push_back(*new_session); });
 
   auto rtsp_ip = get_rtsp_ip_string(get_host_ip<SimpleWeb::HTTPS>(request, state), *new_session);
   auto xml = moonlight::launch_success(rtsp_ip, std::to_string(get_port(state::RTSP_SETUP_PORT)));
@@ -521,35 +568,41 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
   log_req<SimpleWeb::HTTPS>(request);
 
   auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
-  auto old_session = state::get_session_by_client(state->running_sessions->load(), current_client);
-  if (old_session) {
-    auto new_session =
-        create_run_session(request->parse_query_string(), client_ip, current_client, state, *old_session->app);
-    if (!new_session) {
-      server_error<SimpleWeb::HTTPS>(response);
-      return;
-    }
-    // Carry over the old session display handle, and the producers streaming it
-    new_session->wayland_display = std::move(old_session->wayland_display);
-    new_session->producer_name = old_session->producer_name;
-    // Carry over the old session devices, they'll be already plugged into the container
-    new_session->mouse = std::move(old_session->mouse);
-    new_session->keyboard = std::move(old_session->keyboard);
-    new_session->joypads = std::move(old_session->joypads);
-    new_session->pen_tablet = std::move(old_session->pen_tablet);
-    new_session->touch_screen = std::move(old_session->touch_screen);
-
-    state->running_sessions->update([&old_session, new_session](const immer::vector<events::StreamSession> ses_v) {
-      return state::remove_session(ses_v, old_session.value()).push_back(*new_session);
-    });
-
+  if (!state::get_session_by_client(state->running_sessions->load(), current_client)) {
+    logs::log(logs::warning, "[HTTPS] Received resume event from an unregistered session, ip: {}", client_ip);
+    server_error<SimpleWeb::HTTPS>(response);
+  } else if (auto new_session = resume_session(request->parse_query_string(), client_ip, current_client, state)) {
     auto rtsp_ip = get_rtsp_ip_string(get_host_ip<SimpleWeb::HTTPS>(request, state), *new_session);
     auto xml = moonlight::launch_resume(rtsp_ip, std::to_string(get_port(state::RTSP_SETUP_PORT)));
     send_xml<SimpleWeb::HTTPS>(response, SimpleWeb::StatusCode::success_ok, xml);
   } else {
-    logs::log(logs::warning, "[HTTPS] Received resume event from an unregistered session, ip: {}", client_ip);
     server_error<SimpleWeb::HTTPS>(response);
   }
+}
+
+/**
+ * /resume without the HTTP: replaces the client's running StreamSession with a new instance (new keys, display mode)
+ * that keeps what's still running for it. Returns the new session, or nullptr if there's none to resume or the query
+ * is invalid.
+ */
+inline std::shared_ptr<events::StreamSession> resume_session(const SimpleWeb::CaseInsensitiveMultimap &query,
+                                                             const std::string &client_ip,
+                                                             const state::PairedClient &current_client,
+                                                             const immer::box<state::AppState> &state) {
+  auto old_session = state::get_session_by_client(state->running_sessions->load(), current_client);
+  if (old_session) {
+    auto new_session = create_run_session(query, client_ip, current_client, state, *old_session->app);
+    if (!new_session) {
+      return nullptr;
+    }
+    carry_over_resumed_session(*old_session, *new_session);
+
+    state->running_sessions->update([&old_session, new_session](const immer::vector<events::StreamSession> ses_v) {
+      return state::remove_session(ses_v, old_session.value()).push_back(*new_session);
+    });
+    return new_session;
+  }
+  return nullptr;
 }
 
 void cancel(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::Response> &response,

@@ -10,6 +10,7 @@ using Catch::Matchers::Equals;
 #include <future>
 #include <gst-plugin/audio.hpp>
 #include <gst-plugin/video.hpp>
+#include <gst/app/gstappsrc.h>
 #include <moonlight/fec.hpp>
 #include <streaming/streaming.hpp>
 #include <string>
@@ -506,6 +507,36 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Audio RTP packet creation", "[GSTPlugin
   }
 }
 
+TEST_CASE_METHOD(GStreamerTestsFixture, "Audio payloader refuses a missing aes_key", "[GSTPlugin]") {
+  // An empty aes_key= in the pipeline string arrives as a NULL string: it used to be dereferenced (hex_to_str(NULL))
+  auto pay = (gst_rtp_moonlight_pay_audio *)g_object_new(gst_TYPE_rtp_moonlight_pay_audio, nullptr);
+  g_object_set(pay, "aes_key", nullptr, "aes_iv", nullptr, nullptr);
+  REQUIRE(pay->aes_key.empty());
+  REQUIRE(pay->aes_iv.empty());
+  g_object_unref(pay);
+
+  // Encrypting with it would read 16 bytes of key: the stream errors out instead
+  gst_element_register(nullptr, "rtpmoonlightpay_audio", GST_RANK_PRIMARY, gst_TYPE_rtp_moonlight_pay_audio);
+  GError *error = nullptr;
+  auto pipeline = gst_parse_launch("appsrc name=src ! rtpmoonlightpay_audio name=pay encrypt=true ! fakesink", &error);
+  REQUIRE(error == nullptr);
+  auto pay_el = gst_bin_get_by_name(GST_BIN(pipeline), "pay");
+  g_object_set(pay_el, "aes_key", nullptr, nullptr);
+  gst_object_unref(pay_el);
+  auto src = gst_bin_get_by_name(GST_BIN(pipeline), "src");
+  gst_element_set_state(pipeline, GST_STATE_PLAYING);
+  auto payload_str = "TUNZ TUNZ TUMP TUMP!"s;
+  gst_app_src_push_buffer(GST_APP_SRC(src), gst_buffer_new_and_fill(payload_str.size(), payload_str.c_str()));
+  auto bus = gst_element_get_bus(pipeline);
+  auto msg = gst_bus_timed_pop_filtered(bus, 5 * GST_SECOND, GST_MESSAGE_ERROR);
+  REQUIRE(msg != nullptr);
+  gst_message_unref(msg);
+  gst_object_unref(bus);
+  gst_object_unref(src);
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  gst_object_unref(pipeline);
+}
+
 TEST_CASE_METHOD(GStreamerTestsFixture, "Audio RTP without encryption", "[GSTPlugin]") {
   auto rtpmoonlightpay = std::shared_ptr<gst_rtp_moonlight_pay_audio>(
       (gst_rtp_moonlight_pay_audio *)g_object_new(gst_TYPE_rtp_moonlight_pay_audio, nullptr),
@@ -606,6 +637,7 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a stuck pipeline doesn't block
     auto other = event_bus->register_handler<immer::box<events::IDRRequestEvent>>([]() {});
     return std::chrono::steady_clock::now() - start;
   };
+  CHECK(fire_then_register(events::IDRRequestEvent{.session_id = 1}) < 1s);
   CHECK(fire_then_register(events::PauseStreamEvent{.session_id = 1}) < 1s);
   CHECK(fire_then_register(events::StopStreamEvent{.session_id = 2}) < 1s);
   CHECK(fire_then_register(events::StopStreamEvent{.session_id = 3}) < 1s);
@@ -616,4 +648,67 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a stuck pipeline doesn't block
   REQUIRE(stopped_video.wait_for(10s) == std::future_status::ready);
   REQUIRE(stopped_audio.wait_for(10s) == std::future_status::ready);
   REQUIRE(paused_audio.wait_for(10s) == std::future_status::ready);
+}
+
+/*
+ * A stop while the pipeline is still prerolling (its first buffer hasn't reached the sink) must still end it.
+ * An EOS sent to the pipeline itself holds the pipeline's STATE_LOCK until the source takes it, and the preroll needs
+ * that lock to finish: the pipeline would hang forever, leaking it and a GStreamer pool thread.
+ */
+TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a pipeline during preroll ends it", "[GSTPlugin]") {
+  using namespace wolf::core;
+  using namespace std::chrono_literals;
+
+  auto event_bus = std::make_shared<events::EventBusType>();
+  // The first buffer parks the streaming thread for 2s, so the (async) sink is still prerolling when the stop comes
+  auto video_session = immer::box<events::VideoSession>(
+      events::VideoSession{.display_mode = {.width = 64, .height = 64, .refreshRate = 30},
+                           .gst_pipeline = "videotestsrc ! identity sleep-time=2000000 ! fakesink",
+                           .session_id = 1,
+                           .timeout_ms = 1000,
+                           .packet_size = 1024,
+                           .fec_percentage = 20,
+                           .min_required_fec_packets = 2,
+                           .bitrate_kbps = 1000,
+                           .slices_per_frame = 1,
+                           .client_ip = "127.0.0.1"});
+  // Not std::async: its future would block the test forever in its destructor if the pipeline hangs
+  auto ended = std::make_shared<std::promise<void>>();
+  auto ended_future = ended->get_future();
+  std::thread([=]() {
+    streaming::start_streaming_video(
+        video_session,
+        [] { return std::string(); },
+        event_bus,
+        "127.0.0.1",
+        1,
+        std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>(),
+        nullptr);
+    ended->set_value();
+  }).detach();
+  std::this_thread::sleep_for(500ms);
+
+  event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = 1}));
+  REQUIRE(ended_future.wait_for(10s) == std::future_status::ready);
+}
+
+TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a consumer whose producer never sends ends it", "[GSTPlugin]") {
+  using namespace wolf::core;
+  // No interpipesink named nobody_audio: the source never gets a buffer (an app without an audio server)
+  auto pipeline = gstreamer::gst_element_ptr(
+      gst_parse_launch("interpipesrc listen-to=nobody_audio is-live=true stream-sync=restart-ts max-bytes=0 "
+                       "max-buffers=3 block=false ! fakesink",
+                       nullptr),
+      ::gst_object_unref);
+  REQUIRE(pipeline);
+  gst_element_set_state(pipeline.get(), GST_STATE_PLAYING);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+  gstreamer::send_eos_async(pipeline.get());
+  auto bus = gst_element_get_bus(pipeline.get());
+  auto msg = gst_bus_timed_pop_filtered(bus, 5 * GST_SECOND, GST_MESSAGE_EOS);
+  REQUIRE(msg != nullptr);
+  gst_message_unref(msg);
+  gst_object_unref(bus);
+  gst_element_set_state(pipeline.get(), GST_STATE_NULL);
 }

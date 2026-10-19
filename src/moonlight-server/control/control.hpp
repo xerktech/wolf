@@ -35,6 +35,12 @@ immer::vector<ENetPeer *>
 superseded_peers(const enet_clients_map &connected_clients, const ENetPeer *new_peer, std::size_t session_id);
 
 /**
+ * True when a peer of this stream instance (same session_id and ENet secret) is connected. Peers of an instance that
+ * a /resume replaced don't count. The IP fallback on connect never matches such a session.
+ */
+bool has_connected_peer(const enet_clients_map &connected_clients, const events::StreamSession &session);
+
+/**
  * True when `peer_session` (the stream a peer attached to) has been replaced by a /resume: the running session with
  * the same session_id now carries a different ENet secret. A pause raised by such a peer must not end the new stream.
  */

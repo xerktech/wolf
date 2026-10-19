@@ -1,4 +1,5 @@
 #include <immer/vector_transient.hpp>
+#include <mutex>
 #include <sessions/common.hpp>
 #include <sessions/handlers.hpp>
 #include <state/config.hpp>
@@ -69,6 +70,10 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                        const std::string &runtime_dir,
                        const std::optional<AudioServer> &audio_server) {
   immer::vector_transient<immer::box<events::EventBusHandlers>> handlers;
+  // Serialises joins and leaves: a join reads which lobby the session is in, leaves it and joins the new one, so
+  // concurrent joins would otherwise leave a session in two lobbies or listed twice in one.
+  // Recursive: leaving can stop a lobby, whose handler fires the LeaveLobbyEvent of its other sessions on this thread.
+  auto membership_lock = std::make_shared<std::recursive_mutex>();
 
   // On create lobby event
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::CreateLobbyEvent>>(
@@ -107,8 +112,12 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                                             ev_bus);
           }).detach();
 
+          // For the runner: true once the lobby was stopped (see events::Runner::run)
+          std::function<bool()> stopped = [lobbies = app_state->lobbies, id = lobby->id]() {
+            return !state::get_lobby_by_id(lobbies->load(), id);
+          };
           auto w_display_ready = on_ready->get_future().then(
-              [lobby, runtime_dir, ev_bus, audio_server, lobby_settings, host = app_state->host](auto fut) {
+              [lobby, runtime_dir, ev_bus, audio_server, lobby_settings, host = app_state->host, stopped](auto fut) {
                 streaming::WaylandDisplayReady ready = fut.get();
 
                 auto wl_state =
@@ -116,7 +125,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                 // Set the wayland display
                 lobby->wayland_display->store(wl_state);
 
-                if (!wait_for_wayland_socket(runtime_dir, ready.wayland_socket_name)) {
+                if (!wait_for_wayland_socket(runtime_dir, ready.wayland_socket_name, true)) {
                   logs::log(logs::error,
                             "[LOBBY] Wayland socket {} was not ready, aborting runner startup",
                             ready.wayland_socket_name);
@@ -154,7 +163,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                                      .app_host_state_folder = std::filesystem::path(host->host_base_state_folder) /
                                                               lobby_settings->runner_state_folder,
                                      .xdg_runtime_dir = runtime_dir,
-                                     .client_settings = lobby_settings->client_settings}});
+                                     .client_settings = lobby_settings->client_settings,
+                                     .is_stopped = stopped}});
                     // Runner process ended, stop the lobby
                     lobby->wayland_display->store(nullptr);
 
@@ -195,6 +205,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
   // When a Moonlight client joins a lobby
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::JoinLobbyEvent>>(
       [=](const immer::box<events::JoinLobbyEvent> &join_lobby_event) {
+        std::lock_guard membership_guard(*membership_lock);
         auto lobbies = app_state->lobbies->load();
         auto lobby = state::get_lobby_by_id(lobbies.get(), join_lobby_event->lobby_id);
         auto sessions = app_state->running_sessions->load();
@@ -210,10 +221,23 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         }
         logs::log(logs::info, "[LOBBY] Session {} joining lobby {}", session->session_id, lobby->id);
 
+        auto current_lobby = state::get_lobby_by_connected_session(lobbies.get(), std::to_string(session->session_id));
+        if (current_lobby && current_lobby->id == lobby->id) {
+          logs::log(logs::debug, "[LOBBY] Session {} is already in lobby {}", session->session_id, lobby->id);
+          join_lobby_event->error_message.get()->set_value("");
+          return;
+        }
+
         if (!lobby->multi_user && lobby->connected_sessions->load()->size() >= 1) {
           logs::log(logs::error, "[LOBBY] Lobby {} is full", lobby->id);
           join_lobby_event->error_message.get()->set_value("Lobby is full");
           return;
+        }
+
+        // A session is in one lobby at most: a new stream resolves its producers to the first lobby that lists it
+        // (state::stream_producer_name), while a running one follows the last switch
+        if (current_lobby) {
+          leave_lobby(app_state->event_bus, *current_lobby, *session);
         }
 
         // Migrate joypads BEFORE adding the session to connected_sessions, or the relayed unplug races the queued plug
@@ -258,6 +282,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
   // When a Moonlight session leaves the lobby
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::LeaveLobbyEvent>>(
       [=](const immer::box<events::LeaveLobbyEvent> &leave_lobby_event) {
+        std::lock_guard membership_guard(*membership_lock);
         auto lobbies = app_state->lobbies->load();
         auto lobby = state::get_lobby_by_id(lobbies.get(), leave_lobby_event->lobby_id);
         auto sessions = app_state->running_sessions->load();

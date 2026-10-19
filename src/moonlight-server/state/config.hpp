@@ -43,14 +43,17 @@ std::string encoder_video_params(std::string_view tech, // "h264", "h265" or "av
 /**
  * Side effect, will atomically update the paired clients list in cfg
  * and persist the new state to disk
+ * A re-pair of an already paired cert replaces its entry but keeps its settings
+ * Returns false when the config file couldn't be saved: the paired clients are then left as they were
  */
-void pair(const Config &cfg, const PairedClient &client);
+bool pair(const Config &cfg, const PairedClient &client);
 
 /**
  * Side effect, will atomically remove the client from the list of paired clients
  * and persist the new state to disk
+ * Returns false when the config file couldn't be saved: the change is still applied in memory
  */
-void unpair(const Config &cfg, const PairedClient &client);
+bool unpair(const Config &cfg, const PairedClient &client);
 
 /**
  * Returns the first PairedClient with the given client_cert
@@ -185,20 +188,27 @@ static moonlight::control::pkts::CONTROLLER_TYPE get_controller_type(const Contr
 
 std::optional<PairedClient> get_client_by_id(const Config &cfg, const std::string &client_id);
 
+enum class ConfigUpdate {
+  SAVED,
+  NOT_SAVED, // Applied in memory, but the config file couldn't be written
+  NOT_FOUND
+};
+
 /**
  * Replaces the specified client_id with update_fn(current client)
  * update_fn runs while no other config update can, so it must build its result from the client it is given
- * Returns false when there is no such client
+ * Returns NOT_FOUND when there is no such client
  * Side effects: will save back the configuration to disk
  */
-bool update_client_settings(const Config &cfg,
-                            std::size_t client_id,
-                            const std::function<PairedClient(const PairedClient &)> &update_fn);
+ConfigUpdate update_client_settings(const Config &cfg,
+                                    std::size_t client_id,
+                                    const std::function<PairedClient(const PairedClient &)> &update_fn);
 
 /**
  * Replaces the currently loaded profiles with update_fn(current profiles)
  * update_fn runs while no other config update can, so it must build its result from the list it is given
  * Side effects: will save back the configuration to disk
+ * Returns false when the config file couldn't be saved: the change is still applied in memory
  */
-void update_profiles(const Config &cfg, const std::function<ProfilesList(const ProfilesList &)> &update_fn);
+bool update_profiles(const Config &cfg, const std::function<ProfilesList(const ProfilesList &)> &update_fn);
 } // namespace state

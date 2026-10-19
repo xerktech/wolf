@@ -49,6 +49,8 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
                        .summary = "Pair a client",
                        .request_description = APIDescription{.json_schema = rfl::json::to_schema<PairRequest>()},
                        .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                                {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                                {404, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                                 {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
                        .handler = [this](auto req, auto socket) { endpoint_Pair(req, socket); },
                    });
@@ -60,6 +62,8 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
           .summary = "Unpair a client",
           .request_description = APIDescription{.json_schema = rfl::json::to_schema<UnpairClientRequest>()},
           .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                   {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                   {404, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                    {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
           .handler = [this](auto req, auto socket) { endpoint_UnpairClient(req, socket); },
       });
@@ -109,6 +113,8 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
                        .request_description =
                            APIDescription{.json_schema = rfl::json::to_schema<rfl::Reflector<events::App>::ReflType>()},
                        .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                                {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                                {409, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                                 {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
                        .handler = [this](auto req, auto socket) { endpoint_AddApp(req, socket); },
                    });
@@ -118,6 +124,7 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
                    {.summary = "Remove a Moonlight app",
                     .request_description = APIDescription{.json_schema = rfl::json::to_schema<AppDeleteRequest>()},
                     .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                             {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                              {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
                     .handler = [this](auto req, auto socket) { endpoint_RemoveApp(req, socket); }});
 
@@ -142,6 +149,7 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
           .request_description =
               APIDescription{.json_schema = rfl::json::to_schema<rfl::Reflector<events::Profile>::ReflType>()},
           .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                   {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                    {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
           .handler = [this](auto req, auto socket) { endpoint_AddProfile(req, socket); },
       });
@@ -153,6 +161,7 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
           .summary = "Remove a profile",
           .request_description = APIDescription{.json_schema = rfl::json::to_schema<ProfileRemoveRequest>()},
           .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                   {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                    {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
           .handler = [this](auto req, auto socket) { endpoint_RemoveProfile(req, socket); },
       });
@@ -180,6 +189,8 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
               APIDescription{.json_schema = rfl::json::to_schema<rfl::Reflector<events::StreamSession>::ReflType>()},
           .response_description = {{200, {.json_schema = rfl::json::to_schema<StreamSessionCreated>()}},
                                    {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                   {404, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                   {409, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                    {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
           .handler = [this](auto req, auto socket) { endpoint_StreamSessionAdd(req, socket); },
       });
@@ -192,6 +203,7 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
           .request_description = APIDescription{.json_schema = rfl::json::to_schema<StreamSessionStartRequest>()},
           .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
                                    {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                   {404, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                    {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
           .handler = [this](auto req, auto socket) { endpoint_StreamSessionStart(req, socket); },
       });
@@ -203,6 +215,8 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
           .summary = "Pause a stream session",
           .request_description = APIDescription{.json_schema = rfl::json::to_schema<StreamSessionPauseRequest>()},
           .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                   {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                   {404, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                    {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
           .handler = [this](auto req, auto socket) { endpoint_StreamSessionPause(req, socket); },
       });
@@ -214,6 +228,8 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
           .summary = "Stop a stream session",
           .request_description = APIDescription{.json_schema = rfl::json::to_schema<StreamSessionStopRequest>()},
           .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                   {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                   {404, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                    {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
           .handler = [this](auto req, auto socket) { endpoint_StreamSessionStop(req, socket); },
       });
@@ -225,6 +241,8 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
           .summary = "Handle input for a stream session",
           .request_description = APIDescription{.json_schema = rfl::json::to_schema<StreamSessionHandleInputRequest>()},
           .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                   {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                   {404, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                    {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
           .handler = [this](auto req, auto socket) { endpoint_StreamSessionHandleInput(req, socket); },
       });
@@ -235,6 +253,8 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
                        .summary = "Start a runner in a given session",
                        .request_description = APIDescription{.json_schema = rfl::json::to_schema<RunnerStartRequest>()},
                        .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                                {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                                {404, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                                 {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
                        .handler = [this](auto req, auto socket) { endpoint_RunnerStart(req, socket); },
                    });
@@ -270,6 +290,10 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
           .summary = "Join a lobby",
           .request_description = APIDescription{.json_schema = rfl::json::to_schema<events::JoinLobbyEvent>()},
           .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                   {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                   {403, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                   {404, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                   {409, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                    {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
           .handler = [this](auto req, auto socket) { endpoint_LobbyJoin(req, socket); },
       });
@@ -281,6 +305,7 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
           .summary = "Leave a lobby",
           .request_description = APIDescription{.json_schema = rfl::json::to_schema<events::LeaveLobbyEvent>()},
           .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                   {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                    {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
           .handler = [this](auto req, auto socket) { endpoint_LobbyLeave(req, socket); },
       });
@@ -292,6 +317,9 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
           .summary = "Stop a lobby",
           .request_description = APIDescription{.json_schema = rfl::json::to_schema<events::StopLobbyEvent>()},
           .response_description = {{200, {.json_schema = rfl::json::to_schema<GenericSuccessResponse>()}},
+                                   {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                   {403, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
+                                   {404, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                    {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
           .handler = [this](auto req, auto socket) { endpoint_LobbyStop(req, socket); },
       });
@@ -322,6 +350,7 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
                       "progress event will be a single line encoded as JSON.",
        .request_description = APIDescription{.json_schema = rfl::json::to_schema<DockerPullImageRequest>()},
        .response_description = {{200, {.json_schema = rfl::json::to_schema<DockerPullImageResponse>()}},
+                                {400, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}},
                                 {500, {.json_schema = rfl::json::to_schema<GenericErrorResponse>()}}},
        .handler = [this](auto req, auto socket) { endpoint_DockerPullImage(req, socket); }});
 
@@ -399,6 +428,12 @@ void UnixSocketServer::send_data(std::shared_ptr<UnixSocket> socket, std::string
 }
 
 void UnixSocketServer::queue_write(const std::shared_ptr<UnixSocket> &socket, std::shared_ptr<const std::string> data) {
+  // The write queue belongs to the io_context thread. Callers should already be on it, but a racy queue only shows
+  // under TSan or a stress rig, so a caller on another thread is moved there instead of corrupting the queue.
+  if (!state_->io_context.get_executor().running_in_this_thread()) {
+    boost::asio::post(state_->io_context, [this, socket, data = std::move(data)]() { queue_write(socket, data); });
+    return;
+  }
   if (!socket->is_alive) {
     return;
   }
@@ -455,8 +490,9 @@ void UnixSocketServer::handle_request(const HTTPRequest &req, std::shared_ptr<Un
             std::string_view(req.body).substr(0, 1024));
 
   if (!state_->http.handle_request(req, socket)) {
+    // Not closed here: that would cancel the reply's write, still in flight. Like every other reply, the socket
+    // closes once the write completes and the last reference to it goes.
     send_http(socket, 404, "");
-    close(*socket);
   }
 }
 

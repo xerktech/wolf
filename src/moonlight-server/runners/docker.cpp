@@ -1,3 +1,4 @@
+#include <atomic>
 #include <runners/docker.hpp>
 
 namespace wolf::core::docker {
@@ -38,7 +39,8 @@ void RunDocker::run(std::string_view session_id,
                     const immer::array<std::string> &virtual_inputs,
                     const immer::array<std::pair<std::string, std::string>> &paths,
                     const immer::map<std::string, std::string> &env_variables,
-                    std::string_view render_node) {
+                    std::string_view render_node,
+                    const std::function<bool()> &is_stopped) {
 
   std::vector<std::string> full_env;
   full_env.insert(full_env.end(), this->container.env.begin(), this->container.env.end());
@@ -208,19 +210,37 @@ void RunDocker::run(std::string_view session_id,
       logs::log(logs::warning, "[DOCKER] Unable to inspect container {} for hostname", container_id);
     }
 
+    const auto stop_env = utils::get_env("WOLF_STOP_CONTAINER_ON_EXIT");
+    const bool remove_on_exit = stop_env && std::string(stop_env) == "TRUE";
+    auto removed = std::make_shared<std::atomic_bool>(false);
+    // Remove it right in the stop handler rather than after the polling loop below notices the exit: on shutdown
+    // Wolf exits right after firing the stops, before this thread would get there.
+    auto stop_container = [container_id, this, remove_on_exit, removed]() {
+      docker_api.stop_by_id(container_id);
+      if (remove_on_exit && !removed->exchange(true)) {
+        docker_api.remove_by_id(container_id);
+      }
+    };
+
     auto terminate_handler = this->ev_bus->register_handler<immer::box<events::StopStreamEvent>>(
-        [session_id, container_id, this](const immer::box<events::StopStreamEvent> &terminate_ev) {
+        [session_id, stop_container](const immer::box<events::StopStreamEvent> &terminate_ev) {
           if (std::to_string(terminate_ev->session_id) == session_id) {
-            docker_api.stop_by_id(container_id);
+            stop_container();
           }
         });
 
     auto terminate_lobby_handler = this->ev_bus->register_handler<immer::box<events::StopLobbyEvent>>(
-        [session_id, container_id, this](const immer::box<events::StopLobbyEvent> &terminate_ev) {
+        [session_id, stop_container](const immer::box<events::StopLobbyEvent> &terminate_ev) {
           if (terminate_ev->lobby_id == session_id) {
-            docker_api.stop_by_id(container_id);
+            stop_container();
           }
         });
+
+    // A stop fired while the container was being created never reached the handlers above (see events::Runner::run)
+    if (is_stopped && is_stopped()) {
+      logs::log(logs::debug, "[DOCKER] Session {} was stopped while starting, stopping container", session_id);
+      stop_container();
+    }
 
     auto unplug_device_handler = this->ev_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
         [session_id, container_id, hw_db_path, this](const immer::box<events::UnplugDeviceEvent> &ev) {
@@ -282,7 +302,9 @@ void RunDocker::run(std::string_view session_id,
       // value_or() avoids dereferencing nullopt when the container was removed mid-session.
     } while (docker_api.get_by_id(container_id).value_or(Container{.status = EXITED}).status == RUNNING);
 
-    logs::log(logs::debug, "[DOCKER] Container logs: \n{}", docker_api.get_logs(container_id));
+    if (!removed->load()) {
+      logs::log(logs::debug, "[DOCKER] Container logs: \n{}", docker_api.get_logs(container_id));
+    }
     logs::log(logs::debug, "[DOCKER] Stopping container: {}", docker_container->name);
 
     this->ev_bus->fire_event(immer::box<events::DockerContainerStopped>{events::DockerContainerStopped{
@@ -291,11 +313,8 @@ void RunDocker::run(std::string_view session_id,
         .session_id = std::string(session_id),
     }});
 
-    if (const auto env = utils::get_env("WOLF_STOP_CONTAINER_ON_EXIT")) {
-      if (std::string(env) == "TRUE") {
-        docker_api.stop_by_id(container_id);
-        docker_api.remove_by_id(container_id);
-      }
+    if (remove_on_exit && !removed->load()) {
+      stop_container();
     }
 
     logs::log(logs::info, "Stopped container: {}", docker_container->name);

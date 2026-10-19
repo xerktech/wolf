@@ -71,7 +71,8 @@ void start_rtp_ping(unsigned short video_port,
     }).detach();
 
   } catch (std::exception &e) {
-    logs::log(logs::warning, "[RTP] Unable to start RTP server: {}", e.what());
+    logs::log(logs::error, "[RTP] Unable to start RTP server: {}", e.what());
+    throw; // No stream can start without the pings: let the caller shut down
   }
 }
 

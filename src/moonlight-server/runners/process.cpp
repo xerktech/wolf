@@ -56,6 +56,19 @@ struct close_inherited_fds : bp::extend::handler {
   }
 };
 
+/**
+ * Runs inside an event-bus handler, so it must not throw: the bus swallows a std::system_error by skipping every
+ * handler after this one (the pipelines' and the session's own stop). killpg fails once the group is gone, e.g. a stop
+ * that races the app's own exit, or a second stop of the same session (EINVAL: terminate() invalidated the group).
+ */
+static void terminate_group(bp::group &group_proc) {
+  std::error_code ec;
+  group_proc.terminate(ec); // Manually terminate the process
+  if (ec) {
+    logs::log(logs::debug, "[PROCESS] Unable to terminate process group: {}", ec.message());
+  }
+}
+
 void RunProcess::run(std::string_view session_id,
                      std::string_view app_state_folder,
                      std::string_view host_xdg_runtime_dir,
@@ -63,7 +76,8 @@ void RunProcess::run(std::string_view session_id,
                      const immer::array<std::string> &virtual_inputs,
                      const immer::array<std::pair<std::string, std::string>> &paths,
                      const immer::map<std::string, std::string> &env_variables,
-                     std::string_view render_node) {
+                     std::string_view render_node,
+                     const std::function<bool()> &is_stopped) {
   logs::log(logs::debug, "[PROCESS] Starting process: {}", this->run_cmd);
 
   bp::child child_proc;
@@ -93,16 +107,23 @@ void RunProcess::run(std::string_view session_id,
   auto terminate_handler = this->ev_bus->register_handler<immer::box<StopStreamEvent>>(
       [&group_proc, session_id](const immer::box<StopStreamEvent> &terminate_ev) {
         if (std::to_string(terminate_ev->session_id) == session_id) {
-          group_proc.terminate(); // Manually terminate the process
+          terminate_group(group_proc);
         }
       });
 
   auto terminate_lobby_handler = this->ev_bus->register_handler<immer::box<StopLobbyEvent>>(
       [&group_proc, session_id](const immer::box<StopLobbyEvent> &terminate_ev) {
         if (terminate_ev->lobby_id == session_id) {
-          group_proc.terminate(); // Manually terminate the process
+          terminate_group(group_proc);
         }
       });
+
+  // A stop fired while the app was being spawned never reached the handlers above: the session is gone, so stop the
+  // app now instead of leaving it running with nobody to end it. Registering waited for any stop still being fired.
+  if (is_stopped && is_stopped()) {
+    logs::log(logs::debug, "[PROCESS] Session {} was stopped while starting, terminating", session_id);
+    terminate_group(group_proc);
+  }
 
   // This will stop here until the process is over
   child_proc.wait(); // to avoid a zombie process & get the exit code
