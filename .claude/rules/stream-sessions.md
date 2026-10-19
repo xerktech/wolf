@@ -112,3 +112,10 @@ paths:
   - A seq past UINT32_MAX is dropped on purpose (it would reuse a nonce, and accept that packet's replay).
   - Tests: `tests/testControl.cpp` "Control replay window", "Control V2 encryption", "control: a
     replayed encrypted packet is dropped"; `tests/testRTSP.cpp` DESCRIBE / "ANNOUNCE control".
+- ENet isn't thread-safe; feedback and the stop's termination are sent from other threads, so every ENet
+  call on a control host holds `enet_mutex` (`control.cpp`) (XERK-2101).
+  - `run_control` never blocks inside `enet_host_service` (timeout 0 under the lock); it waits on the socket
+    outside the lock, capped at `max_unlocked_wait` so ENet's retransmit and ping timers still run.
+  - `send_seq++` and the send share one lock, so the wire order is the seq order.
+  - Only ThreadSanitizer catches a missing lock (dozens of races); the seq order fails without it.
+    Tests: "control: joypad feedback sent while the client streams input arrives intact".

@@ -18,9 +18,10 @@ paths:
   - Uninstrumented libs (GLib, GStreamer, gst-wayland-display, libcrypto) sync through futexes or
     atomics TSan can't see: hundreds of reports otherwise, all crossing their threads.
   - So Wolf code running on a GStreamer thread (pipeline callbacks, the RTP payloaders) is not covered.
-  - Never suppress a race in Wolf's own code without a ticket, and name it on the line (XERK-2101).
+  - Never suppress a race in Wolf's own code without a ticket, and name the ticket on the line.
 - What it catches: API `state_->sockets` touched off the io_context thread (removing `sse_broadcast`'s
   `dispatch` gives 9 reports in `[API]`) and concurrent process-group terminates (`[PROCESS]`).
+- It also catches an ENet call on a control host without `enet_mutex` (dozens of reports in `[ENET]`).
   - Not an off-thread `write_queue` write: asio's internal mutexes give TSan a happens-before.
   - Not the env leak: glibc's environ is uninstrumented; only the env test's assertion catches it.
 - A flake that shows only on CI's 4 vCPUs reproduces with `taskset -c 0-3` and the JUnit reporter.
