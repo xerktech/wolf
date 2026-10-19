@@ -433,7 +433,7 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
                                moonlight::control::ControlEncryption::V2);
                      });
 
-    // A second ANNOUNCE without it doesn't take the stream back to V1
+    // Until a control packet authenticates, an ANNOUNCE is only a hint: a later one replaces it (see control.cpp)
     tcp_tester::create_client(ioc, port, state)
         ->run("ANNOUNCE streamid=control/13/0 RTSP/1.0\n"
               "CSeq: 7\n"
@@ -450,7 +450,8 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
                 REQUIRE(response.has_value());
                 REQUIRE(response.value().response.status_code == 200);
                 REQUIRE(*state->load()->front().control_stream->encryption.load() ==
-                        moonlight::control::ControlEncryption::V2);
+                        moonlight::control::ControlEncryption::V1);
+                REQUIRE_FALSE(state->load()->front().control_stream->encryption_negotiated);
               });
   }
 
@@ -478,6 +479,47 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
                        // An older client that doesn't enable V2 keeps V1
                        REQUIRE(*state->load()->front().control_stream->encryption.load() ==
                                moonlight::control::ControlEncryption::V1);
+                     });
+
+    // Once the client's first control packet has authenticated with V1, a later (spoofed) ANNOUNCE can't switch it
+    state->load()->front().control_stream->authenticate_encryption(moonlight::control::ControlEncryption::V1);
+    tcp_tester::create_client(ioc, port, state)
+        ->run("ANNOUNCE streamid=control/13/0 RTSP/1.0\n"
+              "CSeq: 8\n"
+              "Host: 0.0.0.0\n"
+              "Content-type: application/sdp\n"
+              "Content-length: 145\n"
+              "\n"
+              "v=0\n"
+              "a=x-ss-general.encryptionEnabled:1 \n"
+              "a=x-nv-video[0].clientViewportWd:1920 \n"
+              "a=x-nv-video[0].clientViewportHt:1080 \n"
+              "a=x-nv-video[0].maxFPS:60 \n"sv,
+              [state](std::optional<RTSP_PACKET> response) {
+                REQUIRE(response.has_value());
+                REQUIRE(response.value().response.status_code == 200);
+                REQUIRE(*state->load()->front().control_stream->encryption.load() ==
+                        moonlight::control::ControlEncryption::V1);
+              });
+  }
+
+  SECTION("ANNOUNCE without a display mode") {
+    wolf_client->run("ANNOUNCE streamid=control/13/0 RTSP/1.0\n"
+                     "CSeq: 9\n"
+                     "Host: 0.0.0.0\n"
+                     "Content-type: application/sdp\n"
+                     "Content-length: 89\n"
+                     "\n"
+                     "v=0\n"
+                     "a=x-ss-general.encryptionEnabled:1 \n"
+                     "a=x-nv-video[0].clientViewportHt:1080 \n"
+                     "a=x-nv-video[0].maxFPS:0 \n"sv,
+                     [state](std::optional<RTSP_PACKET> response) {
+                       REQUIRE(response.has_value());
+                       REQUIRE(response.value().response.status_code == 400);
+                       REQUIRE(response.value().seq_number == 9);
+                       // A rejected ANNOUNCE doesn't negotiate the encryption
+                       REQUIRE(!state->load()->front().control_stream->encryption_negotiated);
                      });
   }
 }
@@ -802,4 +844,12 @@ TEST_CASE("RTSP deadline holds for many concurrent trickling clients", "[RTSP]")
     client.join();
   }
   REQUIRE(closed_in_time == n_clients);
+}
+
+TEST_CASE("RTSP server on a port that's already taken throws instead of running without RTSP", "[RTSP]") {
+  boost::asio::io_context io;
+  // Port 0: the kernel picks a free one, which this acceptor then holds
+  boost::asio::ip::tcp::acceptor taken(io, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), 0));
+  auto sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  REQUIRE_THROWS(rtsp::run_server(taken.local_endpoint().port(), sessions));
 }

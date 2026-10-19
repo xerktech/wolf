@@ -52,6 +52,8 @@ struct RunnerArgs {
   const virtual_display::wl_state_ptr wayland_display;
 
   const std::optional<AudioServer> &audio_server;
+  // Removed when this runner exits. A lobby has a single runner; a session can have several and removes its own sink
+  // when it stops, so it passes none here.
   const std::shared_ptr<audio::VSink> audio_sink;
 
   const immer::box<state::Host> host;
@@ -60,6 +62,9 @@ struct RunnerArgs {
   const std::string &xdg_runtime_dir;
 
   immer::box<config::ClientSettings> client_settings;
+
+  // True once the session/lobby this runner belongs to was stopped (see events::Runner::run)
+  std::function<bool()> is_stopped = {};
 };
 
 /**

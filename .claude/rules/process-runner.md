@@ -23,3 +23,21 @@ paths:
     fds 1-2, masking a range that wrongly starts below 3, and the test would no longer catch it.
 - Tests: `tests/platforms/linux/process.cpp` "Process runner doesn't leak Wolf's sockets to the child"
   (fails without the initializer; its stderr assertion catches a range that starts below 3).
+  - The same inheritance kept a sibling's stdout/stderr pipe open, so a runner waited for its siblings
+    to exit (zombies meanwhile): "Process runner returns when its app exits while a sibling runner still
+  runs".
+- The stop handlers use `bp::group::terminate(std::error_code &)`: the throwing overload throws once the
+  group is gone (a second stop gets `killpg(-1)` → EINVAL).
+  - `fire_event` swallows a `std::system_error` (Boost.Process' errors are one) by abandoning the
+    loop: every handler registered after the throwing one silently never runs.
+  - Tests: "Process runner survives a repeated stop".
+- A runner registers its stop handlers only once its app exists, so a stop fired before that is lost.
+  Every runner (process and docker) calls `is_stopped` right after registering and stops the app if
+  the session/lobby is already gone (`events::Runner::run`). Registering takes the bus's exclusive
+  lock, so a stop being fired has finished, and removed the session, by then.
+  - So a session must be in `running_sessions` before its `StreamSession` event fires, or its
+    no-compositor runner can see it as stopped (HTTPS `/launch` and the API both add first).
+  - `is_stopped` matches by session_id, not instance: a `/resume` keeps the runners.
+  - Tests: "Process runner stops an app whose session was stopped while it started" (unit),
+    `tests/testWolfAPI.cpp` "Runners: a session stopped while its runner starts doesn't leave the app
+    running" (through `setup_moonlight_handlers`).

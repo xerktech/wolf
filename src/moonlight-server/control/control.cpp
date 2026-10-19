@@ -4,6 +4,7 @@
 #include <events/events.hpp>
 #include <immer/box.hpp>
 #include <state/sessions.hpp>
+#include <stdexcept>
 #include <sys/socket.h>
 
 namespace control {
@@ -87,13 +88,34 @@ bool encrypt_and_send(std::string_view payload,
                       const std::shared_ptr<events::ControlStreamState> &control_stream,
                       immer::box<std::shared_ptr<ENetPeer>> connected_client) {
   if (auto enet_client = connected_client->get()) {
-    auto encrypted =
-        control::encrypt_packet(aes_key, control_stream->send_seq++, payload, *control_stream->encryption.load());
-    return send_packet({(char *)encrypted.get(), encrypted->full_size()}, enet_client);
+    auto send = [&](control::ControlEncryption mode) {
+      auto encrypted = control::encrypt_packet(aes_key, control_stream->send_seq++, payload, mode);
+      return send_packet({(char *)encrypted.get(), encrypted->full_size()}, enet_client);
+    };
+    auto hint = *control_stream->encryption.load();
+    if (control_stream->encryption_negotiated) {
+      return send(hint);
+    }
+    // No client packet has authenticated yet, so the mode is only the (unauthenticated) ANNOUNCE's hint: a spoofed one
+    // would make e.g. the termination unreadable. Send it in both modes; the client drops the copy it can't decrypt.
+    auto other = hint == control::ControlEncryption::V1 ? control::ControlEncryption::V2
+                                                        : control::ControlEncryption::V1;
+    bool sent = send(hint);
+    return send(other) || sent;
   } else {
     logs::log(logs::warning, "[ENET] Failed to send packet, client is not connected");
     return false;
   }
+}
+
+bool has_connected_peer(const enet_clients_map &connected_clients, const events::StreamSession &session) {
+  for (const auto &[peer, peer_session] : connected_clients) {
+    if (peer_session->session_id == session.session_id &&
+        peer_session->enet_secret_payload == session.enet_secret_payload) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::optional<events::StreamSession> get_current_session(const enet_clients_map &connected_clients,
@@ -111,8 +133,11 @@ std::optional<events::StreamSession> get_current_session(const enet_clients_map 
     logs::log(logs::warning,
               "[ENET] Unable to find a session that matches the client secret {}, matching by IP",
               enet_event.data);
+    // Never for a stream instance that already has a connected peer: anyone behind the same IP (NAT) could otherwise
+    // attach to a live stream and, being the newest peer, drop its real client (see superseded_peers).
+    // Peers of an instance a /resume replaced don't count: they're the client's dead connection, waiting to time out.
     for (const StreamSession &session : *sessions) {
-      if (session.ip == client_ip) {
+      if (session.ip == client_ip && !has_connected_peer(connected_clients, session)) {
         return session;
       }
     }
@@ -189,6 +214,9 @@ void run_control(int port,
                  const std::string &host_ip) {
 
   enet_host host = create_host(host_ip, port, peers);
+  if (!host) { // e.g. the port is already taken; servicing a null host would segfault
+    throw std::runtime_error(fmt::format("Unable to bind the ENet control server on port {}", port));
+  }
   logs::log(logs::info, "Control server started on port: {}", port);
 
   ENetEvent event;
@@ -241,6 +269,14 @@ void run_control(int port,
                 end_superseded_stream(stale_session, event_bus);
               }
             }
+            // Joypads (carried over by a /resume) send their feedback to this peer from now on
+            client_session->control_feedback->store(events::ControlFeedback{
+                .peer = event.peer,
+                .send = [peer = to_shared_ptr(event.peer),
+                         aes_key = client_session->aes_key,
+                         control_stream = client_session->control_stream](std::string_view plaintext) {
+                  encrypt_and_send(plaintext, aes_key, control_stream, immer::box<std::shared_ptr<ENetPeer>>{peer});
+                }});
           }
           event_bus->fire_event(
               immer::box<ResumeStreamEvent>(ResumeStreamEvent{.session_id = client_session->session_id}));
@@ -248,6 +284,10 @@ void run_control(int port,
         case ENET_EVENT_TYPE_DISCONNECT:
           logs::log(logs::debug, "[ENET] disconnected client: {}:{}", client_ip, client_port);
           connected_clients.update([peer = event.peer](const enet_clients_map &m) { return m.erase(peer); });
+          // ENet reuses the peer's slot for the next connection: never send feedback to it again
+          client_session->control_feedback->update([peer = event.peer](const events::ControlFeedback &feedback) {
+            return feedback.peer == peer ? events::ControlFeedback{} : feedback;
+          });
           pause_stream(running_sessions, client_session.value(), event_bus);
           break;
         case ENET_EVENT_TYPE_RECEIVE:
@@ -279,6 +319,20 @@ void run_control(int port,
                 break;
               }
               auto control_stream = client_session->control_stream;
+              if (!control_stream->encryption_negotiated) {
+                // The first packet that authenticates fixes the mode: what the (unauthenticated) RTSP ANNOUNCE
+                // asked for is only a hint, a spoofed one sent before or after the client's own mustn't decide it
+                auto mode = authenticated_mode(*enc_pkt, client_session->aes_key);
+                if (!mode) {
+                  logs::log(logs::warning, "[ENET] Dropping encrypted packet that doesn't authenticate");
+                  break;
+                }
+                if (*mode != *control_stream->encryption.load()) {
+                  logs::log(logs::info,
+                            "[ENET] Control stream encryption differs from the ANNOUNCE, using the client's");
+                }
+                control_stream->authenticate_encryption(*mode);
+              }
               auto encryption = *control_stream->encryption.load();
               auto decrypted = decrypt_packet(*enc_pkt, client_session->aes_key, encryption);
               if (decrypted.size() < sizeof(ControlPacket)) {

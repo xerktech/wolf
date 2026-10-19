@@ -24,6 +24,12 @@ paths:
   - The temp file is unlinked and opened `O_EXCL | O_NOFOLLOW`: a planted symlink or FIFO at
     `<config>.tmp` must not be followed.
 - A failed save is logged, not thrown: an exception from an API handler terminates Wolf.
+  - It is returned instead (`pair`/`unpair`/`update_profiles` → false, `update_client_settings` →
+    `ConfigUpdate::NOT_SAVED`): the API answers 500, since the change is lost on the next restart.
+- A config.toml that loads without a uuid while Wolf has one was emptied or replaced under us: never save
+  over it (DefaultIfMissing would write an empty uuid/hostname and drop the other paired clients).
+- Tests: `tests/testMoonlight.cpp` "LocalState reports a config file it couldn't save"; `tests/testWolfAPI.cpp`
+  "API reports a config change that couldn't be saved".
 - Tests: `tests/testMoonlight.cpp` "LocalState concurrent updates" (lost updates, mode, planted
   temp symlink/FIFO).
 
@@ -44,10 +50,11 @@ paths:
 
 # Running wolf locally to drive the API
 
-- Wolf segfaults at startup when no PulseAudio server is reachable; start one first
+- Without a reachable PulseAudio server Wolf starts with no audio (XERK-2005); for audio start one first
   (`pulseaudio -D -n --load="module-native-protocol-unix socket=<dir>/native auth-anonymous=1"
   --load=module-null-sink`) and set `PULSE_SERVER=unix:<dir>/native`.
-- Without a GPU set `WOLF_RENDER_NODE=SOFTWARE` and install gstreamer1.0-plugins-{good,bad,ugly}
+- Without a GPU set `WOLF_RENDER_NODE=software` (lowercase: `SOFTWARE` does not work) and install
+  gstreamer1.0-plugins-{good,bad,ugly}
   (startup aborts if no H.264 encoder is found).
-- Keep `WOLF_SOCKET_PATH` short (under ~100 chars): a long Unix socket path aborts startup with
-  "File name too long".
+- Keep `WOLF_SOCKET_PATH` short (under ~100 chars): with a long Unix socket path Wolf starts
+  without the API ("Unable to start the Wolf API server … File name too long").

@@ -18,11 +18,11 @@ public:
 
   TestWaylandDisplay(const DisplayMode &mode) {
     auto pipeline_str = std::string("waylanddisplaysrc name=wolf_wayland_source render-node=software ! ") +
-                        "video/x-raw" +                                  //
-                        ", width=" + std::to_string(mode.width) +        //
-                        ", height=" + std::to_string(mode.height) +      //
+                        "video/x-raw" +                                            //
+                        ", width=" + std::to_string(mode.width) +                  //
+                        ", height=" + std::to_string(mode.height) +                //
                         ", framerate=" + std::to_string(mode.refreshRate) + "/1" + //
-                        " ! fakesink";
+                        " ! fakesink name=wolf_test_sink";
 
     GError *error = nullptr;
     pipeline = gstreamer::gst_element_ptr(gst_parse_launch(pipeline_str.c_str(), &error), ::gst_object_unref);
@@ -40,6 +40,27 @@ public:
 
     auto socket_promise = std::make_shared<std::promise<std::string>>();
     auto socket_future = socket_promise->get_future();
+
+    // The compositor creates its output only once the caps are negotiated, and it drops a toplevel whose first
+    // commit arrives before that: the window is never mapped and gets no input (the flaky first mouse event).
+    // The first buffer reaching the sink means the caps, and so the output, are there.
+    auto first_buffer_promise = std::make_shared<std::promise<void>>();
+    auto first_buffer_future = first_buffer_promise->get_future();
+    {
+      auto sink = gstreamer::gst_element_ptr(gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_test_sink"),
+                                             ::gst_object_unref);
+      auto sink_pad = gst_element_get_static_pad(sink.get(), "sink");
+      gst_pad_add_probe(
+          sink_pad,
+          GST_PAD_PROBE_TYPE_BUFFER,
+          +[](GstPad *, GstPadProbeInfo *, gpointer data) {
+            (*static_cast<std::shared_ptr<std::promise<void>> *>(data))->set_value();
+            return GST_PAD_PROBE_REMOVE;
+          },
+          new std::shared_ptr<std::promise<void>>(first_buffer_promise),
+          +[](gpointer data) { delete static_cast<std::shared_ptr<std::promise<void>> *>(data); });
+      gst_object_unref(sink_pad);
+    }
     main_loop_ = std::make_shared<gstreamer::gst_main_loop_ptr>();
 
     auto captured_pipeline = pipeline;
@@ -53,21 +74,20 @@ public:
       auto bus = gst_pipeline_get_bus(GST_PIPELINE(captured_pipeline.get()));
       gst_bus_add_signal_watch(bus);
 
-      g_signal_connect(
-          bus, "message::application",
-          G_CALLBACK(+[](GstBus *, GstMessage *msg, gpointer data) {
-            auto p = static_cast<std::promise<std::string> *>(data);
-            auto structure = gst_message_get_structure(msg);
-            if (gst_structure_has_name(structure, "wayland.src")) {
-              if (auto display = gst_structure_get_string(structure, "WAYLAND_DISPLAY")) {
-                p->set_value(display);
-              }
-            }
-          }),
-          socket_promise.get());
+      g_signal_connect(bus,
+                       "message::application",
+                       G_CALLBACK(+[](GstBus *, GstMessage *msg, gpointer data) {
+                         auto p = static_cast<std::promise<std::string> *>(data);
+                         auto structure = gst_message_get_structure(msg);
+                         if (gst_structure_has_name(structure, "wayland.src")) {
+                           if (auto display = gst_structure_get_string(structure, "WAYLAND_DISPLAY")) {
+                             p->set_value(display);
+                           }
+                         }
+                       }),
+                       socket_promise.get());
 
-      g_signal_connect(
-          bus, "message::error", G_CALLBACK(gstreamer::pipeline_error_handler), captured_loop->get());
+      g_signal_connect(bus, "message::error", G_CALLBACK(gstreamer::pipeline_error_handler), captured_loop->get());
       g_signal_connect(bus, "message::eos", G_CALLBACK(gstreamer::pipeline_eos_handler), captured_loop->get());
       gst_object_unref(bus);
 
@@ -85,6 +105,14 @@ public:
       if (pipeline_thread_.joinable())
         pipeline_thread_.join();
       throw std::runtime_error("Timed out waiting for wayland.src socket message");
+    }
+
+    if (first_buffer_future.wait_for(std::chrono::seconds(10)) == std::future_status::timeout) {
+      if (main_loop_ && *main_loop_)
+        g_main_loop_quit(main_loop_->get());
+      if (pipeline_thread_.joinable())
+        pipeline_thread_.join();
+      throw std::runtime_error("Timed out waiting for the first frame of the wayland display");
     }
 
     w_state = create_wayland_display(wayland_plugin, socket_future.get());

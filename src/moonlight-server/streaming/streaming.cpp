@@ -521,7 +521,8 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
             logs::log(logs::debug, "[GSTREAMER] Forcing IDR");
             // Force IDR event, see: https://github.com/centricular/gstwebrtc-demos/issues/186
             // https://gstreamer.freedesktop.org/documentation/additional/design/keyframe-force.html?gi-language=c
-            wolf::core::gstreamer::send_message(
+            // Async: a synchronous send_event would hold the event bus while the pipeline is busy
+            wolf::core::gstreamer::send_message_async(
                 pipeline.get(),
                 gst_structure_new("GstForceKeyUnit", "all-headers", G_TYPE_BOOLEAN, TRUE, NULL));
           }
