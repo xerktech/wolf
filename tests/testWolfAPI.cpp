@@ -1219,6 +1219,56 @@ TEST_CASE("Runners: many concurrent starts on one session that exit at once", "[
   }
 }
 
+TEST_CASE("Runners: a session stopped while its runner starts doesn't leave the app running", "[API]") {
+  using namespace std::chrono_literals;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .host = immer::box<state::Host>(state::Host{}),
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .running_sessions = running_sessions});
+  auto handlers = sessions::setup_moonlight_handlers(app_state, api_runtime_dir(), {});
+
+  // A command line unique to this run, to find the app's process by
+  auto app_cmd = fmt::format("sleep 30.{}", getpid());
+  auto app_running = [&app_cmd]() {
+    for (const auto &proc : std::filesystem::directory_iterator("/proc")) {
+      std::ifstream cmdline(proc.path() / "cmdline");
+      std::string arg0, arg1;
+      if (std::getline(cmdline, arg0, '\0') && std::getline(cmdline, arg1, '\0') &&
+          fmt::format("{} {}", std::filesystem::path(arg0).filename().string(), arg1) == app_cmd) {
+        return true;
+      }
+    }
+    return false;
+  };
+  auto app = std::make_shared<events::App>(
+      events::App{.base = {.title = "sleep", .id = "sleep", .support_hdr = false},
+                  .start_virtual_compositor = false,
+                  .start_audio_server = false,
+                  .runner = state::get_runner(wolf::config::AppCMD{.run_cmd = app_cmd}, event_bus)});
+  auto session = events::StreamSession{.event_bus = event_bus, .app = app, .session_id = 4343};
+  running_sessions->update([&](const auto &sessions) { return sessions.push_back(session); });
+  event_bus->fire_event(immer::box<events::StreamSession>(session)); // starts the app's runner on another thread
+
+  // The stop lands before the runner has registered its stop handlers (it does so only once the app is spawned), as
+  // when an API client adds and stops a session right away: only the session being gone tells the runner.
+  running_sessions->update([&](const auto &sessions) { return state::remove_session(sessions, session); });
+
+  // The runner spawns the app, then sees the session is gone and ends it (it used to run on, an orphan)
+  std::this_thread::sleep_for(2s);
+  auto orphan = app_running();
+  if (orphan) {
+    std::system(fmt::format("pkill -f '^{}$'", app_cmd).c_str());
+  }
+  REQUIRE_FALSE(orphan);
+  std::this_thread::sleep_for(200ms); // let the runner thread finish before the bus goes away
+}
+
 TEST_CASE("Session APIs without app_id or client_id", "[API]") {
   auto event_bus = std::make_shared<events::EventBusType>();
   auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();

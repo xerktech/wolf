@@ -62,6 +62,9 @@ struct RunnerArgs {
   const std::string &xdg_runtime_dir;
 
   immer::box<config::ClientSettings> client_settings;
+
+  // True once the session/lobby this runner belongs to was stopped (see events::Runner::run)
+  std::function<bool()> is_stopped = {};
 };
 
 /**

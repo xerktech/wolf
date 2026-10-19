@@ -338,7 +338,15 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                   .app_local_state_folder = run_session->stream_session->app_local_state_folder,
                   .app_host_state_folder = run_session->stream_session->app_host_state_folder,
                   .xdg_runtime_dir = runtime_dir,
-                  .client_settings = run_session->stream_session->client_settings}});
+                  .client_settings = run_session->stream_session->client_settings,
+                  // By id, not instance: a /resume replaces the instance but keeps its runners
+                  .is_stopped = [running_sessions = app_state->running_sessions,
+                                 id = run_session->stream_session->session_id]() {
+                    auto sessions = running_sessions->load();
+                    return std::none_of(sessions->begin(), sessions->end(), [id](const auto &session) {
+                      return session.session_id == id;
+                    });
+                  }}});
 
           // Runner process ended
           if (run_session->stop_stream_when_over) {

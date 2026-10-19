@@ -262,6 +262,51 @@ TEST_CASE("Default config: every encoder has video_params", "[LocalState]") {
   }
 }
 
+TEST_CASE("/resume keeps what still runs for the stream", "[Sessions]") {
+  using namespace wolf::core;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto state_dir = std::filesystem::temp_directory_path() / fmt::format("wolf-resume-{}", getpid());
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions)),
+      .host = immer::box<state::Host>(
+          state::Host{.host_base_state_folder = state_dir.string(), .local_base_state_folder = state_dir.string()}),
+      .event_bus = event_bus,
+      .running_sessions = running_sessions});
+
+  auto client = state::PairedClient{.client_cert = "resume-test-cert", .app_state_folder = "client"};
+  auto app = events::App{.base = {.title = "app", .id = "app"}};
+  auto old_session = *state::create_stream_session(app_state,
+                                                   app,
+                                                   client,
+                                                   {1920, 1080, 60},
+                                                   2,
+                                                   "00112233445566778899aabbccddeeff",
+                                                   "1");
+  auto sink = std::make_shared<audio::VSink>();
+  old_session.audio_sink->store(sink);
+  running_sessions->store(immer::vector<events::StreamSession>{old_session});
+
+  SimpleWeb::CaseInsensitiveMultimap query = {{"mode", "1280x720x30"},
+                                              {"rikey", "ffeeddccbbaa99887766554433221100"},
+                                              {"rikeyid", "2"}};
+  auto resumed = endpoints::https::resume_session(query, "127.0.0.1", client, app_state);
+  REQUIRE(resumed);
+  REQUIRE(running_sessions->load()->size() == 1);
+  auto running = running_sessions->load()->front();
+  // A new instance of the same client's stream...
+  REQUIRE(running.session_id == old_session.session_id);
+  REQUIRE(running.enet_secret_payload == resumed->enet_secret_payload);
+  REQUIRE(running.display_mode.width == 1280);
+  // ...that keeps the desktop, its producers and its audio sink: the sink is removed when the session stops, and a
+  // resumed session that lost it would leave it behind
+  REQUIRE(running.wayland_display == old_session.wayland_display);
+  REQUIRE(running.producer_name == old_session.producer_name);
+  REQUIRE(running.audio_sink->load() == sink);
+
+  std::filesystem::remove_all(state_dir);
+}
+
 TEST_CASE("PulseAudio server name to socket path", "[Sessions]") {
   using wolf::core::sessions::audio_server_socket_path;
   REQUIRE(audio_server_socket_path("/tmp/sockets/pulse-socket") == "/tmp/sockets/pulse-socket");
@@ -283,7 +328,11 @@ TEST_CASE("Wayland socket wait", "[Sessions]") {
 
   // No virtual compositor (e.g. "Test ball"): no socket name, must not wait for the runtime dir to become one
   REQUIRE(wolf::core::sessions::wait_for_wayland_socket(runtime_dir, "", false, std::chrono::milliseconds(100)));
-  // A compositor that reports no socket can't be reached by the runner
+  // A compositor that reports no socket can't be reached by the runner, whether or not the wait is skipped (without
+  // the skip, runtime_dir/"" is a directory, so the wait would also fail by timing out)
+  ::setenv("WOLF_SKIP_WAYLAND_SOCKET_WAIT", "TRUE", 1);
+  REQUIRE_FALSE(wolf::core::sessions::wait_for_wayland_socket(runtime_dir, "", true, std::chrono::milliseconds(100)));
+  ::unsetenv("WOLF_SKIP_WAYLAND_SOCKET_WAIT");
   REQUIRE_FALSE(wolf::core::sessions::wait_for_wayland_socket(runtime_dir, "", true, std::chrono::milliseconds(100)));
   REQUIRE_FALSE(wolf::core::sessions::wait_for_wayland_socket(runtime_dir,
                                                               "wolf-no-such-socket",

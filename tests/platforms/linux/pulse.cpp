@@ -158,12 +158,16 @@ TEST_CASE("PulseAudio virtual sinks", "[PULSE]") {
 
   SECTION("leftover sinks are removed by prefix") {
     auto stale = create_sink(server, fmt::format("{}1234", sessions::VIRTUAL_SINK_PREFIX));
+    auto live = create_sink(server, fmt::format("{}5678", sessions::VIRTUAL_SINK_PREFIX));
     auto other = create_sink(server, "wolf_test_not_ours");
     settle(server);
 
-    audio::remove_stale_virtual_sinks(server, sessions::VIRTUAL_SINK_PREFIX);
+    audio::remove_stale_virtual_sinks(server, sessions::VIRTUAL_SINK_PREFIX, [](std::string_view sink_name) {
+      return sink_name.ends_with("5678"); // a session of this Wolf that's running
+    });
     settle(server);
     REQUIRE_FALSE(sink_exists(server, fmt::format("{}1234", sessions::VIRTUAL_SINK_PREFIX)));
+    REQUIRE(sink_exists(server, fmt::format("{}5678", sessions::VIRTUAL_SINK_PREFIX)));
     REQUIRE(sink_exists(server, "wolf_test_not_ours"));
   }
 
@@ -205,7 +209,8 @@ struct CaptureRunner : events::Runner {
            const immer::array<std::string> &,
            const immer::array<std::pair<std::string, std::string>> &paths,
            const immer::map<std::string, std::string> &env_variables,
-           std::string_view) override {
+           std::string_view,
+           const std::function<bool()> &) override {
     this->paths = paths;
     this->env = env_variables;
     ran = true;
@@ -228,7 +233,8 @@ struct BlockingRunner : events::Runner {
            const immer::array<std::string> &,
            const immer::array<std::pair<std::string, std::string>> &,
            const immer::map<std::string, std::string> &,
-           std::string_view) override {
+           std::string_view,
+           const std::function<bool()> &) override {
     released.wait();
   }
 

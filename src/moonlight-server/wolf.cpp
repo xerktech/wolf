@@ -149,16 +149,9 @@ auto initialize(std::string_view config_file, std::string_view pkey_filename, st
  */
 std::optional<sessions::AudioServer> setup_audio_server(const std::string &host_runtime_dir,
                                                         const std::string &runtime_dir) {
-  // A Wolf that crashed or was killed left its sessions' sinks behind; a new session's sink of the same name would
-  // then fail to load. Only Wolf creates sinks with this prefix.
-  auto with_stale_sinks_removed = [](sessions::AudioServer server) {
-    audio::remove_stale_virtual_sinks(server.server, sessions::VIRTUAL_SINK_PREFIX);
-    return std::optional<sessions::AudioServer>(std::move(server));
-  };
-
   auto audio_server = audio::connect();
   if (audio::connected(audio_server)) {
-    return with_stale_sinks_removed({.server = audio_server});
+    return {{.server = audio_server}};
   } else {
     logs::log(logs::info, "Starting PulseAudio docker container");
     docker::DockerAPI docker_api(utils::get_env("WOLF_DOCKER_SOCKET", "/var/run/docker.sock"));
@@ -193,7 +186,7 @@ std::optional<sessions::AudioServer> setup_audio_server(const std::string &host_
       std::this_thread::sleep_for(std::chrono::milliseconds(ms)); // TODO: Better way of knowing when ready?
       auto container_server = audio::connect(fmt::format("{}/pulse-socket", runtime_dir));
       if (audio::connected(container_server)) {
-        return with_stale_sinks_removed({.server = container_server, .container = container});
+        return {{.server = container_server, .container = container}};
       }
     }
   }
@@ -201,6 +194,33 @@ std::optional<sessions::AudioServer> setup_audio_server(const std::string &host_
   logs::log(logs::warning, "Failed to connect to any PulseAudio server, audio will not be available!");
 
   return {};
+}
+
+/**
+ * A Wolf that crashed or was killed left its sessions' sinks behind; a new session's sink of the same name would then
+ * fail to load. Removes them, but only from a PulseAudio server that this Wolf owns: the one embedded next to it
+ * (WOLF_EMBED_PULSE, one Wolf per container under supervisord) or the container it started itself. Any other server
+ * may be shared with a running Wolf, whose live sinks have the same names.
+ */
+void remove_stale_sinks(const sessions::AudioServer &audio_server, const immer::box<state::AppState> &app_state) {
+  if (!audio_server.container && utils::get_env("WOLF_EMBED_PULSE", "") != "true"s) {
+    logs::log(logs::info, "PulseAudio server isn't Wolf's own, leaving any leftover virtual sinks alone");
+    return;
+  }
+  audio::remove_stale_virtual_sinks(
+      audio_server.server,
+      sessions::VIRTUAL_SINK_PREFIX,
+      [sessions = app_state->running_sessions, lobbies = app_state->lobbies](std::string_view sink_name) {
+        auto id = sink_name.substr(sessions::VIRTUAL_SINK_PREFIX.size());
+        auto running = sessions->load();
+        auto lobbies_now = lobbies->load();
+        return std::any_of(running->begin(),
+                           running->end(),
+                           [id](const auto &session) { return std::to_string(session.session_id) == id; }) ||
+               std::any_of(lobbies_now->begin(), lobbies_now->end(), [id](const auto &lobby) {
+                 return lobby.id == id;
+               });
+      });
 }
 
 /**
@@ -219,6 +239,18 @@ void run() {
   auto p_key_file = utils::get_env("WOLF_PRIVATE_KEY_FILE", "key.pem");
   auto p_cert_file = utils::get_env("WOLF_PRIVATE_CERT_FILE", "cert.pem");
   auto local_state = initialize(config_file, p_key_file, p_cert_file);
+
+  // Before any server starts: a request handled before the handlers are registered is lost (e.g. an API sessions/add
+  // while Wolf waits for the PulseAudio container would find no devices queue for its runner)
+  auto audio_server = setup_audio_server(local_state->host->host_xdg_runtime_dir, runtime_dir);
+  // PulseAudio sink-input router (hostname -> session_id -> virtual_sink_<session>)
+  auto pulse_router_state =
+      std::make_shared<audio::PulseAudioRouterState>(audio_server ? audio_server->server : nullptr);
+  auto pulse_router_handlers = audio::setup_pulseaudio_router_handlers(local_state, pulse_router_state);
+  // Setup event handlers for Moonlight related events (Start/Stop stream, hotplug, etc)
+  auto moonlight_sess_handlers = sessions::setup_moonlight_handlers(local_state, runtime_dir, audio_server);
+  // Setup event handlers for player Lobbies
+  auto lobbies_handlers = sessions::setup_lobbies_handlers(local_state, runtime_dir, audio_server);
 
   // HTTP APIs
   std::thread([local_state]() {
@@ -279,15 +311,18 @@ void run() {
     }
   }).detach();
 
-  auto audio_server = setup_audio_server(local_state->host->host_xdg_runtime_dir, runtime_dir);
-  // PulseAudio sink-input router (hostname -> session_id -> virtual_sink_<session>)
-  auto pulse_router_state =
-      std::make_shared<audio::PulseAudioRouterState>(audio_server ? audio_server->server : nullptr);
-  auto pulse_router_handlers = audio::setup_pulseaudio_router_handlers(local_state, pulse_router_state);
-  // Setup event handlers for Moonlight related events (Start/Stop stream, hotplug, etc)
-  auto moonlight_sess_handlers = sessions::setup_moonlight_handlers(local_state, runtime_dir, audio_server);
-  // Setup event handlers for player Lobbies
-  auto lobbies_handlers = sessions::setup_lobbies_handlers(local_state, runtime_dir, audio_server);
+  // Only once the servers had their chance to bind: a second Wolf started by mistake fails to bind and exits, and
+  // must not have touched the running Wolf's sinks first. The servers bind as their threads start, they don't say when.
+  if (audio_server && audio_server->server) {
+    std::thread([audio_server = *audio_server, local_state]() {
+      std::this_thread::sleep_for(3s);
+      if (shutdown_requested.load()) {
+        logs::log(logs::info, "Wolf is shutting down, leaving any leftover virtual sinks alone");
+        return;
+      }
+      remove_stale_sinks(audio_server, local_state);
+    }).detach();
+  }
 
   // Park the main thread until a termination signal arrives. supervisord sends
   // SIGINT on container stop (stopsignal=INT) and waits stopwaitsecs for us to

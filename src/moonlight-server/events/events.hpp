@@ -50,6 +50,12 @@ using RunnerTypes = rfl::TaggedUnion<"type", wolf::config::AppCMD, wolf::config:
 struct Runner {
   virtual ~Runner() = default;
 
+  /**
+   * Runs the app until it exits or a StopStreamEvent/StopLobbyEvent for session_id stops it.
+   *
+   * A stop fired before the runner registered its stop handlers never reaches them: right after registering, the
+   * runner must call `is_stopped` (true once the session/lobby is gone; may be empty) and stop the app if it's true.
+   */
   virtual void run(std::string_view session_id,
                    std::string_view app_state_folder,
                    std::string_view host_xdg_runtime_dir,
@@ -57,7 +63,8 @@ struct Runner {
                    const immer::array<std::string> &virtual_inputs,
                    const immer::array<std::pair<std::string, std::string>> &paths,
                    const immer::map<std::string, std::string> &env_variables,
-                   std::string_view render_node) = 0;
+                   std::string_view render_node,
+                   const std::function<bool()> &is_stopped) = 0;
 
   virtual RunnerTypes serialize() const = 0;
 };

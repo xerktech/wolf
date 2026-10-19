@@ -78,7 +78,8 @@ void RunProcess::run(std::string_view session_id,
                      const immer::array<std::string> &virtual_inputs,
                      const immer::array<std::pair<std::string, std::string>> &paths,
                      const immer::map<std::string, std::string> &env_variables,
-                     std::string_view render_node) {
+                     std::string_view render_node,
+                     const std::function<bool()> &is_stopped) {
   logs::log(logs::debug, "[PROCESS] Starting process: {}", this->run_cmd);
 
   std::future<std::string> std_out = {}, err_out = {};
@@ -122,6 +123,13 @@ void RunProcess::run(std::string_view session_id,
           terminate_group(group_proc);
         }
       });
+
+  // A stop fired while the app was being spawned never reached the handlers above: the session is gone, so stop the
+  // app now instead of leaving it running with nobody to end it. Registering waited for any stop still being fired.
+  if (is_stopped && is_stopped()) {
+    logs::log(logs::debug, "[PROCESS] Session {} was stopped while starting, terminating", session_id);
+    terminate_group(group_proc);
+  }
 
   // This will stop here until the process is over
 #if BOOST_VERSION < 108800

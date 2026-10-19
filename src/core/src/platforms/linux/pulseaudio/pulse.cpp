@@ -285,29 +285,40 @@ static std::string_view null_sink_name(std::string_view module_args) {
   return {};
 }
 
-void remove_stale_virtual_sinks(const std::shared_ptr<Server> &server, std::string_view sink_name_prefix) {
-  queue_op(server, [server, prefix = std::string(sink_name_prefix)]() {
-    auto prefix_ref = new std::shared_ptr<std::string>(std::make_shared<std::string>(prefix)); // released at eol
+void remove_stale_virtual_sinks(const std::shared_ptr<Server> &server,
+                                std::string_view sink_name_prefix,
+                                const std::function<bool(std::string_view)> &in_use) {
+  struct Request {
+    std::string prefix;
+    std::function<bool(std::string_view)> in_use;
+  };
+  auto request = std::make_shared<Request>(Request{.prefix = std::string(sink_name_prefix), .in_use = in_use});
+  queue_op(server, [server, request]() {
+    auto request_ref = new std::shared_ptr<Request>(request); // released at eol
     auto operation = pa_context_get_module_info_list(
         server->ctx,
         [](pa_context *c, const pa_module_info *info, int eol, void *data) {
-          auto prefix = static_cast<std::shared_ptr<std::string> *>(data);
+          auto request = static_cast<std::shared_ptr<Request> *>(data);
           if (eol) { // the last call, also on error
-            delete prefix;
+            delete request;
             return;
           }
-          if (info && info->name && info->argument && std::string_view(info->name) == "module-null-sink" &&
-              null_sink_name(info->argument).starts_with(**prefix)) {
-            logs::log(logs::info, "[PULSE] Removing leftover virtual sink: {}", null_sink_name(info->argument));
+          if (!info || !info->name || !info->argument || std::string_view(info->name) != "module-null-sink") {
+            return;
+          }
+          auto sink_name = null_sink_name(info->argument);
+          // Checked now, not when the cleanup was asked for: a session started since then has its sink in this list
+          if (sink_name.starts_with((*request)->prefix) && !((*request)->in_use && (*request)->in_use(sink_name))) {
+            logs::log(logs::info, "[PULSE] Removing leftover virtual sink: {}", sink_name);
             unload_sink(c, info->index);
           }
         },
-        prefix_ref);
+        request_ref);
     if (operation) {
-      release_if_cancelled(operation, prefix_ref);
+      release_if_cancelled(operation, request_ref);
       pa_operation_unref(operation);
     } else { // The callback will never run
-      delete prefix_ref;
+      delete request_ref;
     }
   });
 }

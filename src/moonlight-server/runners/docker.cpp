@@ -39,7 +39,8 @@ void RunDocker::run(std::string_view session_id,
                     const immer::array<std::string> &virtual_inputs,
                     const immer::array<std::pair<std::string, std::string>> &paths,
                     const immer::map<std::string, std::string> &env_variables,
-                    std::string_view render_node) {
+                    std::string_view render_node,
+                    const std::function<bool()> &is_stopped) {
 
   std::vector<std::string> full_env;
   full_env.insert(full_env.end(), this->container.env.begin(), this->container.env.end());
@@ -234,6 +235,12 @@ void RunDocker::run(std::string_view session_id,
             stop_container();
           }
         });
+
+    // A stop fired while the container was being created never reached the handlers above (see events::Runner::run)
+    if (is_stopped && is_stopped()) {
+      logs::log(logs::debug, "[DOCKER] Session {} was stopped while starting, stopping container", session_id);
+      stop_container();
+    }
 
     auto unplug_device_handler = this->ev_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
         [session_id, container_id, hw_db_path, this](const immer::box<events::UnplugDeviceEvent> &ev) {

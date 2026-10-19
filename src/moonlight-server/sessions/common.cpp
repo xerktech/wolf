@@ -87,7 +87,8 @@ void start_runner(std::shared_ptr<events::Runner> runner,
               all_devices.persistent(),
               mounted_paths.persistent(),
               full_env.persistent(),
-              render_node);
+              render_node,
+              args->is_stopped);
 
   if (args->audio_server && args->audio_sink) {
     logs::log(logs::debug, "[STREAM_SESSION] Remove virtual audio sink");

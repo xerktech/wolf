@@ -24,7 +24,7 @@ TEST_CASE("Process runner doesn't leak Wolf's sockets to the child", "[PROCESS]"
 
   auto runner = process::RunProcess(std::make_shared<wolf::core::events::EventBusType>(),
                                     fmt::format("/bin/sh -c \"ls -l /proc/$$/fd > {}\"", out_file.string()));
-  runner.run("1", "", "", std::make_shared<wolf::core::events::devices_atom_queue>(), {}, {}, {}, "");
+  runner.run("1", "", "", std::make_shared<wolf::core::events::devices_atom_queue>(), {}, {}, {}, "", {});
 
   std::ifstream in(out_file);
   std::stringstream child_fds;
@@ -47,7 +47,7 @@ TEST_CASE("Process runner survives a repeated stop", "[PROCESS]") {
 
   auto start = std::chrono::steady_clock::now();
   std::thread run_thread([&runner]() {
-    runner.run("42", "", "", std::make_shared<wolf::core::events::devices_atom_queue>(), {}, {}, {}, "");
+    runner.run("42", "", "", std::make_shared<wolf::core::events::devices_atom_queue>(), {}, {}, {}, "", {});
   });
   std::this_thread::sleep_for(500ms); // let the runner spawn the app and register its stop handlers
   auto after_handler = ev_bus->register_handler<immer::box<wolf::core::events::StopStreamEvent>>(
@@ -66,6 +66,23 @@ TEST_CASE("Process runner survives a repeated stop", "[PROCESS]") {
   REQUIRE(std::chrono::steady_clock::now() - start < 5s);
 }
 
+TEST_CASE("Process runner stops an app whose session was stopped while it started", "[PROCESS]") {
+  using namespace std::chrono_literals;
+  auto ev_bus = std::make_shared<wolf::core::events::EventBusType>();
+  auto runner = process::RunProcess(ev_bus, "sleep 30");
+
+  // The session's StopStreamEvent was fired before run() registered its handlers, so it never reached them; only the
+  // session being gone tells. The app used to run on with nobody left to stop it (an orphan, its fds and a thread).
+  std::atomic_int checks = 0;
+  auto start = std::chrono::steady_clock::now();
+  runner.run("7", "", "", std::make_shared<wolf::core::events::devices_atom_queue>(), {}, {}, {}, "", [&checks]() {
+    checks++;
+    return true;
+  });
+  REQUIRE(checks == 1);
+  REQUIRE(std::chrono::steady_clock::now() - start < 10s);
+}
+
 TEST_CASE("Process runner returns when its app exits while sibling runners still run", "[PROCESS]") {
   using namespace std::chrono_literals;
   auto ev_bus = std::make_shared<wolf::core::events::EventBusType>();
@@ -81,13 +98,13 @@ TEST_CASE("Process runner returns when its app exits while sibling runners still
   for (int i = 0; i < pairs; i++) {
     threads.emplace_back([&short_runner, &slow_short_runners]() {
       auto start = std::chrono::steady_clock::now();
-      short_runner.run("1", "", "", std::make_shared<wolf::core::events::devices_atom_queue>(), {}, {}, {}, "");
+      short_runner.run("1", "", "", std::make_shared<wolf::core::events::devices_atom_queue>(), {}, {}, {}, "", {});
       if (std::chrono::steady_clock::now() - start > 4s) {
         slow_short_runners++;
       }
     });
     threads.emplace_back([&long_runner]() {
-      long_runner.run("2", "", "", std::make_shared<wolf::core::events::devices_atom_queue>(), {}, {}, {}, "");
+      long_runner.run("2", "", "", std::make_shared<wolf::core::events::devices_atom_queue>(), {}, {}, {}, "", {});
     });
   }
   // The short runners are done long before the long apps would exit on their own

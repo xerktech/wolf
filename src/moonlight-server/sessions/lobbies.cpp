@@ -112,8 +112,12 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                                             ev_bus);
           }).detach();
 
+          // For the runner: true once the lobby was stopped (see events::Runner::run)
+          std::function<bool()> stopped = [lobbies = app_state->lobbies, id = lobby->id]() {
+            return !state::get_lobby_by_id(lobbies->load(), id);
+          };
           auto w_display_ready = on_ready->get_future().then(
-              [lobby, runtime_dir, ev_bus, audio_server, lobby_settings, host = app_state->host](auto fut) {
+              [lobby, runtime_dir, ev_bus, audio_server, lobby_settings, host = app_state->host, stopped](auto fut) {
                 streaming::WaylandDisplayReady ready = fut.get();
 
                 auto wl_state =
@@ -150,7 +154,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                                      .app_host_state_folder = std::filesystem::path(host->host_base_state_folder) /
                                                               lobby_settings->runner_state_folder,
                                      .xdg_runtime_dir = runtime_dir,
-                                     .client_settings = lobby_settings->client_settings}});
+                                     .client_settings = lobby_settings->client_settings,
+                                     .is_stopped = stopped}});
                     // Runner process ended, stop the lobby
                     lobby->wayland_display->store(nullptr);
 

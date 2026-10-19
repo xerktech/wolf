@@ -19,10 +19,16 @@ paths:
   (API `runners/start`), so the session's `StopStreamEvent` handler removes it and session runners
   get no `audio_sink`.
   - `/resume` carries `audio_sink` over to the new `StreamSession`, like the producers; dropping it
-    leaks the sink.
+    leaks the sink. Tests: `tests/testMoonlight.cpp` "/resume keeps what still runs for the stream"
+    (drives `endpoints::https::resume_session`, which the HTTPS handler calls).
   - A lobby has exactly one runner, so its runner's exit still removes the lobby's sink.
-- At startup Wolf unloads every `virtual_sink_*` null sink left by a Wolf that crashed or was killed
-  (`remove_stale_virtual_sinks`). This assumes no other Wolf shares the PulseAudio server.
+- At startup Wolf unloads `virtual_sink_*` null sinks left by a Wolf that crashed or was killed
+  (`remove_stale_sinks` in `wolf.cpp`). Another Wolf's live sinks have the same names, so:
+  - only on a server Wolf owns: embedded (`WOLF_EMBED_PULSE=true`) or the PA container it started;
+    an external `PULSE_SERVER` may be shared, and is left alone.
+  - only ~3 s after the servers started, and not if one failed to bind (`shutdown_requested`): a
+    second Wolf started by mistake binds nothing and exits, and must not unload the running one's sinks.
+  - never a sink of a session/lobby this Wolf is running: checked in the module-list callback.
 - Runners mount the socket by its bare path: libpulse reports it as `unix:<path>` when it came from
   `PULSE_SERVER`, and Docker splits binds on ':' (`audio_server_socket_path`).
 - Tests: `tests/platforms/linux/pulse.cpp` (`[PULSE]`, CMake `TEST_PULSE`) starts its own
