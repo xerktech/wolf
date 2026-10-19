@@ -558,6 +558,13 @@ struct StreamSession {
    */
   std::shared_ptr<ControlStreamState> control_stream = std::make_shared<ControlStreamState>();
 
+  /**
+   * Set by the first RTSP ANNOUNCE that this stream instance accepted: that ANNOUNCE starts its video/audio pipelines,
+   * and later ones are refused. Each accepted ANNOUNCE starts a new set of pipelines, so a flood of them (RTSP is
+   * unauthenticated) crashed Wolf (XERK-2096). Not carried over on resume: the client negotiates the new stream again.
+   */
+  std::shared_ptr<std::atomic<bool>> pipelines_announced = std::make_shared<std::atomic<bool>>(false);
+
   // virtual devices
   std::shared_ptr<std::optional<MouseTypes>> mouse = std::make_shared<std::optional<MouseTypes>>();
   std::shared_ptr<std::optional<KeyboardTypes>> keyboard = std::make_shared<std::optional<KeyboardTypes>>();

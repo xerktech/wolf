@@ -177,6 +177,12 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
     return error_msg(400, "BAD REQUEST", req.seq_number);
   }
 
+  // Moonlight sends one ANNOUNCE per stream (a new one after /launch or /resume), and each would start new pipelines
+  if (session.pipelines_announced->exchange(true)) {
+    logs::log(logs::warning, "[RTSP] Rejecting a second ANNOUNCE for session {}", session.session_id);
+    return error_msg(455, "METHOD NOT VALID IN THIS STATE", req.seq_number);
+  }
+
   auto control_encryption = (args["x-ss-general.encryptionEnabled"].value_or(0) & moonlight::control::SS_ENC_CONTROL_V2)
                                 ? moonlight::control::ControlEncryption::V2
                                 : moonlight::control::ControlEncryption::V1;

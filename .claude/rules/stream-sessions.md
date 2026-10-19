@@ -97,6 +97,18 @@ paths:
       first packet that authenticates fixes the encryption mode".
     - Until then `encrypt_and_send` sends each host packet in both modes (the client drops the copy it
       can't decrypt): a spoofed hint must not hide e.g. the termination from the real client.
+  - A stream instance accepts one ANNOUNCE (`pipelines_announced`); later ones get 455 and change nothing.
+    - Each accepted ANNOUNCE fires Video/AudioSession, i.e. starts a new set of pipelines: a flood of
+      them crashed Wolf in interpipe (XERK-2096). Moonlight sends one per /launch or /resume, and
+      a /resume is a new instance, so it gets its own.
+    - Don't move the limit into the Video/AudioSession handlers: the API's `sessions/start` restarts
+      an instance after a pause through them (XERK-2046).
+    - Accepted cost: a spoofed ANNOUNCE that beats the client's own claims the instance, so that
+      stream fails to start (Moonlight aborts on a non-200 ANNOUNCE). A fake-ip match ignores the
+      source IP (`get_session`), and fenrir's fake ip is the pod IP; RTSP auth is XERK-2115.
+    - A 400 ANNOUNCE (bad display mode) doesn't use it up: keep the claim after the validation.
+    - Tests: `tests/testRTSP.cpp` "RTSP: a stream instance starts its pipelines from one ANNOUNCE only";
+      `tests/testMoonlight.cpp` "/resume keeps what still runs for the stream" (not carried over).
   - A seq past UINT32_MAX is dropped on purpose (it would reuse a nonce, and accept that packet's replay).
   - Tests: `tests/testControl.cpp` "Control replay window", "Control V2 encryption", "control: a
     replayed encrypted packet is dropped"; `tests/testRTSP.cpp` DESCRIBE / "ANNOUNCE control".
