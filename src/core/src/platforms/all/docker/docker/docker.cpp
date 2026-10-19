@@ -328,7 +328,15 @@ bool DockerAPI::pull_image(std::string_view image_name,
                            std::string_view registry_auth,
                            const std::function<void(const DockerProgressEvent &)> &progress_fn) const {
   if (auto conn = docker_connect(socket_path)) {
-    auto api_url = fmt::format("http://localhost/{}/images/create?fromImage={}", docker_api_version, image_name);
+    // Without a tag Docker pulls every tag of the image (and fails on ones with no build for this platform, like
+    // hello-world:nanoserver); default to :latest as the docker CLI does. A ':' before the last '/' is a registry port.
+    auto slash = image_name.find_last_of('/');
+    auto last_component = slash == std::string_view::npos ? image_name : image_name.substr(slash + 1);
+    bool has_tag = last_component.find(':') != std::string_view::npos || image_name.find('@') != std::string_view::npos;
+    auto api_url = fmt::format("http://localhost/{}/images/create?fromImage={}{}",
+                               docker_api_version,
+                               image_name,
+                               has_tag ? "" : ":latest");
 
     struct PullState {
       std::string buffer = {};
