@@ -47,6 +47,21 @@ bool has_connected_peer(const enet_clients_map &connected_clients, const events:
 bool is_superseded_stream(const immer::vector<events::StreamSession> &running_sessions,
                           const events::StreamSession &peer_session);
 
+/**
+ * The stream session an ENet event belongs to: on connect, the running session whose ENet secret matches (or, failing
+ * that, one from the same IP with no connected peer); afterwards, the session the peer connected to.
+ */
+std::optional<events::StreamSession> get_current_session(const enet_clients_map &connected_clients,
+                                                         const state::SessionsAtoms &running_sessions,
+                                                         std::string_view client_ip,
+                                                         const ENetEvent &enet_event);
+
+/**
+ * The connected ENet peer of the stream session `session_id`, and the session it connected to.
+ */
+std::optional<std::pair<ENetPeer *, immer::box<events::StreamSession>>>
+find_connected_peer(const immer::atom<enet_clients_map> &connected_clients, std::size_t session_id);
+
 bool encrypt_and_send(std::string_view payload,
                       std::string_view aes_key,
                       const std::shared_ptr<events::ControlStreamState> &control_stream,

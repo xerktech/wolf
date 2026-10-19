@@ -184,6 +184,17 @@ void end_superseded_stream(const events::StreamSession &peer_session,
                                .rtp_secret_payload = peer_session.rtp_secret_payload}));
 }
 
+std::optional<std::pair<ENetPeer *, immer::box<events::StreamSession>>>
+find_connected_peer(const immer::atom<enet_clients_map> &connected_clients, std::size_t session_id) {
+  auto clients = connected_clients.load(); // iterate a snapshot that an update can't free under us
+  for (auto &[peer, session] : *clients) {
+    if (session->session_id == session_id) {
+      return {{peer, session}};
+    }
+  }
+  return std::nullopt;
+}
+
 /**
  * Pause the stream that `peer_session` attached to. If a /resume has already replaced it with a newer one, only end
  * the old stream instance's pipelines: a PauseStreamEvent is keyed by session_id and would end the new stream too.
@@ -227,13 +238,11 @@ void run_control(int port,
       [&connected_clients](const immer::box<StopStreamEvent> &ev) {
         auto terminate_pkt = ControlTerminatePacket{};
         std::string plaintext = {(char *)&terminate_pkt, sizeof(terminate_pkt)};
-        auto clients = connected_clients.load(); // iterate a snapshot that an update can't free under us
-        for (auto &[peer, session] : *clients) {
-          if (session->session_id == ev->session_id) {
-            immer::box<std::shared_ptr<ENetPeer>> enet_client = {to_shared_ptr(peer)};
-            encrypt_and_send(plaintext, session->aes_key, session->control_stream, enet_client);
-            return;
-          }
+        if (auto connected = find_connected_peer(connected_clients, ev->session_id)) {
+          auto &[peer, session] = *connected;
+          immer::box<std::shared_ptr<ENetPeer>> enet_client = {to_shared_ptr(peer)};
+          encrypt_and_send(plaintext, session->aes_key, session->control_stream, enet_client);
+          return;
         }
         logs::log(logs::debug, "[ENET] Client not found for session: {}", ev->session_id);
       });
