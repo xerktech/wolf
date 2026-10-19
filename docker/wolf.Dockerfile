@@ -51,6 +51,26 @@ RUN <<_GST_WAYLAND_DISPLAY
     cargo cinstall --features="cuda" --prefix=/usr/local/lib/x86_64-linux-gnu/ --libdir=/usr/local/lib/x86_64-linux-gnu
 _GST_WAYLAND_DISPLAY
 
+# gst-interpipe with our teardown-race fixes, replacing the base image's copy: installs over it
+# into /usr/local/lib64/gstreamer-1.0, which the runner copies the plugin from.
+# Pinned so the patches keep applying; bump the ref and patches together.
+ARG GST_INTERPIPE_REF=0c454917cb3cf4f2b2f2729f5f72a4dee072c7c9
+COPY docker/patches/gst-interpipe-*.patch /tmp/gst-interpipe-patches/
+RUN <<_GST_INTERPIPE
+    #!/bin/bash
+    set -e
+
+    dnf install -y meson
+    git clone https://github.com/games-on-whales/gst-interpipe.git
+    cd gst-interpipe
+    git checkout $GST_INTERPIPE_REF
+    git apply /tmp/gst-interpipe-patches/gst-interpipe-*.patch
+    meson setup build -Denable-gtk-doc=false -Dtests=disabled --prefix=/usr/local --libdir=lib64
+    meson install -C build
+    cd .. && rm -rf gst-interpipe
+    dnf clean all
+_GST_INTERPIPE
+
 COPY . /wolf/
 WORKDIR /wolf
 
@@ -115,6 +135,9 @@ COPY docker/supervisord.conf /etc/supervisord.conf
 ENV GST_PLUGIN_PATH=/usr/local/lib64/gstreamer-1.0:/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0
 # Copying out our custom compositor from the build stage
 COPY --from=wolf-builder /usr/local/lib/x86_64-linux-gnu/gstreamer-1.0/* /usr/local/lib/x86_64-linux-gnu/gstreamer-1.0/
+# The patched gst-interpipe, over the base image's copy; it must be the only one GStreamer can find
+COPY --from=wolf-builder /usr/local/lib64/gstreamer-1.0/libgstinterpipe.so /usr/local/lib64/gstreamer-1.0/
+RUN test "$(find / -xdev -name 'libgstinterpipe.so' | wc -l)" = 1
 # Rebuild the loader cache now that the compositor libs are in place
 RUN ldconfig
 
