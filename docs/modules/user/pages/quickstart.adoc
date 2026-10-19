@@ -689,8 +689,8 @@ These are the default values, if you want to assign custom ports you can set the
 * `WOLF_VIDEO_PING_PORT`
 * `WOLF_AUDIO_PING_PORT`
 
-The HTTP and HTTPS servers listen on all interfaces; set `WOLF_HTTP_BIND_ADDRESS` (e.g. `127.0.0.1`) to
-listen on a single address instead. `WOLF_HTTP_SERVERS=FALSE` starts neither of them (nor mDNS), for
+The HTTP and HTTPS servers listen on all IPv4 interfaces; set `WOLF_HTTP_BIND_ADDRESS` to an IP address
+(e.g. `127.0.0.1`) to listen on that one instead. Wolf doesn't start mDNS when it is a loopback address. `WOLF_HTTP_SERVERS=FALSE` starts neither of them (nor mDNS), for
 setups where Moonlight pairing is handled elsewhere and Wolf is driven only through its API.
 
 ====

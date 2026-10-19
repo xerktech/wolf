@@ -224,7 +224,7 @@ std::string get_cert_public_key(x509_ptr cert);
 /**
  * Checks that the paired_cert is a valid chain for untrusted_cert.
  * allow_unknown_issuer also accepts an untrusted_cert whose issuer isn't paired_cert (old moonlight-embedded
- * workaround): any such cert then passes, so it lets an unpaired client in.
+ * workaround): any such cert then passes, whatever its key, so it lets an unpaired client in.
  * @return std::nullopt if the verification runs fine, else the error message
  */
 std::optional<std::string>

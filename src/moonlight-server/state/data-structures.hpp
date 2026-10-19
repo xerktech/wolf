@@ -61,10 +61,20 @@ inline int get_port(STANDARD_PORTS_MAPPING port) {
 }
 
 /**
- * The address the Moonlight HTTP and HTTPS servers listen on (WOLF_HTTP_BIND_ADDRESS), all interfaces by default
+ * The address the Moonlight HTTP and HTTPS servers listen on (WOLF_HTTP_BIND_ADDRESS), all IPv4 interfaces when unset
+ * or empty. Throws when it isn't an IP address: SimpleWeb parses it in a noexcept function, which would abort Wolf.
  */
-inline std::string get_http_bind_address() {
-  return utils::get_env("WOLF_HTTP_BIND_ADDRESS", "0.0.0.0");
+inline ba::ip::address get_http_bind_address() {
+  std::string address = utils::get_env("WOLF_HTTP_BIND_ADDRESS", "");
+  if (address.empty()) {
+    address = "0.0.0.0";
+  }
+  boost::system::error_code ec;
+  auto parsed = ba::ip::make_address(address, ec);
+  if (ec) {
+    throw std::runtime_error("WOLF_HTTP_BIND_ADDRESS=\"" + address + "\" isn't an IP address: " + ec.message());
+  }
+  return parsed;
 }
 
 /**
@@ -77,8 +87,8 @@ inline bool http_servers_enabled() {
 
 /**
  * WOLF_ALLOW_UNKNOWN_ISSUER_CERTS=TRUE brings back the old moonlight-embedded workaround: a client cert naming an
- * issuer that isn't one of the paired certs is accepted. It then matches whatever cert it is checked against, so ANY
- * client passes as the first paired one: only for trusted networks, off by default.
+ * issuer that isn't one of the paired certs is accepted. Such a cert matches every paired cert whose subject isn't that
+ * issuer, so ANY client passes as a paired one without its key: only for trusted networks, off by default.
  */
 inline bool allow_unknown_issuer_certs() {
   return utils::get_env("WOLF_ALLOW_UNKNOWN_ISSUER_CERTS", "") == std::string("TRUE");

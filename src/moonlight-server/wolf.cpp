@@ -243,6 +243,11 @@ void run() {
   // Before the servers start, so that no session's sink can be among them
   auto stale_sinks = audio_server && audio_server->server ? find_stale_sinks(*audio_server) : 0;
 
+  if (state::allow_unknown_issuer_certs()) {
+    logs::log(logs::warning,
+              "WOLF_ALLOW_UNKNOWN_ISSUER_CERTS=TRUE: any client cert naming an unknown issuer passes as paired");
+  }
+
   if (state::http_servers_enabled()) {
     // HTTP APIs
     std::thread([local_state]() {
@@ -291,8 +296,12 @@ void run() {
   // mDNS: advertises the HTTP server
   if (state::http_servers_enabled()) {
     std::thread([hostname = local_state->config->hostname]() {
-      logs::log(logs::info, "Starting mDNS service");
       try {
+        if (state::get_http_bind_address().is_loopback()) {
+          logs::log(logs::info, "HTTP server bound to loopback, not starting the mDNS service");
+          return;
+        }
+        logs::log(logs::info, "Starting mDNS service");
         mdns_cpp::Logger::setLoggerSink([](const std::string &msg) {
           // msg here will include a /n at the end, so we remove it
           logs::log(logs::trace, "mDNS: {}", msg.substr(0, msg.size() - 1));
