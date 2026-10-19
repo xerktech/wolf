@@ -586,7 +586,11 @@ bool pair(const Config &cfg, const PairedClient &client) {
   });
 
   // Update TOML
-  if (!update_config_file(cfg, [&client](WolfConfig &tml) { tml.paired_clients.push_back(client); })) {
+  if (!update_config_file(cfg, [&client](WolfConfig &tml) {
+        // Like the in-memory list: a re-pair replaces the cert's entry rather than adding a duplicate
+        std::erase_if(tml.paired_clients, [&client](const auto &c) { return c.client_cert == client.client_cert; });
+        tml.paired_clients.push_back(client);
+      })) {
     // An unsaved pairing would vanish on restart, so it fails; and a re-pair must not lose the client's
     // existing (saved) pairing, which the update above replaced. Paired clients only change under this lock.
     cfg.paired_clients->store(previous_clients);

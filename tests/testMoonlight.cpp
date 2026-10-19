@@ -405,6 +405,11 @@ TEST_CASE("LocalState reports a config file it couldn't save", "[LocalState]") {
   auto keep_profiles = [](const state::ProfilesList &profiles) { return profiles; };
 
   REQUIRE(state::pair(cfg, {.client_cert = "saved-cert"}));
+  REQUIRE(state::pair(cfg, {.client_cert = "saved-cert"})); // a re-pair replaces it, on disk too
+  {
+    auto on_disk = rfl::toml::load<wolf::config::WolfConfig, rfl::DefaultIfMissing>(cfg_file).value().paired_clients;
+    REQUIRE(std::ranges::count_if(on_disk, [](const auto &c) { return c.client_cert == "saved-cert"; }) == 1);
+  }
   REQUIRE(state::update_client_settings(cfg, client_id, keep_client) == state::ConfigUpdate::SAVED);
   REQUIRE(state::update_client_settings(cfg, 42, keep_client) == state::ConfigUpdate::NOT_FOUND);
   REQUIRE(state::update_profiles(cfg, keep_profiles));
