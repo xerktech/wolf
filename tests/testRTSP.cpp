@@ -924,3 +924,46 @@ TEST_CASE("RTSP: a stream instance starts its pipelines from one ANNOUNCE only",
   REQUIRE(video_sessions == 2);
   REQUIRE(audio_sessions == 2);
 }
+
+TEST_CASE("Session matching is bound to the client IP", "[RTSP]") {
+  auto sessions = test_init_state()->load();
+  auto setup = rtsp::parse("SETUP streamid=video/0/0 RTSP/1.0\r\n"
+                           "CSeq: 1\r\n"
+                           "Host: 00.11.22.33.44\r\n\r\n"sv)
+                   .value();
+  auto no_host = rtsp::parse("SETUP streamid=video/0/0 RTSP/1.0\r\n"
+                             "CSeq: 1\r\n"
+                             "Host: 0.0.0.0\r\n\r\n"sv)
+                     .value();
+
+  SECTION("The client is matched by fake IP or by its own IP") {
+    REQUIRE(tcp_connection::get_session(*sessions, setup, "127.0.0.1"));
+    REQUIRE(tcp_connection::get_session(*sessions, no_host, "127.0.0.1"));
+  }
+
+  SECTION("The fake IP picks between sessions of the same client IP") {
+    auto other = (*sessions)[0];
+    other.session_id = 5678;
+    other.rtsp_fake_ip = "55.66.77.88";
+    auto both = sessions->push_back(other);
+    auto setup_other = rtsp::parse("SETUP streamid=video/0/0 RTSP/1.0\r\n"
+                                   "CSeq: 1\r\n"
+                                   "Host: 55.66.77.88\r\n\r\n"sv)
+                           .value();
+    REQUIRE(tcp_connection::get_session(both, setup, "127.0.0.1")->session_id == 1234);
+    REQUIRE(tcp_connection::get_session(both, setup_other, "127.0.0.1")->session_id == 5678);
+  }
+
+  SECTION("An IPv4-mapped client IP matches its IPv4 peer address") {
+    auto mapped = (*sessions)[0];
+    mapped.ip = "::ffff:127.0.0.1";
+    auto mapped_sessions = immer::vector<events::StreamSession>{mapped};
+    REQUIRE(tcp_connection::get_session(mapped_sessions, setup, "127.0.0.1"));
+    REQUIRE_FALSE(tcp_connection::get_session(mapped_sessions, setup, "127.0.0.2"));
+  }
+
+  SECTION("Knowing the fake IP isn't enough from another address") {
+    REQUIRE_FALSE(tcp_connection::get_session(*sessions, setup, "127.0.0.2"));
+    REQUIRE_FALSE(tcp_connection::get_session(*sessions, no_host, "127.0.0.2"));
+  }
+}

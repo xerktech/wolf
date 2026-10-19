@@ -62,6 +62,25 @@ public:
     socket_.close(ec);
   }
 
+  /**
+   * True if both strings are the same address, so that an API caller passing an IPv4-mapped IPv6 client_ip
+   * (::ffff:a.b.c.d) still matches the plain IPv4 peer address that our IPv4-only acceptor reports.
+   */
+  static bool same_ip(std::string_view a, std::string_view b) {
+    auto normalise = [](std::string_view ip) {
+      boost::system::error_code ec;
+      auto address = asio::ip::make_address(ip, ec);
+      if (ec) {
+        return std::string(ip);
+      }
+      if (address.is_v6() && address.to_v6().is_v4_mapped()) {
+        return asio::ip::make_address_v4(asio::ip::v4_mapped, address.to_v6()).to_string();
+      }
+      return address.to_string();
+    };
+    return normalise(a) == normalise(b);
+  }
+
   static std::optional<events::StreamSession> get_session(const immer::vector<events::StreamSession> &sessions,
                                                           const RTSP_PACKET &packet,
                                                           std::string_view user_ip) {
@@ -69,14 +88,32 @@ public:
     if (auto host = packet.options.find("Host"); host != packet.options.end()) {
       host_option = host->second;
     }
+    std::optional<events::StreamSession> rejected;
     for (const events::StreamSession &session : sessions) {
-      if (session.rtsp_fake_ip == packet.request.uri.ip || host_option == session.rtsp_fake_ip) {
+      bool fake_ip_match = session.rtsp_fake_ip == packet.request.uri.ip || host_option == session.rtsp_fake_ip;
+      // RTSP is unauthenticated and the fake IP is no secret, so
+      // it only picks between the sessions of the client that is talking to us: a request from any other address
+      // could otherwise read the session's ping payload (and steal its video) or ANNOUNCE before the real client.
+      if (!same_ip(session.ip, user_ip)) {
+        if (fake_ip_match) {
+          rejected = session;
+        }
+        continue;
+      }
+      if (fake_ip_match) {
         logs::log(logs::debug, "[RTSP] found session by matching payload: {}", session.rtsp_fake_ip);
         return session;
-      } else if ((host_option == "0.0.0.0" || host_option.empty()) && session.ip == user_ip) {
+      } else if (host_option == "0.0.0.0" || host_option.empty()) {
         logs::log(logs::debug, "[RTSP] found session by matching IP: {}", session.ip);
         return session;
       }
+    }
+    if (rejected) {
+      logs::log(logs::warning,
+                "[RTSP] rejecting request for {} from {}, the session belongs to {}",
+                rejected->rtsp_fake_ip,
+                user_ip,
+                rejected->ip);
     }
     return std::nullopt;
   }
