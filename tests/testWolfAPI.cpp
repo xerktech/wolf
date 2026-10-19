@@ -1407,7 +1407,8 @@ struct CountingRunner : events::Runner {
            const immer::array<std::string> &,
            const immer::array<std::pair<std::string, std::string>> &,
            const immer::map<std::string, std::string> &,
-           std::string_view) override {
+           std::string_view,
+           const std::function<bool()> &) override {
     if (release.valid()) {
       release.wait();
       while (plugged_devices_queue->pop(std::chrono::milliseconds(0))) {
