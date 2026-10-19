@@ -3,7 +3,6 @@
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
 #include <helpers/logger.hpp>
-#include <mutex>
 
 namespace wolf::core::gstreamer {
 
@@ -79,13 +78,9 @@ static void send_message_async(GstElement *recipient, GstStructure *message) {
  * (`has_pending_eos`) and abort Wolf. Sent to the pipeline, the bin's STATE_LOCK used to serialise them.
  */
 static void send_eos_async(GstElement *pipeline) {
-  {
-    static std::mutex eos_sent_mutex;
-    std::lock_guard lock(eos_sent_mutex);
-    if (g_object_get_data(G_OBJECT(pipeline), "wolf-eos-sent")) {
-      return;
-    }
-    g_object_set_data(G_OBJECT(pipeline), "wolf-eos-sent", GINT_TO_POINTER(1));
+  // Atomic test-and-set on the pipeline itself (a mutex here would be one per translation unit: this is static)
+  if (!g_object_replace_data(G_OBJECT(pipeline), "wolf-eos-sent", nullptr, GINT_TO_POINTER(1), nullptr, nullptr)) {
+    return;
   }
   gst_element_call_async(
       pipeline,
