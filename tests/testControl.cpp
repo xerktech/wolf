@@ -552,7 +552,7 @@ TEST_CASE("control: joypad feedback reaches the resumed stream's client", "[ENET
 /*
  * ENet isn't thread-safe: joypad feedback is sent from inputtino's device threads while the control thread services
  * the same host (XERK-2101). A data race corrupts ENet's packet lists only now and then, so this fails reliably only
- * under ThreadSanitizer; otherwise it checks that every packet arrives once, in order.
+ * under ThreadSanitizer; otherwise it checks that every packet arrives once, in order, and in send_seq order.
  */
 TEST_CASE("control: joypad feedback sent while the client streams input arrives intact", "[ENET]") {
   using wolf::core::events::StreamSession;
@@ -579,33 +579,47 @@ TEST_CASE("control: joypad feedback sent while the client streams input arrives 
   auto feedback = session.control_feedback->load();
   REQUIRE(feedback->send);
 
-  // What a joypad's rumble callback does (see create_new_joypad), from its device thread
-  constexpr int rumbles = 500;
-  std::thread device([feedback]() {
-    for (int i = 0; i < rumbles; i++) {
-      feedback->send(fmt::format("rumble {}", i));
-    }
-  });
+  // What a joypad's rumble callback does (see create_new_joypad), from each pad's device thread
+  constexpr int pads = 2, rumbles = 250;
+  std::vector<std::thread> devices;
+  for (int pad = 0; pad < pads; pad++) {
+    devices.emplace_back([feedback, pad]() {
+      for (int i = 0; i < rumbles; i++) {
+        feedback->send(fmt::format("pad {} rumble {}", pad, i));
+      }
+    });
+  }
   // Meanwhile the client keeps the control thread busy servicing its packets
   std::uint32_t seq = 1;
   auto deadline = std::chrono::steady_clock::now() + 10s;
-  while (client.received_packets.size() < rumbles && std::chrono::steady_clock::now() < deadline) {
+  while (client.received_packets.size() < pads * rumbles && std::chrono::steady_clock::now() < deadline) {
     client.send_idr(aes_key, seq++, ControlEncryption::V1);
     client.service(1ms);
   }
-  device.join();
+  for (auto &device : devices) {
+    device.join();
+  }
   client.service(100ms);
 
-  REQUIRE(client.received_packets.size() == rumbles);
-  for (int i = 0; i < rumbles; i++) {
-    auto &packet = client.received_packets[i];
-    auto plaintext = decrypt_packet(*(ControlEncryptedPacket *)packet.data(),
-                                    aes_key,
-                                    ControlEncryption::V1,
-                                    ControlPacketOrigin::HOST);
-    REQUIRE_THAT(plaintext, Equals(fmt::format("rumble {}", i)));
+  REQUIRE(client.received_packets.size() == pads * rumbles);
+  std::optional<std::uint32_t> previous_seq;
+  std::array<int, pads> next_rumble = {};
+  for (auto &packet : client.received_packets) {
+    auto &encrypted = *(ControlEncryptedPacket *)packet.data();
+    // Each send takes its seq and goes out under one lock: the wire order is the seq order
+    auto packet_seq = boost::endian::little_to_native(encrypted.seq);
+    if (previous_seq) {
+      REQUIRE(packet_seq == *previous_seq + 1);
+    }
+    previous_seq = packet_seq;
+
+    auto plaintext = decrypt_packet(encrypted, aes_key, ControlEncryption::V1, ControlPacketOrigin::HOST);
+    int pad = plaintext[4] - '0';
+    REQUIRE(pad < pads);
+    REQUIRE_THAT(plaintext, Equals(fmt::format("pad {} rumble {}", pad, next_rumble[pad]++)));
   }
 }
+
 TEST_CASE("control: the first packet that authenticates fixes the encryption mode", "[ENET]") {
   using wolf::core::events::StreamSession;
   constexpr int port = 47994;

@@ -116,5 +116,6 @@ paths:
   call on a control host holds `enet_mutex` (`control.cpp`) (XERK-2101).
   - `run_control` never blocks inside `enet_host_service` (timeout 0 under the lock); it waits on the socket
     outside the lock, capped at `max_unlocked_wait` so ENet's retransmit and ping timers still run.
-  - Only ThreadSanitizer catches a regression. Tests: "control: joypad feedback sent while the client
-    streams input arrives intact" (TSan reports ~45 races with the lock removed).
+  - `send_seq++` and the send share one lock, so the wire order is the seq order.
+  - Only ThreadSanitizer catches a missing lock (dozens of races); the seq order fails without it.
+    Tests: "control: joypad feedback sent while the client streams input arrives intact".
