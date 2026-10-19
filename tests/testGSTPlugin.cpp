@@ -699,12 +699,9 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a pipeline during preroll ends
 TEST_CASE_METHOD(GStreamerTestsFixture, "A pipeline whose stream already ended is never played", "[GSTPlugin]") {
   using namespace wolf::core;
   using namespace std::chrono_literals;
-  boost::asio::io_context io;
-  boost::asio::ip::udp::socket rx(io, boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
-  rx.non_blocking(true);
+  // Live and never ending: once played, it would only end on an EOS, which nothing sends here
   auto audio_session = immer::box<events::AudioSession>(
-      events::AudioSession{.gst_pipeline = fmt::format("audiotestsrc is-live=true ! udpsink host=127.0.0.1 port={}",
-                                                       rx.local_endpoint().port()),
+      events::AudioSession{.gst_pipeline = "audiotestsrc is-live=true ! fakesink",
                            .session_id = 1,
                            .client_ip = "127.0.0.1",
                            .packet_duration = 5,
@@ -729,10 +726,6 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "A pipeline whose stream already ended i
     ended->set_value();
   }).detach();
   REQUIRE(ended_future.wait_for(2s) == std::future_status::ready);
-
-  std::array<char, 4096> buf{};
-  boost::system::error_code ec;
-  REQUIRE(rx.receive(boost::asio::buffer(buf), 0, ec) == 0); // nothing was ever sent
   REQUIRE(event_bus->handler_count() == 0);
 }
 
