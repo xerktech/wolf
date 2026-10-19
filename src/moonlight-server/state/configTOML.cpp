@@ -574,7 +574,8 @@ template <typename F> static bool update_config_file(const Config &cfg, F &&upda
 bool pair(const Config &cfg, const PairedClient &new_client) {
   std::lock_guard lock(config_file_mutex);
   auto previous_clients = cfg.paired_clients->load();
-  // A re-pair of the same cert keeps the client's settings (they were customised for this client)
+  // A re-pair of the same cert keeps the client's settings (they were customised for this client); the caller's
+  // app_state_folder wins, as before (tests/testWolfAPI.cpp pins it, upstream issue 211)
   auto client = new_client;
   for (const auto &paired_client : *previous_clients) {
     if (paired_client->client_cert == client.client_cert) {

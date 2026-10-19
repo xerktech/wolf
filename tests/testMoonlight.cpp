@@ -419,6 +419,9 @@ TEST_CASE("LocalState reports a config file it couldn't save", "[LocalState]") {
     REQUIRE(std::ranges::count_if(on_disk, [](const auto &c) { return c.client_cert == "saved-cert"; }) == 1);
     auto saved = std::ranges::find_if(on_disk, [](const auto &c) { return c.client_cert == "saved-cert"; });
     REQUIRE(saved->settings.run_uid == 4242);
+    auto clients = cfg.paired_clients->load(); // and in memory
+    auto in_memory = std::ranges::find_if(*clients, [](const auto &c) { return c->client_cert == "saved-cert"; });
+    REQUIRE((*in_memory)->settings.run_uid == 4242);
   }
   REQUIRE(state::update_client_settings(cfg, client_id, keep_client) == state::ConfigUpdate::SAVED);
   REQUIRE(state::update_client_settings(cfg, 42, keep_client) == state::ConfigUpdate::NOT_FOUND);
