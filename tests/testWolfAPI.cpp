@@ -1286,7 +1286,9 @@ TEST_CASE("Runners: a lobby stopped while its runner starts doesn't leave the ap
       .event_bus = event_bus,
       .lobbies = lobbies,
       .running_sessions = running_sessions});
-  auto handlers = sessions::setup_lobbies_handlers(app_state, api_runtime_dir(), {});
+  // gst-wayland-display creates the desktop's socket in $XDG_RUNTIME_DIR: wait for it there, so that the test also
+  // passes on its own, without CTest's WOLF_SKIP_WAYLAND_SOCKET_WAIT
+  auto handlers = sessions::setup_lobbies_handlers(app_state, utils::get_env("XDG_RUNTIME_DIR", "/tmp"), {});
 
   auto app_cmd = fmt::format("sleep 31.{}", getpid());
   auto lobby_id = fmt::format("lobby-{}", getpid());

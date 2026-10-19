@@ -201,15 +201,15 @@ std::optional<sessions::AudioServer> setup_audio_server(const std::string &host_
  * Wolf owns: the one embedded next to it (WOLF_EMBED_PULSE, one Wolf per container under supervisord) or the container
  * it started itself. Any other server may be shared with a running Wolf, whose live sinks have the same names.
  *
- * Must run before any session can start: what it finds is unloaded later by module index, so a session's sink loaded
- * since (with a new index, even under a leftover's name) is never touched.
+ * Must run before any session can start: a session's sink then replaces a leftover of the same name (its client's,
+ * session ids being stable), and the rest is unloaded later by module index, so a sink loaded since is never touched.
  */
-std::vector<unsigned int> find_stale_sinks(const sessions::AudioServer &audio_server) {
+std::size_t find_stale_sinks(const sessions::AudioServer &audio_server) {
   if (!audio_server.container && utils::get_env("WOLF_EMBED_PULSE", "") != "true"s) {
     logs::log(logs::info, "PulseAudio server isn't Wolf's own, leaving any leftover virtual sinks alone");
-    return {};
+    return 0;
   }
-  return audio::find_virtual_sinks(audio_server.server, sessions::VIRTUAL_SINK_PREFIX, 2s);
+  return audio::find_leftover_virtual_sinks(audio_server.server, sessions::VIRTUAL_SINK_PREFIX, 2s);
 }
 
 /**
@@ -241,8 +241,7 @@ void run() {
   // Setup event handlers for player Lobbies
   auto lobbies_handlers = sessions::setup_lobbies_handlers(local_state, runtime_dir, audio_server);
   // Before the servers start, so that no session's sink can be among them
-  auto stale_sinks = audio_server && audio_server->server ? find_stale_sinks(*audio_server)
-                                                          : std::vector<unsigned int>{};
+  auto stale_sinks = audio_server && audio_server->server ? find_stale_sinks(*audio_server) : 0;
 
   // HTTP APIs
   std::thread([local_state]() {
@@ -305,14 +304,14 @@ void run() {
 
   // Only once the servers had their chance to bind: a second Wolf started by mistake fails to bind and exits, and
   // must not have touched the running Wolf's sinks first. The servers bind as their threads start, they don't say when.
-  if (!stale_sinks.empty()) {
-    std::thread([server = audio_server->server, stale_sinks]() {
+  if (stale_sinks > 0) {
+    std::thread([server = audio_server->server]() {
       std::this_thread::sleep_for(3s);
       if (shutdown_requested.load()) {
         logs::log(logs::info, "Wolf is shutting down, leaving any leftover virtual sinks alone");
         return;
       }
-      audio::unload_virtual_sinks(server, stale_sinks);
+      audio::unload_leftover_virtual_sinks(server);
     }).detach();
   }
 

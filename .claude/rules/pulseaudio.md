@@ -26,11 +26,16 @@ paths:
   (`find_stale_sinks` in `wolf.cpp`). Another Wolf's live sinks have the same names, so:
   - only on a server Wolf owns: embedded (`WOLF_EMBED_PULSE=true`) or the PA container it started;
     an external `PULSE_SERVER` may be shared, and is left alone.
-  - the leftovers' module indices are taken before any server starts (no session exists yet), and
-    unloaded by index later. Never match by name: session ids are stable across restarts, so a client
-    relaunching right away gets a live sink under a leftover's name (PA calls it `<name>.2`).
-  - unloaded only ~3 s after the servers started, and not if one failed to bind
-    (`shutdown_requested`): a second Wolf started by mistake must not unload the running one's sinks.
+  - the leftovers (name → module index) are recorded on the `audio::Server` before any server
+    starts, when no session exists yet (`find_leftover_virtual_sinks`).
+  - session ids are stable across restarts, so a client relaunching right away creates a sink under
+    a leftover's name. `create_virtual_sink` unloads that leftover first, and loads only in the
+    unload's callback: loaded alongside, PA names the new sink `<name>.2`, while the app
+    (`PULSE_SINK`) and Wolf's pulsesrc attach by the plain name and lose audio once it goes.
+  - the rest is unloaded by module index (never by name) ~3 s after the servers started, and not if
+    one failed to bind (`shutdown_requested`): a second Wolf started by mistake must not unload the
+    running one's sinks. It never starts a session, so it never replaces one either.
+  - Tests: `tests/platforms/linux/pulse.cpp` "leftover sinks are replaced or removed".
 - Runners mount the socket by its bare path: libpulse reports it as `unix:<path>` when it came from
   `PULSE_SERVER`, and Docker splits binds on ':' (`audio_server_socket_path`).
 - Tests: `tests/platforms/linux/pulse.cpp` (`[PULSE]`, CMake `TEST_PULSE`) starts its own

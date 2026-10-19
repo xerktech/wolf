@@ -8,6 +8,7 @@
 #include <fmt/core.h>
 #include <fstream>
 #include <future>
+#include <mutex>
 #include <pulse/pulseaudio.h>
 #include <sessions/common.hpp>
 #include <sessions/handlers.hpp>
@@ -57,8 +58,20 @@ struct PrivatePulse {
   }
 };
 
+/**
+ * Never freed, like Wolf's own: an audio::Server doesn't stop its mainloop thread when it's destroyed, so freeing one
+ * (e.g. when a failed REQUIRE unwinds a test) would leave that thread running on freed memory.
+ */
+std::shared_ptr<audio::Server> keep_alive(std::shared_ptr<audio::Server> server) {
+  static std::mutex m;
+  static std::vector<std::shared_ptr<audio::Server>> servers;
+  std::lock_guard lock(m);
+  servers.push_back(server);
+  return server;
+}
+
 std::shared_ptr<audio::Server> connect(const PrivatePulse &pulse) {
-  auto server = audio::connect(pulse.socket);
+  auto server = keep_alive(audio::connect(pulse.socket));
   REQUIRE(audio::connected(server));
   return server;
 }
@@ -156,27 +169,41 @@ TEST_CASE("PulseAudio virtual sinks", "[PULSE]") {
     REQUIRE(sink_exists(server, "wolf_test_sink_temporary_name"));
   }
 
-  SECTION("leftover sinks are removed by prefix") {
-    auto stale_name = fmt::format("{}1234", sessions::VIRTUAL_SINK_PREFIX);
-    auto stale = create_sink(server, stale_name);
+  SECTION("leftover sinks are replaced or removed") {
+    auto reclaimed_name = fmt::format("{}1234", sessions::VIRTUAL_SINK_PREFIX);
+    auto unclaimed_name = fmt::format("{}4321", sessions::VIRTUAL_SINK_PREFIX);
+    { // A Wolf that crashed: its sinks outlive its connection
+      auto dead_wolf = connect(pulse);
+      create_sink(dead_wolf, reclaimed_name);
+      create_sink(dead_wolf, unclaimed_name);
+      settle(dead_wolf);
+      audio::disconnect(dead_wolf);
+    }
     auto other = create_sink(server, "wolf_test_not_ours");
     settle(server);
 
-    auto found = audio::find_virtual_sinks(server, sessions::VIRTUAL_SINK_PREFIX, 2s);
-    REQUIRE(found.size() == 1);
+    REQUIRE(audio::find_leftover_virtual_sinks(server, sessions::VIRTUAL_SINK_PREFIX, 2s) == 2);
 
-    // Sessions started after the snapshot: one new, one of the same client as the leftover (session ids are stable
-    // across restarts), whose sink PulseAudio names <name>.2 since the leftover still holds the name
+    // Its client relaunches right away (session ids are stable across restarts): the new sink must get the exact
+    // name, which the app (PULSE_SINK) and Wolf's pulsesrc attach to; "<name>.2" left them on the leftover
+    auto same_client = create_sink(server, reclaimed_name);
     auto live = create_sink(server, fmt::format("{}5678", sessions::VIRTUAL_SINK_PREFIX));
-    auto same_client = create_sink(server, stale_name);
     settle(server);
+    REQUIRE(sink_exists(server, reclaimed_name));
+    REQUIRE_FALSE(sink_exists(server, fmt::format("{}.2", reclaimed_name)));
 
-    audio::unload_virtual_sinks(server, found);
+    // The sweep removes only the leftover nobody replaced
+    audio::unload_leftover_virtual_sinks(server);
     settle(server);
-    REQUIRE_FALSE(sink_exists(server, stale_name));
-    REQUIRE(sink_exists(server, fmt::format("{}.2", stale_name)));
+    REQUIRE_FALSE(sink_exists(server, unclaimed_name));
+    REQUIRE(sink_exists(server, reclaimed_name));
     REQUIRE(sink_exists(server, fmt::format("{}5678", sessions::VIRTUAL_SINK_PREFIX)));
     REQUIRE(sink_exists(server, "wolf_test_not_ours"));
+
+    // ...and the sink under the reclaimed name is the new session's own, not the leftover
+    audio::delete_virtual_sink(server, same_client);
+    settle(server);
+    REQUIRE_FALSE(sink_exists(server, reclaimed_name));
   }
 
   audio::disconnect(server);
@@ -256,7 +283,7 @@ TEST_CASE("Runners get the PulseAudio socket mounted", "[PULSE]") {
   PrivatePulse pulse;
   // How libpulse names a socket picked from PULSE_SERVER: Docker would split a bind on that ':'
   auto audio_server = std::optional<sessions::AudioServer>(
-      sessions::AudioServer{.server = audio::connect(fmt::format("unix:{}", pulse.socket))});
+      sessions::AudioServer{.server = keep_alive(audio::connect(fmt::format("unix:{}", pulse.socket)))});
   REQUIRE(audio::connected(audio_server->server));
 
   auto runner = std::make_shared<CaptureRunner>();
