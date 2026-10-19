@@ -172,6 +172,14 @@ TEST_CASE("Control replay window", "CONTROL") {
     REQUIRE(accept_seq(window, UINT32_MAX - 1));
   }
 
+  SECTION("seq doesn't wrap around") {
+    // Past UINT32_MAX the client would reuse seq 0.. and so the GCM nonces of its first packets under the same key:
+    // accepting them would also accept a replay of those packets. The stream needs a /resume (new key) by then.
+    auto window = accept_all({UINT32_MAX - 1, UINT32_MAX});
+    REQUIRE_FALSE(accept_seq(window, 0));
+    REQUIRE_FALSE(accept_seq(window, 1));
+  }
+
   SECTION("the low byte repeats every 256 packets, the full seq doesn't") {
     auto window = accept_all({1});
     REQUIRE(accept_seq(window, 257));
@@ -293,6 +301,10 @@ struct TestENetClient {
     send_encrypted(aes_key, seq, {(char *)&pkt, sizeof(pkt)}, encryption);
   }
 
+  void disconnect() {
+    enet_peer_disconnect(peer, 0);
+  }
+
   ~TestENetClient() {
     enet_host_destroy(host);
   }
@@ -400,6 +412,111 @@ TEST_CASE("control: a dead client's late pause doesn't end its resumed stream", 
   reconnected_client.service(200ms);
   REQUIRE(pauses == 1);
   REQUIRE(ended() == std::vector<char>{1, 1});
+}
+
+TEST_CASE("control: a peer matched only by IP can't take over a live stream", "[ENET]") {
+  using wolf::core::events::StreamSession;
+  constexpr int port = 47996;
+  StreamSession session{.session_id = 42};
+  session.enet_secret_payload = 1;
+  session.aes_key = "EDF04A215C4FBEA20934120C8480D855";
+  session.ip = "127.0.0.1"; // the IP fallback matches anyone connecting over loopback
+
+  auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
+  std::atomic<int> pauses = 0, resumes = 0;
+  auto pause_handler = event_bus->register_handler<immer::box<wolf::core::events::PauseStreamEvent>>(
+      [&pauses](const immer::box<wolf::core::events::PauseStreamEvent> &ev) { pauses++; });
+  auto resume_handler = event_bus->register_handler<immer::box<wolf::core::events::ResumeStreamEvent>>(
+      [&resumes](const immer::box<wolf::core::events::ResumeStreamEvent> &ev) { resumes++; });
+  state::SessionsAtoms running_sessions =
+      std::make_shared<immer::atom<immer::vector<StreamSession>>>(immer::vector{session});
+
+  REQUIRE(control::init());
+  std::thread([=] { control::run_control(port, running_sessions, event_bus, 20, 10ms, "127.0.0.1"); }).detach();
+  std::this_thread::sleep_for(200ms);
+
+  TestENetClient live_client(port, 1);
+  live_client.service(100ms);
+  REQUIRE(resumes == 1);
+
+  // Same IP (e.g. behind the same NAT), unknown secret: refused, the live peer stays connected
+  TestENetClient intruder(port, 99);
+  intruder.service(200ms);
+  live_client.service(200ms);
+  REQUIRE(intruder.disconnected);
+  REQUIRE_FALSE(live_client.disconnected);
+  REQUIRE(resumes == 1);
+  REQUIRE(pauses == 0);
+
+  // Once the live peer is gone, the fallback still lets a client that doesn't send the secret (legacy) connect
+  live_client.disconnect();
+  live_client.service(200ms);
+  REQUIRE(pauses == 1);
+  TestENetClient legacy_client(port, 0);
+  legacy_client.service(200ms);
+  REQUIRE_FALSE(legacy_client.disconnected);
+  REQUIRE(resumes == 2);
+}
+
+TEST_CASE("control: joypad feedback reaches the resumed stream's client", "[ENET]") {
+  using wolf::core::events::StreamSession;
+  constexpr int port = 47995;
+  const std::string old_key = "EDF04A215C4FBEA20934120C8480D855", new_key = "00112233445566778899AABBCCDDEEFF";
+  auto make_session = [](std::uint32_t enet_secret, const std::string &aes_key) {
+    StreamSession session{.session_id = 42};
+    session.enet_secret_payload = enet_secret;
+    session.aes_key = aes_key;
+    session.ip = "10.255.255.1"; // never matches loopback, keep the IP fallback out of the way
+    return session;
+  };
+  // What a joypad's rumble callback does (see create_new_joypad)
+  auto rumble = [](const StreamSession &session, std::string_view plaintext) {
+    if (auto feedback = session.control_feedback->load(); feedback->send) {
+      feedback->send(plaintext);
+    }
+  };
+  auto decrypt = [](const std::string &packet, const std::string &key) {
+    return decrypt_packet(*(ControlEncryptedPacket *)packet.data(),
+                          key,
+                          ControlEncryption::V1,
+                          ControlPacketOrigin::HOST);
+  };
+
+  auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
+  auto first = make_session(1, old_key);
+  state::SessionsAtoms running_sessions =
+      std::make_shared<immer::atom<immer::vector<StreamSession>>>(immer::vector{first});
+
+  REQUIRE(control::init());
+  std::thread([=] { control::run_control(port, running_sessions, event_bus, 20, 10ms, "127.0.0.1"); }).detach();
+  std::this_thread::sleep_for(200ms);
+
+  TestENetClient first_client(port, 1);
+  first_client.service(100ms);
+  rumble(first, "rumble 1");
+  first_client.service(200ms);
+  REQUIRE(first_client.received_packets.size() == 1);
+  REQUIRE_THAT(decrypt(first_client.received_packets[0], old_key), Equals("rumble 1"));
+
+  // /resume carries the joypads over to a new stream instance with a new key and, once it connects, a new peer
+  auto resumed = make_session(2, new_key);
+  resumed.joypads = first.joypads;
+  resumed.control_feedback = first.control_feedback;
+  running_sessions->store(immer::vector{resumed});
+  TestENetClient resumed_client(port, 2);
+  resumed_client.service(100ms);
+
+  rumble(first, "rumble 2"); // the joypad still holds what it captured when it was created
+  resumed_client.service(200ms);
+  first_client.service(100ms);
+  REQUIRE(first_client.received_packets.size() == 1);
+  REQUIRE(resumed_client.received_packets.size() == 1);
+  REQUIRE_THAT(decrypt(resumed_client.received_packets[0], new_key), Equals("rumble 2"));
+
+  // Once the client disconnects there's nowhere to send it
+  resumed_client.disconnect();
+  resumed_client.service(200ms);
+  REQUIRE_FALSE(resumed.control_feedback->load()->send);
 }
 
 TEST_CASE("streaming: a superseded stream instance ends only its own pipelines", "[GSTREAMER]") {

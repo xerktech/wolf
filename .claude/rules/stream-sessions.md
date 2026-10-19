@@ -21,6 +21,12 @@ paths:
     resume. `control.cpp` treats it as superseded: it fires `EndSupersededStreamEvent` (keyed by
     `rtp_secret_payload`) instead of a pause.
   - On ENet connect the newest peer owns the session; older peers of the same session are dropped.
+  - So the IP fallback (a CONNECT whose secret matches nothing) only matches a session with no connected
+    peer: anyone behind the client's NAT could otherwise drop the live peer. Tests: "control: a peer
+    matched only by IP can't take over a live stream".
+  - Joypads outlive a /resume, so their feedback (rumble, LEDs) sends through `control_feedback`, which
+    each ENet connect points at its peer/key. Never capture the peer or key in a device callback.
+    Tests: "control: joypad feedback reaches the resumed stream's client".
   - A stop's runner exits milliseconds after the stop, often after a /resume re-added the
     session_id. The runner-exit path fires `StopStreamEvent` only while its own instance is the
     running one (`state::is_running_instance`), else `EndSupersededStreamEvent` (XERK-1964).
@@ -81,5 +87,8 @@ paths:
   - The window belongs to the stream instance, not the ENet peer: a new peer of the same stream
     must not reset it. `/resume` gets a fresh `control_stream` (new key, seq restarts at 0).
   - Packets Wolf sends take `send_seq++`: a fixed seq reuses the GCM nonce under one key.
+  - The first valid ANNOUNCE fixes the mode for the stream instance (`encryption_negotiated`); a later
+    one can't switch it either way: RTSP is unauthenticated, a spoofed switch breaks all control input.
+  - A seq past UINT32_MAX is dropped on purpose (it would reuse a nonce, and accept that packet's replay).
   - Tests: `tests/testControl.cpp` "Control replay window", "Control V2 encryption", "control: a
     replayed encrypted packet is dropped"; `tests/testRTSP.cpp` DESCRIBE / "ANNOUNCE control".

@@ -475,6 +475,8 @@ struct ReplayWindow {
  * it was already accepted (a replay) or it's too old for the window to tell.
  * Only call it for a packet whose GCM tag verified with ControlEncryption::V2: with V1 the seq isn't authenticated,
  * so a forged seq would move the window (and a seq far ahead would lock out every genuine packet).
+ * A seq that wraps past UINT32_MAX is dropped on purpose: it reuses an earlier packet's nonce under the same key, and
+ * accepting it would accept that packet's replay too (2^32 packets is ~50 days of input at 1000 packets/s).
  */
 [[nodiscard]] static std::optional<ReplayWindow> accept_seq(ReplayWindow window, std::uint32_t seq) {
   if (!window.highest_seq || seq > *window.highest_seq) {

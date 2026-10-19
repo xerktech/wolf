@@ -342,6 +342,10 @@ void pair(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTP>::Res
     send_xml<SimpleWeb::HTTP>(response, result->status, result->xml);
   } else {
     logs::log(logs::warning, "Unable to match pair with any phase, you can retry pairing from Moonlight");
+    // Always answer: a request left without a reply hangs the client until it times out
+    send_xml<SimpleWeb::HTTP>(response,
+                              SimpleWeb::StatusCode::client_error_bad_request,
+                              fail_pair("Unable to match pair with any phase"));
   }
 }
 
@@ -536,6 +540,7 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
     new_session->mouse = std::move(old_session->mouse);
     new_session->keyboard = std::move(old_session->keyboard);
     new_session->joypads = std::move(old_session->joypads);
+    new_session->control_feedback = std::move(old_session->control_feedback); // the joypads send through it
     new_session->pen_tablet = std::move(old_session->pen_tablet);
     new_session->touch_screen = std::move(old_session->touch_screen);
 

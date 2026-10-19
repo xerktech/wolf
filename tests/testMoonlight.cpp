@@ -9,9 +9,11 @@
 
 using Catch::Matchers::Equals;
 
+#include <client_http.hpp>
 #include <crypto/crypto.hpp>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <moonlight/protocol.hpp>
 #include <range/v3/view.hpp>
 #include <rest/helpers.hpp>
@@ -911,4 +913,63 @@ TEST_CASE("Launch rejects malformed client parameters", "[HTTP]") {
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"surroundAudioInfo", "196610junk"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "abc"}}));
   REQUIRE_FALSE(launch({})); // missing rikeyid
+}
+
+TEST_CASE("HTTP Pairing over the /pair handler", "[MoonlightProtocol]") {
+  PairingData moonlight_data;
+  ServerData server_data;
+
+  immer::box<state::AppState> app_state = {state::AppState{
+      .config = state::Config{.config_source = "config.test.PAIRING.toml",
+                              .paired_clients = std::make_shared<immer::atom<state::PairedClientList>>()},
+      .host = {state::Host{.server_cert = server_data.server_cert,
+                           .server_pkey = signature::create_key(server_data.server_pkey, true)}},
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = std::make_shared<events::EventBusType>()}};
+  auto pair_handler = app_state->event_bus->register_handler<immer::box<events::PairSignal>>(
+      [moonlight_data](const immer::box<events::PairSignal> &signal) {
+        signal->user_pin->set_value(moonlight_data.pin);
+      });
+
+  SimpleWeb::Server<SimpleWeb::HTTP> server;
+  server.config.address = "127.0.0.1";
+  server.config.port = 0;
+  server.resource["^/pair$"]["GET"] = [&app_state](auto resp, auto req) { endpoints::pair(resp, req, app_state); };
+  std::promise<unsigned short> bound_port;
+  std::thread server_thread([&] { server.start([&](unsigned short port) { bound_port.set_value(port); }); });
+  // Stops the server even when a REQUIRE below throws
+  auto stop_server = std::shared_ptr<void>(nullptr, [&](void *) {
+    server.stop();
+    server_thread.join();
+  });
+  SimpleWeb::Client<SimpleWeb::HTTP> client("127.0.0.1:" + std::to_string(bound_port.get_future().get()));
+  client.config.timeout = 5; // a handler that never replies fails the test instead of hanging it
+  auto get = [&client](const std::string &query) {
+    try {
+      auto response = client.request("GET", "/pair?" + query);
+      return std::make_pair(response->status_code, response->content.string());
+    } catch (const std::exception &e) {
+      return std::make_pair(std::string("no reply"), std::string(e.what()));
+    }
+  };
+
+  // Phase 1: the handler answers once the user has entered the PIN
+  auto [status_1, body_1] = get("uniqueid=1234&devicename=roth&updateState=1&phrase=getservercert&salt=" +
+                                moonlight_data.salt + "&clientcert=" + moonlight_data.client_cert_base64);
+  REQUIRE_THAT(status_1, Equals("200 OK"));
+  REQUIRE_THAT(body_1, Catch::Matchers::ContainsSubstring("<paired>1</paired>"));
+
+  // Phase 2 goes through pair_next_phase: the handler must send its reply
+  auto [status_2, body_2] =
+      get("uniqueid=1234&devicename=roth&updateState=1&clientchallenge=" + moonlight_data.client_challenge);
+  REQUIRE_THAT(status_2, Equals("200 OK"));
+  REQUIRE_THAT(body_2, Catch::Matchers::ContainsSubstring("<challengeresponse>"));
+
+  // Requests that match no phase are answered too
+  auto [status_3, body_3] = get("uniqueid=1234&foo=bar");
+  REQUIRE_THAT(status_3, Equals("400 Bad Request"));
+  REQUIRE_THAT(body_3, Catch::Matchers::ContainsSubstring("<paired>0</paired>"));
+  auto [status_4, body_4] = get("salt=" + moonlight_data.salt);
+  REQUIRE_THAT(status_4, Equals("400 Bad Request"));
 }

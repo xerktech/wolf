@@ -111,8 +111,10 @@ std::optional<events::StreamSession> get_current_session(const enet_clients_map 
     logs::log(logs::warning,
               "[ENET] Unable to find a session that matches the client secret {}, matching by IP",
               enet_event.data);
+    // Only for a session with no connected peer: anyone behind the same IP (NAT) could otherwise attach to a live
+    // stream and, being the newest peer, drop its real client (see superseded_peers)
     for (const StreamSession &session : *sessions) {
-      if (session.ip == client_ip) {
+      if (session.ip == client_ip && superseded_peers(connected_clients, enet_event.peer, session.session_id).empty()) {
         return session;
       }
     }
@@ -241,6 +243,14 @@ void run_control(int port,
                 end_superseded_stream(stale_session, event_bus);
               }
             }
+            // Joypads (carried over by a /resume) send their feedback to this peer from now on
+            client_session->control_feedback->store(events::ControlFeedback{
+                .peer = event.peer,
+                .send = [peer = to_shared_ptr(event.peer),
+                         aes_key = client_session->aes_key,
+                         control_stream = client_session->control_stream](std::string_view plaintext) {
+                  encrypt_and_send(plaintext, aes_key, control_stream, immer::box<std::shared_ptr<ENetPeer>>{peer});
+                }});
           }
           event_bus->fire_event(
               immer::box<ResumeStreamEvent>(ResumeStreamEvent{.session_id = client_session->session_id}));
@@ -248,6 +258,10 @@ void run_control(int port,
         case ENET_EVENT_TYPE_DISCONNECT:
           logs::log(logs::debug, "[ENET] disconnected client: {}:{}", client_ip, client_port);
           connected_clients.update([peer = event.peer](const enet_clients_map &m) { return m.erase(peer); });
+          // ENet reuses the peer's slot for the next connection: never send feedback to it again
+          client_session->control_feedback->update([peer = event.peer](const events::ControlFeedback &feedback) {
+            return feedback.peer == peer ? events::ControlFeedback{} : feedback;
+          });
           pause_stream(running_sessions, client_session.value(), event_bus);
           break;
         case ENET_EVENT_TYPE_RECEIVE:

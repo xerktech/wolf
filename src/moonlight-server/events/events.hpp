@@ -10,6 +10,7 @@
 #include <core/virtual-display.hpp>
 #include <cstddef>
 #include <eventbus/event_bus.hpp>
+#include <functional>
 #include <helpers/tsqueue.hpp>
 #include <immer/array.hpp>
 #include <immer/atom.hpp>
@@ -439,10 +440,21 @@ struct StreamState {
 struct ControlStreamState {
   /** Set by the RTSP ANNOUNCE, before the client connects to the control stream */
   immer::atom<moonlight::control::ControlEncryption> encryption{moonlight::control::ControlEncryption::V1};
+  /** Set by the first ANNOUNCE: later ones can't change `encryption` */
+  std::atomic<bool> encryption_negotiated = false;
   /** The seqs of the packets received so far, so that a replayed packet is dropped (V2 only, see accept_seq()) */
   immer::atom<moonlight::control::ReplayWindow> replay_window;
   /** The seq of the next packet sent to the client, so that no two share an IV */
   std::atomic<std::uint32_t> send_seq = 0;
+};
+
+/**
+ * Sends host -> client control packets (joypad rumble, LEDs, trigger effects) to the client's current ENet peer
+ */
+struct ControlFeedback {
+  /** The ENet peer `send` goes to, so that its disconnect only clears its own */
+  const void *peer = nullptr;
+  std::function<void(std::string_view /* plaintext */)> send;
 };
 
 struct StreamSession {
@@ -512,6 +524,13 @@ struct StreamSession {
       std::make_shared<std::optional<TouchScreenTypes>>(); /* Now added at the start */
 
   std::shared_ptr<immer::atom<JoypadList>> joypads = std::make_shared<immer::atom<JoypadList>>();
+
+  /**
+   * Carried over on resume with the joypads: their feedback callbacks send through it, and each ENet connect points
+   * it at the new peer, key and control stream. Capturing those when the joypad is created would keep sending to the
+   * first stream's (dead) peer with its old key after a /resume.
+   */
+  std::shared_ptr<immer::atom<ControlFeedback>> control_feedback = std::make_shared<immer::atom<ControlFeedback>>();
 
   /**
    * Bitmask (KEYBOARD_MODIFIERS) of the modifier keys the client is currently physically holding.

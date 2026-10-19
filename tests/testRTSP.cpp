@@ -479,6 +479,46 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
                        REQUIRE(*state->load()->front().control_stream->encryption.load() ==
                                moonlight::control::ControlEncryption::V1);
                      });
+
+    // A later (spoofed) ANNOUNCE can't switch a V1 stream to V2 either
+    tcp_tester::create_client(ioc, port, state)
+        ->run("ANNOUNCE streamid=control/13/0 RTSP/1.0\n"
+              "CSeq: 8\n"
+              "Host: 0.0.0.0\n"
+              "Content-type: application/sdp\n"
+              "Content-length: 145\n"
+              "\n"
+              "v=0\n"
+              "a=x-ss-general.encryptionEnabled:1 \n"
+              "a=x-nv-video[0].clientViewportWd:1920 \n"
+              "a=x-nv-video[0].clientViewportHt:1080 \n"
+              "a=x-nv-video[0].maxFPS:60 \n"sv,
+              [state](std::optional<RTSP_PACKET> response) {
+                REQUIRE(response.has_value());
+                REQUIRE(response.value().response.status_code == 200);
+                REQUIRE(*state->load()->front().control_stream->encryption.load() ==
+                        moonlight::control::ControlEncryption::V1);
+              });
+  }
+
+  SECTION("ANNOUNCE without a display mode") {
+    wolf_client->run("ANNOUNCE streamid=control/13/0 RTSP/1.0\n"
+                     "CSeq: 9\n"
+                     "Host: 0.0.0.0\n"
+                     "Content-type: application/sdp\n"
+                     "Content-length: 89\n"
+                     "\n"
+                     "v=0\n"
+                     "a=x-ss-general.encryptionEnabled:1 \n"
+                     "a=x-nv-video[0].clientViewportHt:1080 \n"
+                     "a=x-nv-video[0].maxFPS:0 \n"sv,
+                     [state](std::optional<RTSP_PACKET> response) {
+                       REQUIRE(response.has_value());
+                       REQUIRE(response.value().response.status_code == 400);
+                       REQUIRE(response.value().seq_number == 9);
+                       // A rejected ANNOUNCE doesn't negotiate the encryption
+                       REQUIRE(!state->load()->front().control_stream->encryption_negotiated);
+                     });
   }
 }
 
