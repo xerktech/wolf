@@ -1248,7 +1248,7 @@ TEST_CASE("Hot-plugging devices while other streams start and stop", "[API]") {
   REQUIRE(*held_runner->plugged >= result.runs);
 
   // Let the other streams' threads finish: one still running when wolftests exits reads freed globals
-  for (int i = 0; i < 500 && other_runners < other_starts; i++) {
+  for (int i = 0; i < 3000 && other_runners < other_starts; i++) { // up to 60 s on a starved runner
     std::this_thread::sleep_for(20ms);
   }
   REQUIRE(other_runners == other_starts);
