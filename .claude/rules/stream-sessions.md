@@ -104,8 +104,11 @@ paths:
     - Don't move the limit into the Video/AudioSession handlers: the API's `sessions/start` restarts
       an instance after a pause through them (XERK-2046).
     - Accepted cost: a spoofed ANNOUNCE that beats the client's own claims the instance, so that
-      stream fails to start (a retry is a /resume: a new instance). Before, it got duplicate pipelines.
-    - Tests: `tests/testRTSP.cpp` "RTSP: a stream instance starts its pipelines from one ANNOUNCE only".
+      stream fails to start (Moonlight aborts on a non-200 ANNOUNCE). A fake-ip match ignores the
+      source IP (`get_session`), and fenrir's fake ip is the pod IP; RTSP auth is XERK-2115.
+    - A 400 ANNOUNCE (bad display mode) doesn't use it up: keep the claim after the validation.
+    - Tests: `tests/testRTSP.cpp` "RTSP: a stream instance starts its pipelines from one ANNOUNCE only";
+      `tests/testMoonlight.cpp` "/resume keeps what still runs for the stream" (not carried over).
   - A seq past UINT32_MAX is dropped on purpose (it would reuse a nonce, and accept that packet's replay).
   - Tests: `tests/testControl.cpp` "Control replay window", "Control V2 encryption", "control: a
     replayed encrypted packet is dropped"; `tests/testRTSP.cpp` DESCRIBE / "ANNOUNCE control".

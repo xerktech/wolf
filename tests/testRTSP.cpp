@@ -889,6 +889,21 @@ TEST_CASE("RTSP: a stream instance starts its pipelines from one ANNOUNCE only",
     return reply->response.status_code;
   };
 
+  // An ANNOUNCE without a valid display mode is refused before it uses up the stream's one ANNOUNCE
+  std::optional<RTSP_PACKET> bad_reply;
+  tcp_tester::create_client(ioc, port, state)
+      ->run("ANNOUNCE streamid=control/13/0 RTSP/1.0\n"
+            "CSeq: 0\n"
+            "Host: 0.0.0.0\n"
+            "Content-type: application/sdp\n"
+            "Content-length: 43\n"
+            "\n"
+            "v=0\n"
+            "a=x-nv-video[0].clientViewportHt:1080 \n"sv,
+            [&bad_reply](std::optional<RTSP_PACKET> response) { bad_reply = response; });
+  REQUIRE(bad_reply.has_value());
+  REQUIRE(bad_reply->response.status_code == 400);
+
   REQUIRE(announce(1) == 200);
   // Each accepted ANNOUNCE starts a new set of pipelines: a flood of them crashed Wolf (XERK-2096)
   for (int seq = 2; seq <= 20; seq++) {

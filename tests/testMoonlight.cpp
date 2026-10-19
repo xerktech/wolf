@@ -287,6 +287,7 @@ TEST_CASE("/resume keeps what still runs for the stream", "[Sessions]") {
                                                    "1");
   auto sink = std::make_shared<audio::VSink>();
   old_session.audio_sink->store(sink);
+  old_session.pipelines_announced->store(true); // the old stream's client already negotiated it over RTSP
   running_sessions->store(immer::vector<events::StreamSession>{old_session});
 
   SimpleWeb::CaseInsensitiveMultimap query = {{"mode", "1280x720x30"},
@@ -305,6 +306,8 @@ TEST_CASE("/resume keeps what still runs for the stream", "[Sessions]") {
   REQUIRE(running.wayland_display == old_session.wayland_display);
   REQUIRE(running.producer_name == old_session.producer_name);
   REQUIRE(running.audio_sink->load() == sink);
+  // ...but negotiates its own stream: the client's ANNOUNCE for it must not be refused
+  REQUIRE_FALSE(running.pipelines_announced->load());
 
   std::filesystem::remove_all(state_dir);
 }
