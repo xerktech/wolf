@@ -72,8 +72,16 @@ static void send_message_async(GstElement *recipient, GstStructure *message) {
  * An appsrc (interpipesrc is one) gets gst_app_src_end_of_stream instead: an EOS event only reaches
  * its streaming thread with the next buffer, so a consumer whose producer never sends one (an app
  * without an audio server) would never end.
+ *
+ * Only the first call per pipeline sends anything (a pause and a stop can both end the same one): two
+ * EOS events sent concurrently to one basesrc trip GStreamer's own assertion in gst_base_src_loop
+ * (`has_pending_eos`) and abort Wolf. Sent to the pipeline, the bin's STATE_LOCK used to serialise them.
  */
 static void send_eos_async(GstElement *pipeline) {
+  // Atomic test-and-set on the pipeline itself (a mutex here would be one per translation unit: this is static)
+  if (!g_object_replace_data(G_OBJECT(pipeline), "wolf-eos-sent", nullptr, GINT_TO_POINTER(1), nullptr, nullptr)) {
+    return;
+  }
   gst_element_call_async(
       pipeline,
       [](GstElement *element, gpointer) {

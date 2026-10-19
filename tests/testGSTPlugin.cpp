@@ -712,3 +712,26 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a consumer whose producer neve
   gst_object_unref(bus);
   gst_element_set_state(pipeline.get(), GST_STATE_NULL);
 }
+
+TEST_CASE_METHOD(GStreamerTestsFixture, "Ending a pipeline twice at once sends one EOS", "[GSTPlugin]") {
+  using namespace wolf::core;
+  // A pause and a stop can both end the same pipeline; two concurrent EOS events into one basesrc abort Wolf
+  // inside GStreamer (gst_base_src_loop: has_pending_eos). Without the fix this usually aborts within 1000 rounds.
+  for (int round = 0; round < 1000; round++) {
+    auto pipeline = gstreamer::gst_element_ptr(
+        gst_parse_launch("audiotestsrc is-live=true samplesperbuffer=64 ! fakesink sync=false", nullptr),
+        ::gst_object_unref);
+    REQUIRE(pipeline);
+    gst_element_set_state(pipeline.get(), GST_STATE_PLAYING);
+    gst_element_get_state(pipeline.get(), nullptr, nullptr, GST_CLOCK_TIME_NONE);
+
+    gstreamer::send_eos_async(pipeline.get());
+    gstreamer::send_eos_async(pipeline.get());
+    auto bus = gst_element_get_bus(pipeline.get());
+    auto msg = gst_bus_timed_pop_filtered(bus, 5 * GST_SECOND, GST_MESSAGE_EOS);
+    REQUIRE(msg != nullptr);
+    gst_message_unref(msg);
+    gst_object_unref(bus);
+    gst_element_set_state(pipeline.get(), GST_STATE_NULL);
+  }
+}
