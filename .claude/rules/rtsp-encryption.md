@@ -25,9 +25,10 @@ paths:
   the GCM nonce. Never make it per session: two sessions can share a key (an API caller, a /resume
   reusing a rikey); QA recovered a reply's plaintext from two per-session counters.
 - A message no key opens gets no reply (there's nothing to seal it with): Moonlight times out.
-- `WOLF_RTSP_REQUIRE_ENCRYPTION` (TRUE in any case) is read once into
+- `WOLF_RTSP_REQUIRE_ENCRYPTION` is read once (`state::parse_rtsp_require_encryption`) into
   `Host::rtsp_require_encryption`: it refuses plaintext-only clients at /launch, /resume (XML
   status 403) and API `sessions/add` (HTTP 403). Default off keeps old clients working.
+  - A security switch: an unrecognised value turns it on (with a warning), never silently off.
   - Tests set the Host field; never `setenv` it in a test (`tests.md`).
 - Tests: `tests/testRTSP.cpp` "Encrypted RTSP wire format" (an independently generated vector),
   "Commands (Encrypted RTSP)"; `tests/testWolfAPI.cpp` "Sessions API: a session added with encrypted

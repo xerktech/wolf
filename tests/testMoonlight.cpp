@@ -1251,6 +1251,15 @@ TEST_CASE("HTTP Pairing over the /pair handler", "[MoonlightProtocol]") {
   REQUIRE_THAT(status_4, Equals("400 Bad Request"));
 }
 
+TEST_CASE("WOLF_RTSP_REQUIRE_ENCRYPTION never silently stays off", "[MoonlightProtocol]") {
+  for (auto off : {"", "FALSE", "false", "0", "no", "Off"}) {
+    REQUIRE_FALSE(state::parse_rtsp_require_encryption(off));
+  }
+  for (auto on : {"TRUE", "true", "True", "1", "yes", "ON", "enabled", "tru"}) {
+    REQUIRE(state::parse_rtsp_require_encryption(on));
+  }
+}
+
 TEST_CASE("HTTPS /launch and /resume: encrypted RTSP", "[MoonlightProtocol]") {
   // Certificates for the HTTPS server and the (already paired) client
   char dir_template[] = "/tmp/wolf-rtspenc-XXXXXX";
