@@ -29,9 +29,12 @@ paths:
   - the leftovers (name → module index) are recorded on the `audio::Server` before any server
     starts, when no session exists yet (`find_leftover_virtual_sinks`).
   - session ids are stable across restarts, so a client relaunching right away creates a sink under
-    a leftover's name. `create_virtual_sink` unloads that leftover first, and loads only in the
-    unload's callback: loaded alongside, PA names the new sink `<name>.2`, while the app
-    (`PULSE_SINK`) and Wolf's pulsesrc attach by the plain name and lose audio once it goes.
+    a leftover's name. `create_virtual_sink` unloads that leftover first, and loads only once PA
+    reports no sink of that name (`load_when_name_free`, bounded ~1 s): loaded while the name is
+    taken, PA names the new sink `<name>.2`, while the app (`PULSE_SINK`) and Wolf's pulsesrc attach
+    by the plain name and lose audio once it goes.
+    - PA acks an unload before the module is gone: loading from the ack callback is not enough once
+      several reclaims are in flight (12 clients relaunching at once got `.2` up to half the time).
   - the rest is unloaded by module index (never by name) ~3 s after the servers started, and not if
     one failed to bind (`shutdown_requested`): a second Wolf started by mistake must not unload the
     running one's sinks. It never starts a session, so it never replaces one either.

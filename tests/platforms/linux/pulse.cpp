@@ -206,6 +206,41 @@ TEST_CASE("PulseAudio virtual sinks", "[PULSE]") {
     REQUIRE_FALSE(sink_exists(server, reclaimed_name));
   }
 
+  SECTION("many leftover sinks replaced at once") {
+    constexpr int clients = 12;
+    auto name = [](int i) { return fmt::format("{}{}", sessions::VIRTUAL_SINK_PREFIX, 9000 + i); };
+    {
+      auto dead_wolf = connect(pulse);
+      for (int i = 0; i < clients; i++) {
+        create_sink(dead_wolf, name(i));
+      }
+      settle(dead_wolf);
+      audio::disconnect(dead_wolf);
+    }
+    REQUIRE(audio::find_leftover_virtual_sinks(server, sessions::VIRTUAL_SINK_PREFIX, 2s) == clients);
+
+    // Every client relaunches at once: all must get their plain names. In a live Wolf, loading right after each
+    // unload's ack got "<name>.2" now and then (PulseAudio acks before the module is gone); this test doesn't reproduce
+    // that timing (QA rig h5.sh does), it checks the wait for the name keeps every sink right
+    std::vector<std::thread> threads;
+    std::vector<std::shared_ptr<audio::VSink>> sinks(clients);
+    for (int i = 0; i < clients; i++) {
+      threads.emplace_back([&, i]() { sinks[i] = create_sink(server, name(i)); });
+    }
+    for (auto &t : threads) {
+      t.join();
+    }
+    for (int i = 0; i < clients; i++) {
+      REQUIRE(sinks[i]->sink_idx_fut.wait_for(boost::chrono::seconds(3)) == boost::future_status::ready);
+    }
+    settle(server);
+    for (int i = 0; i < clients; i++) {
+      INFO(name(i));
+      REQUIRE(sink_exists(server, name(i)));
+      REQUIRE_FALSE(sink_exists(server, fmt::format("{}.2", name(i))));
+    }
+  }
+
   audio::disconnect(server);
 }
 

@@ -3,6 +3,7 @@
 #include <map>
 #include <memory>
 #include <pulse/pulseaudio.h>
+#include <pulse/rtclock.h>
 #include <vector>
 
 namespace fmt {
@@ -249,6 +250,70 @@ load_sink(const std::shared_ptr<Server> &server, const std::shared_ptr<VSink> &v
   }
 }
 
+/**
+ * A new sink waiting for a leftover of the same name to be gone, see create_virtual_sink().
+ */
+struct Reclaim {
+  std::shared_ptr<Server> server;
+  std::shared_ptr<VSink> vsink;
+  std::string sink_name;
+  std::string channel_spec;
+  int checks = 0;
+  bool name_taken = false;
+};
+
+constexpr int RECLAIM_MAX_CHECKS = 100;             // ~1 s
+constexpr pa_usec_t RECLAIM_CHECK_INTERVAL = 10000; // 10 ms
+
+/**
+ * Loads the reclaim's sink once no sink has its name any more, checking every RECLAIM_CHECK_INTERVAL; after
+ * RECLAIM_MAX_CHECKS, loads it anyway (as "<name>.2"). Must be called with the mainloop lock held.
+ */
+static void load_when_name_free(const std::shared_ptr<Reclaim> &reclaim) {
+  auto load = [](const std::shared_ptr<Reclaim> &reclaim) {
+    load_sink(reclaim->server, reclaim->vsink, reclaim->channel_spec);
+  };
+  reclaim->name_taken = false;
+  auto reclaim_ref = new std::shared_ptr<Reclaim>(reclaim); // released at eol
+  auto operation = pa_context_get_sink_info_by_name(
+      reclaim->server->ctx,
+      reclaim->sink_name.c_str(),
+      [](pa_context *c, const pa_sink_info *info, int eol, void *data) {
+        auto reclaim = static_cast<std::shared_ptr<Reclaim> *>(data);
+        if (!eol) { // the sink is still there
+          (*reclaim)->name_taken = true;
+          return;
+        }
+        std::unique_ptr<std::shared_ptr<Reclaim>> owned(reclaim); // eol is the last call, also on "no such entity"
+        if (!(*owned)->name_taken) {
+          load_sink((*owned)->server, (*owned)->vsink, (*owned)->channel_spec);
+        } else if (++(*owned)->checks >= RECLAIM_MAX_CHECKS) {
+          logs::log(logs::warning,
+                    "[PULSE] Leftover sink {} is still there, creating the new one anyway",
+                    (*owned)->sink_name);
+          load_sink((*owned)->server, (*owned)->vsink, (*owned)->channel_spec);
+        } else { // check again in a moment
+          pa_context_rttime_new(
+              c,
+              pa_rtclock_now() + RECLAIM_CHECK_INTERVAL,
+              [](pa_mainloop_api *api, pa_time_event *event, const struct timeval *, void *data) {
+                api->time_free(event);
+                std::unique_ptr<std::shared_ptr<Reclaim>> reclaim((std::shared_ptr<Reclaim> *)data);
+                load_when_name_free(*reclaim);
+              },
+              new std::shared_ptr<Reclaim>(*owned));
+        }
+      },
+      reclaim_ref);
+  if (operation) {
+    release_if_cancelled(operation, reclaim_ref);
+    pa_operation_unref(operation);
+  } else { // The callback will never run: the connection is gone, this load fails (and logs) too
+    delete reclaim_ref;
+    load(reclaim);
+  }
+}
+
 std::shared_ptr<VSink> create_virtual_sink(const std::shared_ptr<Server> &server, const AudioDevice &device) {
 
   auto vsink = std::make_shared<VSink>();
@@ -267,24 +332,19 @@ std::shared_ptr<VSink> create_virtual_sink(const std::shared_ptr<Server> &server
       return;
     }
     // A Wolf that crashed left a sink of this very name (session ids are stable across restarts). The app and Wolf's
-    // pulsesrc attach to the sink by name, so it must go first: loaded meanwhile, the new one would be "<name>.2".
-    // Load only once PulseAudio confirmed the unload: one sent along with it finds the name still taken.
+    // pulsesrc attach to the sink by name, so it must go first: loaded while the name is taken, the new one would be
+    // "<name>.2". PulseAudio acks the unload before the module is actually gone, so load only once the name is free.
     auto module = leftover->second;
     server->leftovers.erase(leftover);
     logs::log(logs::info, "[PULSE] Replacing leftover virtual sink: {} (module {})", sink_name, module);
-    struct Pending {
-      std::shared_ptr<Server> server;
-      std::shared_ptr<VSink> vsink;
-      std::string channel_spec;
-    };
-    auto pending_ref = new std::shared_ptr<Pending>(
-        std::make_shared<Pending>(Pending{.server = server, .vsink = vsink, .channel_spec = channel_spec}));
+    auto pending_ref = new std::shared_ptr<Reclaim>(std::make_shared<Reclaim>(
+        Reclaim{.server = server, .vsink = vsink, .sink_name = sink_name, .channel_spec = channel_spec}));
     auto operation = pa_context_unload_module(
         server->ctx,
         module,
         [](pa_context *, int, void *data) {
-          std::unique_ptr<std::shared_ptr<Pending>> pending((std::shared_ptr<Pending> *)data);
-          load_sink((*pending)->server, (*pending)->vsink, (*pending)->channel_spec);
+          std::unique_ptr<std::shared_ptr<Reclaim>> pending((std::shared_ptr<Reclaim> *)data);
+          load_when_name_free(*pending);
         },
         pending_ref);
     if (operation) {
