@@ -399,6 +399,12 @@ void UnixSocketServer::send_data(std::shared_ptr<UnixSocket> socket, std::string
 }
 
 void UnixSocketServer::queue_write(const std::shared_ptr<UnixSocket> &socket, std::shared_ptr<const std::string> data) {
+  // The write queue belongs to the io_context thread. Callers should already be on it, but a racy queue only shows
+  // under TSan or a stress rig, so a caller on another thread is moved there instead of corrupting the queue.
+  if (!state_->io_context.get_executor().running_in_this_thread()) {
+    boost::asio::post(state_->io_context, [this, socket, data = std::move(data)]() { queue_write(socket, data); });
+    return;
+  }
   if (!socket->is_alive) {
     return;
   }

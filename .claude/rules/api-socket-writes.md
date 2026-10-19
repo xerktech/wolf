@@ -18,9 +18,11 @@ paths:
     `write_queue` keeps exactly one in flight.
 - `state_->sockets` and every `write_queue` belong to the io_context thread. Endpoints, event-bus
   publishers and the docker-pull thread run elsewhere, so they `dispatch` onto it first.
+- `queue_write` posts itself onto the io_context thread when called from another one: a direct call
+  from an endpoint thread is safe, not a race. Iterating `state_->sockets` has no such guard.
 - Tests: `tests/testWolfAPI.cpp` "APPs APIs" sends a 4 MiB reply under `M_PERTURB`; the SSE
-  cases cover interleaving and the stalled-reader cap. The concurrency (dispatch) is caught only by
-  a live stress rig or TSan, not by the unit tests.
+  cases cover interleaving and the stalled-reader cap. A race on `state_->sockets` is caught only
+  by a live stress rig or TSan, not by the unit tests.
 - Building locally: `ninja -j3` at most. Each reflect-cpp TU needs ~2 GiB, and the host's memory
   guard kills large parallel builds.
 - ASan: set `ASAN_OPTIONS=allow_user_segv_handler=0`. `wolf.cpp` installs its own SIGSEGV handler,

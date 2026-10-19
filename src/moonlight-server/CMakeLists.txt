@@ -86,6 +86,9 @@ FetchContent_Declare(
         GIT_REPOSITORY https://github.com/cgutman/enet
         GIT_TAG 44c85e16279553d9c052e572bcbfcd745fb74abf)
 FetchContent_MakeAvailable(enet)
+# enet is always static; with BUILD_SHARED_LIBS=ON it is linked into libwolf_runner.so, so it needs -fPIC
+# (sanitizer builds otherwise fail with "R_X86_64_PC32 against __asan_option_detect_stack_use_after_return")
+set_target_properties(enet PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries_system(wolf_runner PUBLIC enet)
 unset(CMAKE_PROJECT_INCLUDE_BEFORE)
 

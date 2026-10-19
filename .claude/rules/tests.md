@@ -19,3 +19,9 @@ paths:
 - Never log a whole multi-megabyte payload (request or reply bodies, SSE events). CI pipes the
   console straight to the GitHub runner, and one line of a few MiB stalls the "Run tests" step
   until the 30 min job timeout. The suite itself finishes in ~20 s. Log at most the first 1 KiB.
+- Wayland tests (`tests/platforms/linux/wayland-display.cpp`): `TestWaylandDisplay` waits for the
+  pipeline's first buffer before returning. gst-wayland-display creates its output only at caps
+  negotiation and drops a toplevel committed before that, so the window never maps and gets no
+  input (failed ~1/2 runs under load). Don't remove that wait.
+  - The client is single-threaded and its queues only fill while it dispatches: pop with
+    `pop_event`, not a bare `queue->pop()` after one roundtrip.
