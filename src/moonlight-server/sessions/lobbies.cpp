@@ -108,8 +108,17 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           }).detach();
 
           auto w_display_ready = on_ready->get_future().then(
-              [lobby, runtime_dir, ev_bus, audio_server, lobby_settings, host = app_state->host](auto fut) {
+              [lobby, runtime_dir, ev_bus, audio_server, lobby_settings, app_state](auto fut) {
                 streaming::WaylandDisplayReady ready = fut.get();
+                auto host = app_state->host;
+
+                if (!state::get_lobby_by_id(app_state->lobbies->load().get(), lobby->id)) {
+                  // Stopped while setting up (e.g. the API create call timed out): don't start the runner.
+                  // Stop again, for the producer pipeline that may have come up after the first stop.
+                  logs::log(logs::warning, "[LOBBY] Lobby {} was stopped during setup", lobby->id);
+                  ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
+                  return;
+                }
 
                 auto wl_state =
                     virtual_display::create_wayland_display(ready.wayland_plugin, ready.wayland_socket_name);

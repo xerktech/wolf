@@ -42,6 +42,32 @@ TEST_CASE("Serialize to JSON", "[serialization]") {
   // TODO: test the inverse operation, rfl::json::read
 }
 
+TEST_CASE("JSON integers that don't fit the field are rejected", "[serialization]") {
+  auto read_video = [](const std::string &width) {
+    return rfl::json::read<events::VideoSettings>(
+        "{\"width\":" + width +
+        ",\"height\":1080,\"refresh_rate\":60,\"wayland_render_node\":\"\",\"runner_render_node\":\"\","
+        "\"video_producer_buffer_caps\":\"\"}");
+  };
+
+  REQUIRE(read_video("1920").value().width == 1920);
+  REQUIRE(read_video("-1").value().width == -1);
+  REQUIRE(read_video("2147483647").value().width == 2147483647);
+  REQUIRE(read_video("-2147483648").value().width == -2147483648LL);
+  REQUIRE(!read_video("2147483648"));
+  REQUIRE(!read_video("4294967297")); // used to wrap to 1
+  REQUIRE(!read_video("-2147483649"));
+  REQUIRE(!read_video("18446744073709551615")); // used to wrap to -1
+  REQUIRE(!read_video("1.5"));
+
+  auto pin = rfl::json::read<events::StopLobbyEvent>("{\"lobby_id\":\"a\",\"pin\":[1,65537]}");
+  REQUIRE(!pin);
+  REQUIRE(rfl::json::read<events::StopLobbyEvent>("{\"lobby_id\":\"a\",\"pin\":[1,2]}").value().pin ==
+          std::vector<short>{1, 2});
+
+  REQUIRE_THAT(rfl::json::write(events::AudioSettings{.channel_count = 6}), Equals("{\"channel_count\":6}"));
+}
+
 // TEST_CASE("Serialize to msgpack", "[serialization]") {
 //   SECTION("example from the README") {
 //
