@@ -433,7 +433,7 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
                                moonlight::control::ControlEncryption::V2);
                      });
 
-    // A second ANNOUNCE without it doesn't take the stream back to V1
+    // Until a control packet authenticates, an ANNOUNCE is only a hint: a later one replaces it (see control.cpp)
     tcp_tester::create_client(ioc, port, state)
         ->run("ANNOUNCE streamid=control/13/0 RTSP/1.0\n"
               "CSeq: 7\n"
@@ -450,7 +450,8 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
                 REQUIRE(response.has_value());
                 REQUIRE(response.value().response.status_code == 200);
                 REQUIRE(*state->load()->front().control_stream->encryption.load() ==
-                        moonlight::control::ControlEncryption::V2);
+                        moonlight::control::ControlEncryption::V1);
+                REQUIRE_FALSE(state->load()->front().control_stream->encryption_negotiated);
               });
   }
 
@@ -480,7 +481,8 @@ TEST_CASE("Commands (Payload matching)", "[RTSP]") {
                                moonlight::control::ControlEncryption::V1);
                      });
 
-    // A later (spoofed) ANNOUNCE can't switch a V1 stream to V2 either
+    // Once the client's first control packet has authenticated with V1, a later (spoofed) ANNOUNCE can't switch it
+    state->load()->front().control_stream->authenticate_encryption(moonlight::control::ControlEncryption::V1);
     tcp_tester::create_client(ioc, port, state)
         ->run("ANNOUNCE streamid=control/13/0 RTSP/1.0\n"
               "CSeq: 8\n"

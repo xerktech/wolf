@@ -470,6 +470,23 @@ auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
   return std::move(base_session);
 }
 
+/**
+ * What a /resume's new stream instance keeps from the one it replaces (`old_session` is left without them)
+ */
+inline void carry_over_resumed_session(events::StreamSession &old_session, events::StreamSession &new_session) {
+  // Carry over the old session display handle, and the producers streaming it
+  new_session.wayland_display = std::move(old_session.wayland_display);
+  new_session.producer_name = old_session.producer_name;
+  new_session.audio_sink = old_session.audio_sink; // ...and their audio sink, removed when the session stops
+  // Carry over the old session devices, they'll be already plugged into the container
+  new_session.mouse = std::move(old_session.mouse);
+  new_session.keyboard = std::move(old_session.keyboard);
+  new_session.joypads = std::move(old_session.joypads);
+  new_session.control_feedback = std::move(old_session.control_feedback); // the joypads send through it
+  new_session.pen_tablet = std::move(old_session.pen_tablet);
+  new_session.touch_screen = std::move(old_session.touch_screen);
+}
+
 std::string get_rtsp_ip_string(const std::string &local_ip, const events::StreamSession &session) {
   auto use_fake_ip = utils::get_env("WOLF_USE_RTSP_FAKE_IP", "TRUE") == "TRUE"s;
   return use_fake_ip ? session.rtsp_fake_ip : local_ip;
@@ -564,17 +581,7 @@ inline std::shared_ptr<events::StreamSession> resume_session(const SimpleWeb::Ca
     if (!new_session) {
       return nullptr;
     }
-    // Carry over the old session display handle, and the producers streaming it
-    new_session->wayland_display = std::move(old_session->wayland_display);
-    new_session->producer_name = old_session->producer_name;
-    new_session->audio_sink = old_session->audio_sink; // ...and their audio sink, removed when the session stops
-    // Carry over the old session devices, they'll be already plugged into the container
-    new_session->mouse = std::move(old_session->mouse);
-    new_session->keyboard = std::move(old_session->keyboard);
-    new_session->joypads = std::move(old_session->joypads);
-    new_session->control_feedback = std::move(old_session->control_feedback); // the joypads send through it
-    new_session->pen_tablet = std::move(old_session->pen_tablet);
-    new_session->touch_screen = std::move(old_session->touch_screen);
+    carry_over_resumed_session(*old_session, *new_session);
 
     state->running_sessions->update([&old_session, new_session](const immer::vector<events::StreamSession> ses_v) {
       return state::remove_session(ses_v, old_session.value()).push_back(*new_session);

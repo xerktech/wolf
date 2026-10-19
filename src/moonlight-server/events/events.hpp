@@ -19,6 +19,7 @@
 #include <immer/vector.hpp>
 #include <moonlight/control.hpp>
 #include <moonlight/data-structures.hpp>
+#include <mutex>
 #include <rfl.hpp>
 #include <rfl/json.hpp>
 #include <state/serialised_config.hpp>
@@ -445,10 +446,36 @@ struct StreamState {
  * The ENet control stream's encryption state, shared by every copy of a StreamSession
  */
 struct ControlStreamState {
-  /** Set by the RTSP ANNOUNCE, before the client connects to the control stream */
+  /**
+   * Until a client packet authenticates (see authenticated_mode()): what the latest RTSP ANNOUNCE asked for, used for
+   * the packets Wolf sends meanwhile. Then: the mode that packet's GCM tag verified with, for the rest of the stream.
+   * RTSP isn't authenticated, so an ANNOUNCE (possibly spoofed, in any order) never fixes the mode by itself.
+   */
   immer::atom<moonlight::control::ControlEncryption> encryption{moonlight::control::ControlEncryption::V1};
-  /** Set by the first ANNOUNCE: later ones can't change `encryption` */
+  /** Set once a client packet has authenticated: `encryption` is final */
   std::atomic<bool> encryption_negotiated = false;
+
+  /** An ANNOUNCE's mode; returns false (ignored) once the mode is final */
+  bool announce_encryption(moonlight::control::ControlEncryption mode) {
+    std::lock_guard lock(negotiation_mutex);
+    if (encryption_negotiated) {
+      return *encryption.load() == mode;
+    }
+    encryption.store(mode);
+    return true;
+  }
+
+  /** The mode the client's first authenticated packet used: final for this stream instance */
+  void authenticate_encryption(moonlight::control::ControlEncryption mode) {
+    std::lock_guard lock(negotiation_mutex);
+    encryption.store(mode);
+    encryption_negotiated = true;
+  }
+
+private:
+  std::mutex negotiation_mutex;
+
+public:
   /** The seqs of the packets received so far, so that a replayed packet is dropped (V2 only, see accept_seq()) */
   immer::atom<moonlight::control::ReplayWindow> replay_window;
   /** The seq of the next packet sent to the client, so that no two share an IV */

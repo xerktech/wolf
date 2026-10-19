@@ -513,6 +513,23 @@ static std::string decrypt_packet(const ControlEncryptedPacket &packet_data,
 }
 
 /**
+ * The mode the client encrypted this packet with: the one whose GCM tag verifies under the session key, or nothing
+ * when neither does (a forgery, or the wrong key). Unlike the RTSP ANNOUNCE, which anyone can send, this can't be
+ * spoofed without the key: it's what fixes a stream's mode.
+ */
+static std::optional<ControlEncryption> authenticated_mode(const ControlEncryptedPacket &packet_data,
+                                                           std::string_view gcm_key) {
+  for (auto mode : {ControlEncryption::V2, ControlEncryption::V1}) {
+    try {
+      decrypt_packet(packet_data, gcm_key, mode, ControlPacketOrigin::CLIENT);
+      return mode;
+    } catch (const std::runtime_error &) {
+    }
+  }
+  return std::nullopt;
+}
+
+/**
  * Turns a payload into a properly formatted control encrypted packet
  */
 static std::unique_ptr<ControlEncryptedPacket> encrypt_packet(std::string_view gcm_key,

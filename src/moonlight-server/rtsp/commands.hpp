@@ -180,11 +180,9 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
   auto control_encryption = (args["x-ss-general.encryptionEnabled"].value_or(0) & moonlight::control::SS_ENC_CONTROL_V2)
                                 ? moonlight::control::ControlEncryption::V2
                                 : moonlight::control::ControlEncryption::V1;
-  // The first ANNOUNCE sets the mode for the whole stream instance. RTSP isn't authenticated: a later (possibly
-  // spoofed) ANNOUNCE switching either way would make every genuine packet fail to decrypt
-  if (!session.control_stream->encryption_negotiated.exchange(true)) {
-    session.control_stream->encryption.store(control_encryption);
-  } else if (*session.control_stream->encryption.load() != control_encryption) {
+  // Only a hint: RTSP isn't authenticated, so the client's first control packet that authenticates fixes the mode
+  // (see control.cpp). Once it has, a later (possibly spoofed) ANNOUNCE can't switch it.
+  if (!session.control_stream->announce_encryption(control_encryption)) {
     logs::log(logs::warning, "[RTSP] Ignoring a control stream encryption change in a later ANNOUNCE");
   }
 

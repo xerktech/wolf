@@ -11,6 +11,7 @@ using Catch::Matchers::Equals;
 
 #include <boost/asio/local/stream_protocol.hpp>
 #include <client_http.hpp>
+#include <client_https.hpp>
 #include <crypto/crypto.hpp>
 #include <filesystem>
 #include <fstream>
@@ -1088,4 +1089,72 @@ TEST_CASE("HTTP Pairing over the /pair handler", "[MoonlightProtocol]") {
   REQUIRE_THAT(body_3, Catch::Matchers::ContainsSubstring("<paired>0</paired>"));
   auto [status_4, body_4] = get("salt=" + moonlight_data.salt);
   REQUIRE_THAT(status_4, Equals("400 Bad Request"));
+}
+
+TEST_CASE("HTTPS /resume carries the stream's devices over to the new instance", "[MoonlightProtocol]") {
+  // Certificates for the HTTPS server and the (already paired) client
+  char dir_template[] = "/tmp/wolf-resume-XXXXXX";
+  REQUIRE(mkdtemp(dir_template));
+  std::string dir = dir_template;
+  auto server_key = x509::generate_key();
+  REQUIRE(x509::write_to_disk(server_key, dir + "/server.key", x509::generate_x509(server_key), dir + "/server.crt"));
+  auto client_key = x509::generate_key();
+  auto client_cert = x509::generate_x509(client_key);
+  REQUIRE(x509::write_to_disk(client_key, dir + "/client.key", client_cert, dir + "/client.crt"));
+
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = state::Config{.paired_clients = std::make_shared<immer::atom<state::PairedClientList>>()},
+      .host = {},
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .event_bus = std::make_shared<events::EventBusType>(),
+      .running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>()});
+  auto client = state::PairedClient{.client_cert = x509::get_cert_pem(client_cert), .app_state_folder = "test"};
+  auto app = events::App{.base = moonlight::App{.title = "test_app"}};
+
+  // The running stream, with the devices and producers the resumed one must keep
+  auto old_session =
+      endpoints::https::create_run_session({{"rikey", "1234"}, {"rikeyid", "1"}}, "127.0.0.1", client, app_state, app);
+  REQUIRE(old_session);
+  old_session->producer_name = "the_old_producers";
+  auto kept = *old_session; // its shared state, which the resume moves out of the old session
+  app_state->running_sessions->store(immer::vector{*old_session});
+
+  HttpsServer server(dir + "/server.crt", dir + "/server.key");
+  server.config.address = "127.0.0.1";
+  server.config.port = 0;
+  server.resource["^/resume$"]["GET"] = [&](auto resp, auto req) {
+    endpoints::https::resume(resp, req, client, app_state);
+  };
+  std::promise<unsigned short> bound_port;
+  std::thread server_thread([&] { server.start([&](unsigned short port) { bound_port.set_value(port); }); });
+  auto stop_server = std::shared_ptr<void>(nullptr, [&](void *) {
+    server.stop();
+    server_thread.join();
+    std::filesystem::remove_all(dir);
+  });
+  SimpleWeb::Client<SimpleWeb::HTTPS> https_client("127.0.0.1:" + std::to_string(bound_port.get_future().get()),
+                                                   false,
+                                                   dir + "/client.crt",
+                                                   dir + "/client.key");
+  https_client.config.timeout = 5;
+  auto response = https_client.request("GET", "/resume?rikey=5678&rikeyid=2&surroundAudioInfo=196610");
+  REQUIRE_THAT(response->status_code, Equals("200 OK"));
+
+  auto sessions = app_state->running_sessions->load();
+  REQUIRE(sessions->size() == 1);
+  auto resumed = sessions->front();
+  REQUIRE(resumed.aes_key != kept.aes_key); // a new stream instance...
+  REQUIRE(resumed.session_id == kept.session_id);
+  // ...that keeps the old one's desktop, producers, audio sink and devices
+  REQUIRE(resumed.wayland_display == kept.wayland_display);
+  REQUIRE(resumed.producer_name == "the_old_producers");
+  REQUIRE(resumed.audio_sink == kept.audio_sink);
+  REQUIRE(resumed.mouse == kept.mouse);
+  REQUIRE(resumed.keyboard == kept.keyboard);
+  REQUIRE(resumed.joypads == kept.joypads);
+  REQUIRE(resumed.control_feedback == kept.control_feedback); // the joypads' feedback reaches the new peer
+  REQUIRE(resumed.pen_tablet == kept.pen_tablet);
+  REQUIRE(resumed.touch_screen == kept.touch_screen);
+  // Not carried over: the new instance negotiates its own control stream
+  REQUIRE(resumed.control_stream != kept.control_stream);
 }

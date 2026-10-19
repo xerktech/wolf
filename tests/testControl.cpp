@@ -457,6 +457,26 @@ TEST_CASE("control: a peer matched only by IP can't take over a live stream", "[
   legacy_client.service(200ms);
   REQUIRE_FALSE(legacy_client.disconnected);
   REQUIRE(resumes == 2);
+
+  // The legacy client crashes and /resumes while its dead peer is still listed: that peer belongs to the stream
+  // instance the resume replaced, so the fallback lets the client's new connection in, and it supersedes the dead one
+  auto resumed = session;
+  resumed.enet_secret_payload = 2;
+  resumed.aes_key = "00112233445566778899AABBCCDDEEFF";
+  running_sessions->store(immer::vector{resumed});
+  TestENetClient resumed_client(port, 0);
+  resumed_client.service(200ms);
+  legacy_client.service(200ms);
+  REQUIRE_FALSE(resumed_client.disconnected);
+  REQUIRE(legacy_client.disconnected);
+  REQUIRE(resumes == 3);
+
+  // ...and the resumed stream's live peer is protected like the first one was
+  TestENetClient second_intruder(port, 99);
+  second_intruder.service(200ms);
+  resumed_client.service(200ms);
+  REQUIRE(second_intruder.disconnected);
+  REQUIRE_FALSE(resumed_client.disconnected);
 }
 
 TEST_CASE("control: joypad feedback reaches the resumed stream's client", "[ENET]") {
@@ -518,6 +538,70 @@ TEST_CASE("control: joypad feedback reaches the resumed stream's client", "[ENET
   resumed_client.disconnect();
   resumed_client.service(200ms);
   REQUIRE_FALSE(resumed.control_feedback->load()->send);
+}
+
+TEST_CASE("control: the first packet that authenticates fixes the encryption mode", "[ENET]") {
+  using wolf::core::events::StreamSession;
+  constexpr int port = 47994;
+  const std::string key = "EDF04A215C4FBEA20934120C8480D855", wrong_key = "00112233445566778899AABBCCDDEEFF";
+  // Two streams whose (unauthenticated) RTSP ANNOUNCE got the client's mode wrong, e.g. a spoofed one won the race
+  auto make_session = [&](std::size_t id, ControlEncryption announced) {
+    StreamSession session{.session_id = id};
+    session.enet_secret_payload = id;
+    session.aes_key = key;
+    session.ip = "10.255.255.1"; // never matches loopback, keep the IP fallback out of the way
+    REQUIRE(session.control_stream->announce_encryption(announced));
+    return session;
+  };
+  auto v2_stream = make_session(1, ControlEncryption::V1), v1_stream = make_session(2, ControlEncryption::V2);
+
+  auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
+  std::mutex idr_mutex;
+  std::vector<std::size_t> idr_sessions;
+  auto idr_handler = event_bus->register_handler<immer::box<wolf::core::events::IDRRequestEvent>>(
+      [&](const immer::box<wolf::core::events::IDRRequestEvent> &ev) {
+        std::lock_guard lock(idr_mutex);
+        idr_sessions.push_back(ev->session_id);
+      });
+  auto idrs = [&]() {
+    std::lock_guard lock(idr_mutex);
+    return idr_sessions;
+  };
+  state::SessionsAtoms running_sessions =
+      std::make_shared<immer::atom<immer::vector<StreamSession>>>(immer::vector{v2_stream, v1_stream});
+
+  REQUIRE(control::init());
+  std::thread([=] { control::run_control(port, running_sessions, event_bus, 20, 10ms, "127.0.0.1"); }).detach();
+  std::this_thread::sleep_for(200ms);
+
+  TestENetClient v2_client(port, 1), v1_client(port, 2);
+  v2_client.service(100ms);
+  v1_client.service(100ms);
+
+  // A packet that doesn't authenticate under the session key decides nothing
+  v2_client.send_idr(wrong_key, 0, ControlEncryption::V2);
+  v2_client.service(200ms);
+  REQUIRE(idrs().empty());
+  REQUIRE_FALSE(v2_stream.control_stream->encryption_negotiated);
+
+  // Each client's first genuine packet gets through and fixes its stream's mode, whatever the ANNOUNCE said
+  v2_client.send_idr(key, 1, ControlEncryption::V2);
+  v2_client.service(200ms);
+  v1_client.send_idr(key, 0, ControlEncryption::V1);
+  v1_client.service(200ms);
+  REQUIRE(idrs() == std::vector<std::size_t>{1, 2});
+  REQUIRE(v2_stream.control_stream->encryption_negotiated);
+  REQUIRE(*v2_stream.control_stream->encryption.load() == ControlEncryption::V2);
+  REQUIRE(*v1_stream.control_stream->encryption.load() == ControlEncryption::V1);
+
+  // From then on: a later (spoofed) ANNOUNCE is ignored, and a packet in the other mode doesn't decrypt
+  REQUIRE_FALSE(v2_stream.control_stream->announce_encryption(ControlEncryption::V1));
+  REQUIRE(*v2_stream.control_stream->encryption.load() == ControlEncryption::V2);
+  v2_client.send_idr(key, 2, ControlEncryption::V1);
+  v2_client.service(200ms);
+  v2_client.send_idr(key, 3, ControlEncryption::V2);
+  v2_client.service(200ms);
+  REQUIRE(idrs() == std::vector<std::size_t>{1, 2, 1});
 }
 
 TEST_CASE("streaming: a superseded stream instance ends only its own pipelines", "[GSTREAMER]") {

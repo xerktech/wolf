@@ -97,6 +97,16 @@ bool encrypt_and_send(std::string_view payload,
   }
 }
 
+bool has_connected_peer(const enet_clients_map &connected_clients, const events::StreamSession &session) {
+  for (const auto &[peer, peer_session] : connected_clients) {
+    if (peer_session->session_id == session.session_id &&
+        peer_session->enet_secret_payload == session.enet_secret_payload) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::optional<events::StreamSession> get_current_session(const enet_clients_map &connected_clients,
                                                          const state::SessionsAtoms &running_sessions,
                                                          std::string_view client_ip,
@@ -112,10 +122,11 @@ std::optional<events::StreamSession> get_current_session(const enet_clients_map 
     logs::log(logs::warning,
               "[ENET] Unable to find a session that matches the client secret {}, matching by IP",
               enet_event.data);
-    // Only for a session with no connected peer: anyone behind the same IP (NAT) could otherwise attach to a live
-    // stream and, being the newest peer, drop its real client (see superseded_peers)
+    // Never for a stream instance that already has a connected peer: anyone behind the same IP (NAT) could otherwise
+    // attach to a live stream and, being the newest peer, drop its real client (see superseded_peers).
+    // Peers of an instance a /resume replaced don't count: they're the client's dead connection, waiting to time out.
     for (const StreamSession &session : *sessions) {
-      if (session.ip == client_ip && superseded_peers(connected_clients, enet_event.peer, session.session_id).empty()) {
+      if (session.ip == client_ip && !has_connected_peer(connected_clients, session)) {
         return session;
       }
     }
@@ -297,6 +308,20 @@ void run_control(int port,
                 break;
               }
               auto control_stream = client_session->control_stream;
+              if (!control_stream->encryption_negotiated) {
+                // The first packet that authenticates fixes the mode: what the (unauthenticated) RTSP ANNOUNCE
+                // asked for is only a hint, a spoofed one sent before or after the client's own mustn't decide it
+                auto mode = authenticated_mode(*enc_pkt, client_session->aes_key);
+                if (!mode) {
+                  logs::log(logs::warning, "[ENET] Dropping encrypted packet that doesn't authenticate");
+                  break;
+                }
+                if (*mode != *control_stream->encryption.load()) {
+                  logs::log(logs::info,
+                            "[ENET] Control stream encryption differs from the ANNOUNCE, using the client's");
+                }
+                control_stream->authenticate_encryption(*mode);
+              }
               auto encryption = *control_stream->encryption.load();
               auto decrypted = decrypt_packet(*enc_pkt, client_session->aes_key, encryption);
               if (decrypted.size() < sizeof(ControlPacket)) {

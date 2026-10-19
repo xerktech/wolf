@@ -21,9 +21,11 @@ paths:
     resume. `control.cpp` treats it as superseded: it fires `EndSupersededStreamEvent` (keyed by
     `rtp_secret_payload`) instead of a pause.
   - On ENet connect the newest peer owns the session; older peers of the same session are dropped.
-  - So the IP fallback (a CONNECT whose secret matches nothing) only matches a session with no connected
-    peer: anyone behind the client's NAT could otherwise drop the live peer. Tests: "control: a peer
-    matched only by IP can't take over a live stream".
+  - So the IP fallback (a CONNECT whose secret matches nothing) never matches a stream instance with a
+    connected peer (`has_connected_peer`): anyone behind the client's NAT could otherwise drop it.
+    - Peers of an instance a /resume replaced don't count: a client without the secret that crashed and
+      resumed must get in while its dead peer times out. Tests: "control: a peer matched only by IP
+      can't take over a live stream".
   - Joypads outlive a /resume, so their feedback (rumble, LEDs) sends through `control_feedback`, which
     each ENet connect points at its peer/key. Never capture the peer or key in a device callback.
     Tests: "control: joypad feedback reaches the resumed stream's client".
@@ -87,8 +89,12 @@ paths:
   - The window belongs to the stream instance, not the ENet peer: a new peer of the same stream
     must not reset it. `/resume` gets a fresh `control_stream` (new key, seq restarts at 0).
   - Packets Wolf sends take `send_seq++`: a fixed seq reuses the GCM nonce under one key.
-  - The first valid ANNOUNCE fixes the mode for the stream instance (`encryption_negotiated`); a later
-    one can't switch it either way: RTSP is unauthenticated, a spoofed switch breaks all control input.
+  - RTSP is unauthenticated: an ANNOUNCE's mode is only a hint (used for what Wolf sends meanwhile).
+    The client's first control packet whose GCM tag verifies (`authenticated_mode`) fixes the mode for
+    the stream instance (`encryption_negotiated`); later ANNOUNCEs are ignored.
+    - Never let any ANNOUNCE fix it, first or last: a spoofed one sent before the client's own locks a
+      V2 client into V1 (no control, no video), one sent after flips a V1 client. Tests: "control: the
+      first packet that authenticates fixes the encryption mode".
   - A seq past UINT32_MAX is dropped on purpose (it would reuse a nonce, and accept that packet's replay).
   - Tests: `tests/testControl.cpp` "Control replay window", "Control V2 encryption", "control: a
     replayed encrypted packet is dropped"; `tests/testRTSP.cpp` DESCRIBE / "ANNOUNCE control".
