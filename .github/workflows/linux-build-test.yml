@@ -12,6 +12,9 @@ on:
 
 env:
   GST_WAYLAND_COMMIT: 016b4fc
+  # Only read by the ASan leg. allow_user_segv_handler=0: a SIGSEGV handler installed by the code under test (wolf.cpp
+  # has one) would otherwise swallow ASan's report. detect_leaks=0: detached server threads leak by design.
+  WOLFTESTS_ASAN_OPTIONS: allow_user_segv_handler=0:detect_leaks=0
 
 jobs:
   # Build the Rust-based libgstwaylanddisplay for both architectures
@@ -75,7 +78,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name
     runs-on: ${{ matrix.runner }}
     needs: build-gst-wayland
-    timeout-minutes: 30
+    timeout-minutes: ${{ matrix.timeout || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -134,6 +137,20 @@ jobs:
             test_virtual_input: OFF
             test_exceptions: ON
             name: clang++ - STD 20 - Shared false
+          # AddressSanitizer: a use-after-free (e.g. of a freed immer snapshot) almost never crashes the other legs.
+          # The storm tests (tests/storm.hpp) only fail reliably here.
+          - runner: ubuntu-26.04
+            arch: x86_64
+            cxx: g++
+            shared: false
+            std: 20
+            sanitize: address
+            timeout: 60
+            test_docker: ON
+            test_nvidia: OFF
+            test_virtual_input: OFF
+            test_exceptions: ON
+            name: ASan - g++ - STD 20 - Shared false
 
     steps:
       - uses: actions/checkout@v6
@@ -168,7 +185,7 @@ jobs:
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2.23
         with:
-          key: ${{ matrix.cxx }}-${{ matrix.arch }}
+          key: ${{ matrix.cxx }}-${{ matrix.arch }}${{ matrix.sanitize && format('-{0}', matrix.sanitize) || '' }}
 
       - name: Setup gst-interpipe
         run: |
@@ -182,11 +199,24 @@ jobs:
         working-directory: ${{runner.workspace}}
         env:
           CXX: ${{matrix.cxx}}
+          SANITIZE: ${{ matrix.sanitize }}
         # Note: $GITHUB_WORKSPACE is distinct from ${{runner.workspace}}.
         run: |
+          BUILD_TYPE=Release
+          SANITIZER_FLAGS=()
+          if [ -n "$SANITIZE" ]; then
+            BUILD_TYPE=RelWithDebInfo # line numbers in the sanitizer's report
+            # IMMER_NO_FREE_LIST: immer otherwise recycles freed nodes through its own free lists, out of the
+            # sanitizer's sight, so a read of a freed snapshot would go unnoticed
+            FLAGS="-fsanitize=$SANITIZE -fno-omit-frame-pointer -DIMMER_NO_FREE_LIST=1"
+            SANITIZER_FLAGS=(-DCMAKE_C_FLAGS="$FLAGS" -DCMAKE_CXX_FLAGS="$FLAGS"
+                             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=$SANITIZE"
+                             -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=$SANITIZE")
+          fi
           cmake -Bbuild \
                 -H$GITHUB_WORKSPACE \
-                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+                "${SANITIZER_FLAGS[@]}" \
                 -DCMAKE_CXX_STANDARD=${{ matrix.std }} \
                 -DCMAKE_CXX_EXTENSIONS=OFF \
                 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -202,6 +232,9 @@ jobs:
 
       - name: Build tests + lib
         working-directory: ${{runner.workspace}}/build
+        env:
+          # The build runs wolftests --list-tests (catch_discover_tests)
+          ASAN_OPTIONS: ${{ env.WOLFTESTS_ASAN_OPTIONS }}
         run: ninja -j $(nproc) wolftests
 
       - name: Run tests
@@ -212,6 +245,7 @@ jobs:
           XDG_RUNTIME_DIR: /tmp
           RUST_BACKTRACE: FULL
           RUST_LOG: FATAL
+          ASAN_OPTIONS: ${{ env.WOLFTESTS_ASAN_OPTIONS }}
         run: ./wolftests --reporter JUnit::out=${{runner.workspace}}/report.xml --reporter console::out=-::colour-mode=ansi
 
       - name: Test Report

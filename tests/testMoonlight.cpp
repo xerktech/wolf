@@ -1,5 +1,6 @@
 #include <crypto/src/sign.hpp>
 
+#include "storm.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_container_properties.hpp>
 #include <catch2/matchers/catch_matchers_contains.hpp>
@@ -911,4 +912,31 @@ TEST_CASE("Launch rejects malformed client parameters", "[HTTP]") {
   REQUIRE_FALSE(launch({{"rikeyid", "1"}, {"surroundAudioInfo", "196610junk"}}));
   REQUIRE_FALSE(launch({{"rikeyid", "abc"}}));
   REQUIRE_FALSE(launch({})); // missing rikeyid
+}
+
+TEST_CASE("Pairing: a phase lookup racing other clients' pairing", "[MoonlightProtocol]") {
+  immer::box<state::AppState> app_state = {
+      state::AppState{.pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>()}};
+  auto cache_key = endpoints::pair_cache_key("1234", "0.0.0.0");
+  // A long cert, so that copying the cached entry out of a freed snapshot reads a freed buffer for a while
+  auto pair_cache = state::PairCache{.client_cert = std::string(4096, 'c'), .aes_key = "key"};
+  app_state->pairing_cache->update([&](const auto &cache) { return cache.set(cache_key, pair_cache); });
+
+  QuietLogs quiet;
+  // Other clients starting and failing to pair: each update swaps the map out and frees the previous one, so a lookup
+  // that doesn't hold its snapshot reads freed memory (XERK-2023)
+  Hammer other_clients([&, i = 0]() mutable {
+    auto other_key = endpoints::pair_cache_key(std::to_string(i++ % 8), "1.1.1.1");
+    app_state->pairing_cache->update([&](const auto &cache) { return cache.set(other_key, pair_cache); });
+    app_state->pairing_cache->update([&](const auto &cache) { return cache.erase(other_key); });
+  });
+
+  // A query matching no phase looks the client up and leaves its pairing session alone
+  auto result = storm(4, 50'000, std::chrono::seconds(5), [&]() {
+    return !endpoints::pair_next_phase(app_state, {{"foo", "bar"}}, "1234", "0.0.0.0").has_value();
+  });
+  REQUIRE(result.runs > 0);
+  REQUIRE(result.failures == 0);
+  REQUIRE(other_clients.iterations > 0);
+  REQUIRE(app_state->pairing_cache->load()->find(cache_key) != nullptr);
 }

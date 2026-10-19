@@ -17,3 +17,12 @@ paths:
   `debug_size_heap` assert when ~32 runners on one session exit together.
 - Tests: `tests/testWolfAPI.cpp` "Runners: many concurrent starts on one session that exit at once".
   It segfaulted on every CI leg before the fix; it can't prove absence, only catch a regression often.
+- The other sites (hot-plug handler, API pair endpoints, `pair_next_phase`, control's session lookups)
+  have storm tests (`tests/storm.hpp` helpers): a reader races a thread that keeps replacing the atom.
+  - A normal build rarely crashes with a fix reverted; the CI ASan leg is what catches the read of
+    the freed snapshot. Keep that leg's `-DIMMER_NO_FREE_LIST=1`: immer otherwise recycles freed nodes
+    through its own free lists, where ASan can't see them.
+  - Tests: "Pairing: a phase lookup racing other clients' pairing", "Pair API: completing pairings
+    while other pairing requests come and go", "control: a connecting peer's session lookup racing
+    session updates", "control: a stopped stream's peer lookup racing peers connecting",
+    "Hot-plugging devices while other streams start and stop".
