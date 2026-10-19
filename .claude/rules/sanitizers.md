@@ -20,7 +20,10 @@ paths:
   - So Wolf code running on a GStreamer thread (pipeline callbacks, the RTP payloaders) is not covered.
   - Never suppress a race in Wolf's own code without a ticket, and name it on the line (XERK-2101).
 - What it catches: API `state_->sockets` touched off the io_context thread (removing `sse_broadcast`'s
-  `dispatch` gives 9 reports in `[API]`), the process runner's env/terminate races (`[PROCESS]`).
+  `dispatch` gives 9 reports in `[API]`) and concurrent process-group terminates (`[PROCESS]`).
+  - Not an off-thread `write_queue` write: asio's internal mutexes give TSan a happens-before.
+  - Not the env leak: glibc's environ is uninstrumented; only the env test's assertion catches it.
+- A flake that shows only on CI's 4 vCPUs reproduces with `taskset -c 0-3` and the JUnit reporter.
 - Running it by hand: Ubuntu 26.04 + CI's apt list + `gstreamer1.0-plugins-{base,good}` (without
   `videotestsrc` "Stopping a stuck pipeline doesn't block the event bus" fails and hangs the run).
   - The whole suite takes ~6 min under TSan; `TSAN_OPTIONS=log_path=<prefix>` keeps reports out of
