@@ -41,3 +41,10 @@ paths:
   - Tests: "Process runner stops an app whose session was stopped while it started" (unit),
     `tests/testWolfAPI.cpp` "Runners: a session stopped while its runner starts doesn't leave the app
     running" (through `setup_moonlight_handlers`).
+- The app's environment is a copy (`bp::environment env = this_process::environment()`), never `auto`:
+  that is Wolf's live environment, and assigning to it `setenv()`s in Wolf, racing every `getenv` and
+  leaking one app's variables (`XDG_RUNTIME_DIR`, `PULSE_SINK`) into Wolf and later apps.
+  - Tests: "Process runner passes the app's environment without changing Wolf's".
+- `terminate_group` runs under the runner's `terminate_lock`: handlers fire under the bus's shared lock,
+  so two stops on two threads would race on the group's pgid. Tests: "Process runner handles stops
+  fired on two threads at once" (fails only under TSan).

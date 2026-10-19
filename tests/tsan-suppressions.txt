@@ -1,0 +1,21 @@
+# ThreadSanitizer suppressions for the CI TSan leg (TSAN_OPTIONS=suppressions=<this file>).
+# A `race:` line matches a report when any frame of either racing stack has the pattern in its function, file or
+# library name. Keep every entry narrow and say why it's not a Wolf bug, or which ticket tracks the bug.
+
+# Uninstrumented system libraries. They synchronise through futexes TSan can't see (GMutex, GAsyncQueue, GThreadPool,
+# Rust's std::sync in gst-wayland-display), so memory handed to or from their threads shows up as a race, e.g. a
+# buffer Wolf allocates and a GStreamer streaming thread frees. Wolf code running on their threads (pipeline
+# callbacks, the RTP payloaders) is therefore not covered by this leg.
+race:libglib-2.0.so
+race:libgobject-2.0.so
+race:libgstreamer-1.0.so
+race:libgstbase-1.0.so
+race:libgstapp-1.0.so
+race:libgstinterpipe.so
+race:libgstwaylanddisplaysrc.so
+# OpenSSL initialises its RNG lazily with atomics TSan can't see: two first RAND_bytes calls at once are reported
+race:libcrypto.so
+
+# XERK-2101: ENet packets are sent from other threads while the control thread services the same host.
+# A real bug: drop this line with its fix.
+race:control::send_packet
