@@ -20,6 +20,9 @@ paths:
   - `send_eos_async` sends the EOS to each source, never to the pipeline: a bin holds its STATE_LOCK
     while the sources take it, and a still-prerolling pipeline needs that lock to finish → it hangs
     forever. Tests: `tests/testGSTPlugin.cpp` "Stopping a pipeline during preroll ends it".
+  - An appsrc source (interpipesrc) gets `gst_app_src_end_of_stream` instead: an EOS event only
+    reaches its streaming thread with the next buffer, so a consumer with no producer never ends.
+    Tests: "Stopping a consumer whose producer never sends ends it" (needs gst-interpipe).
   - Other events into a pipeline (e.g. the IDR's force-key-unit) go through `send_message_async`.
 - `SwitchStreamProducerEvents` stays synchronous (`g_object_set` "listen-to"): an async switch runs on
   an unordered thread pool, so a quick join + leave could land in the wrong order.

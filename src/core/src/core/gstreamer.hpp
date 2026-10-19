@@ -1,5 +1,6 @@
 #pragma once
 
+#include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
 #include <helpers/logger.hpp>
 
@@ -67,6 +68,10 @@ static void send_message_async(GstElement *recipient, GstStructure *message) {
  * The EOS goes to each source, not to the pipeline: sending it to a bin holds the bin's STATE_LOCK
  * until the sources have taken it, and a pipeline still prerolling needs that lock to finish its
  * state change, so a stop during preroll would deadlock the pipeline forever.
+ *
+ * An appsrc (interpipesrc is one) gets gst_app_src_end_of_stream instead: an EOS event only reaches
+ * its streaming thread with the next buffer, so a consumer whose producer never sends one (an app
+ * without an audio server) would never end.
  */
 static void send_eos_async(GstElement *pipeline) {
   gst_element_call_async(
@@ -81,7 +86,12 @@ static void send_eos_async(GstElement *pipeline) {
         bool sent = false;
         // A source added mid-iteration (GST_ITERATOR_RESYNC) is ignored: Wolf's pipelines are static
         while (gst_iterator_next(sources, &source) == GST_ITERATOR_OK) {
-          gst_element_send_event(GST_ELEMENT(g_value_get_object(&source)), gst_event_new_eos());
+          auto src = GST_ELEMENT(g_value_get_object(&source));
+          if (GST_IS_APP_SRC(src)) {
+            gst_app_src_end_of_stream(GST_APP_SRC(src));
+          } else {
+            gst_element_send_event(src, gst_event_new_eos());
+          }
           sent = true;
           g_value_reset(&source);
         }

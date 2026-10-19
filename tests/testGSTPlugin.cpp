@@ -660,3 +660,24 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a pipeline during preroll ends
   event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = 1}));
   REQUIRE(ended_future.wait_for(10s) == std::future_status::ready);
 }
+
+TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a consumer whose producer never sends ends it", "[GSTPlugin]") {
+  using namespace wolf::core;
+  // No interpipesink named nobody_audio: the source never gets a buffer (an app without an audio server)
+  auto pipeline = gstreamer::gst_element_ptr(
+      gst_parse_launch("interpipesrc listen-to=nobody_audio is-live=true stream-sync=restart-ts max-bytes=0 "
+                       "max-buffers=3 block=false ! fakesink",
+                       nullptr),
+      ::gst_object_unref);
+  REQUIRE(pipeline);
+  gst_element_set_state(pipeline.get(), GST_STATE_PLAYING);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+  gstreamer::send_eos_async(pipeline.get());
+  auto bus = gst_element_get_bus(pipeline.get());
+  auto msg = gst_bus_timed_pop_filtered(bus, 5 * GST_SECOND, GST_MESSAGE_EOS);
+  REQUIRE(msg != nullptr);
+  gst_message_unref(msg);
+  gst_object_unref(bus);
+  gst_element_set_state(pipeline.get(), GST_STATE_NULL);
+}
