@@ -6,7 +6,9 @@
 
 using Catch::Matchers::Equals;
 
+#include <atomic>
 #include <chrono>
+#include <fmt/format.h>
 #include <future>
 #include <gst-plugin/audio.hpp>
 #include <gst-plugin/video.hpp>
@@ -15,6 +17,7 @@ using Catch::Matchers::Equals;
 #include <streaming/streaming.hpp>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace std::string_literals;
 
@@ -734,4 +737,122 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Ending a pipeline twice at once sends o
     gst_object_unref(bus);
     gst_element_set_state(pipeline.get(), GST_STATE_NULL);
   }
+}
+
+/*
+ * INTERPIPE
+ */
+
+/**
+ * A producer's interpipesink is torn down while consumers on other threads keep joining, leaving and sending
+ * upstream events to it. Unpatched gst-interpipe SIGSEGVs here within the first ~100 producer teardowns (see
+ * docker/patches/gst-interpipe-teardown-race.patch).
+ */
+TEST_CASE_METHOD(GStreamerTestsFixture, "Interpipe producer teardown with active consumers", "[GSTPlugin]") {
+  auto interpipe = gst_element_factory_find("interpipesrc");
+  REQUIRE(interpipe); // fail rather than skip, so a broken CI install doesn't read as green
+  gst_object_unref(interpipe);
+
+  constexpr int n_consumers = 16;
+  constexpr int n_producers = 500;
+  std::atomic<bool> stop = false;
+  std::vector<std::thread> consumers;
+
+  for (int i = 0; i < n_consumers; i++) {
+    consumers.emplace_back([i, &stop]() {
+      auto desc = fmt::format("interpipesrc name=teardown_c{} listen-to=teardown_prod is-live=true ! "
+                              "fakesink sync=false",
+                              i);
+      while (!stop) {
+        auto pipeline = gst_parse_launch(desc.c_str(), nullptr);
+        gst_element_set_state(pipeline, GST_STATE_PLAYING);
+        auto src = gst_bin_get_by_name(GST_BIN(pipeline), fmt::format("teardown_c{}", i).c_str());
+        auto pad = gst_element_get_static_pad(src, "src");
+        for (int ev = 0; ev < 10; ev++) {
+          gst_pad_send_event(pad, gst_event_new_reconfigure());
+        }
+        gst_object_unref(pad);
+        gst_object_unref(src);
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+      }
+    });
+  }
+
+  for (int i = 0; i < n_producers; i++) {
+    auto pipeline = gst_parse_launch("videotestsrc is-live=true ! video/x-raw,width=64,height=64 ! "
+                                     "interpipesink name=teardown_prod sync=false async=false",
+                                     nullptr);
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    std::this_thread::sleep_for(std::chrono::microseconds(i % 7 * 300));
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline); // finalizing the interpipesink unregisters the node
+  }
+
+  stop = true;
+  for (auto &t : consumers) {
+    t.join();
+  }
+  SUCCEED("no crash or deadlock");
+}
+
+/**
+ * An upstream event forwarded from a consumer is still inside the producer (held by a pad probe) when the producer is
+ * disposed: tearing the producer down must wait for that forward to return instead of freeing the node under it.
+ */
+TEST_CASE_METHOD(GStreamerTestsFixture, "Interpipe producer teardown waits for forwarded events", "[GSTPlugin]") {
+  auto interpipe = gst_element_factory_find("interpipesrc");
+  REQUIRE(interpipe);
+  gst_object_unref(interpipe);
+
+  static std::atomic<bool> in_probe = false;
+  auto consumer =
+      gst_parse_launch("interpipesrc name=fwd_c listen-to=fwd_prod is-live=true ! fakesink sync=false", nullptr);
+  gst_element_set_state(consumer, GST_STATE_PLAYING);
+  auto consumer_src = gst_bin_get_by_name(GST_BIN(consumer), "fwd_c");
+  auto consumer_pad = gst_element_get_static_pad(consumer_src, "src");
+
+  auto producer = gst_parse_launch(
+      "videotestsrc is-live=true ! video/x-raw,width=64,height=64 ! identity name=fwd_id ! "
+      "interpipesink name=fwd_prod sync=false async=false",
+      nullptr);
+  auto identity = gst_bin_get_by_name(GST_BIN(producer), "fwd_id");
+  auto identity_pad = gst_element_get_static_pad(identity, "src");
+  gst_pad_add_probe(
+      identity_pad,
+      GST_PAD_PROBE_TYPE_EVENT_UPSTREAM,
+      [](GstPad *, GstPadProbeInfo *info, gpointer) {
+        if (GST_EVENT_TYPE(GST_PAD_PROBE_INFO_EVENT(info)) == GST_EVENT_CUSTOM_UPSTREAM) {
+          in_probe = true;
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+          in_probe = false;
+        }
+        return GST_PAD_PROBE_OK;
+      },
+      nullptr,
+      nullptr);
+  gst_object_unref(identity_pad);
+  gst_object_unref(identity);
+  gst_element_set_state(producer, GST_STATE_PLAYING);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100)); // let the consumer connect
+
+  std::thread sender([consumer_pad]() {
+    gst_pad_send_event(consumer_pad,
+                       gst_event_new_custom(GST_EVENT_CUSTOM_UPSTREAM, gst_structure_new_empty("wolf-test")));
+  });
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!in_probe && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  REQUIRE(in_probe);
+
+  gst_element_set_state(producer, GST_STATE_NULL);
+  gst_object_unref(producer); // disposing the interpipesink unregisters the node
+  REQUIRE_FALSE(in_probe);    // the forward finished before the node was torn down
+
+  sender.join();
+  gst_element_set_state(consumer, GST_STATE_NULL);
+  gst_object_unref(consumer_pad);
+  gst_object_unref(consumer_src);
+  gst_object_unref(consumer);
 }

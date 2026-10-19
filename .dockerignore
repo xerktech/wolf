@@ -8,4 +8,5 @@
 !.clang-format
 !docker/gstreamer.control
 !docker/startup.sh
+!docker/patches
 !docker/supervisord.conf
