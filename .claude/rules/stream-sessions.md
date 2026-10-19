@@ -105,7 +105,8 @@ paths:
       an instance after a pause through them (XERK-2046).
     - Accepted cost: a spoofed ANNOUNCE that beats the client's own claims the instance, so that
       stream fails to start (Moonlight aborts on a non-200 ANNOUNCE). A fake-ip match ignores the
-      source IP (`get_session`), and fenrir's fake ip is the pod IP; RTSP auth is XERK-2115.
+      source IP (`get_session`), and fenrir's fake ip is the pod IP. Clients with encrypted RTSP
+      (`.claude/rules/rtsp-encryption.md`) aren't exposed to this; plaintext-only clients still are.
     - A 400 ANNOUNCE (bad display mode) doesn't use it up: keep the claim after the validation.
     - Tests: `tests/testRTSP.cpp` "RTSP: a stream instance starts its pipelines from one ANNOUNCE only";
       `tests/testMoonlight.cpp` "/resume keeps what still runs for the stream" (not carried over).

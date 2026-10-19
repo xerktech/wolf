@@ -149,11 +149,15 @@ XML applist(const immer::vector<App> &apps);
 /**
  * After the user selects an app to launch we have to negotiate the IP and PORT for the RTSP session
  *
- * @param config: local state
+ * @param encrypted_rtsp: advertise Sunshine's encrypted RTSP (rtspenc://) instead of plaintext rtsp://
  * @return:
  */
-XML launch_success(const std::string &local_ip, const std::string &rtsp_port);
-// TODO: launch_error()
+XML launch_success(const std::string &local_ip, const std::string &rtsp_port, bool encrypted_rtsp = false);
 
-XML launch_resume(const std::string &local_ip, const std::string &rtsp_port);
+/**
+ * A refused launch or resume: Moonlight shows status_message to the user
+ */
+XML launch_error(int status_code, const std::string &status_message);
+
+XML launch_resume(const std::string &local_ip, const std::string &rtsp_port, bool encrypted_rtsp = false);
 } // namespace moonlight

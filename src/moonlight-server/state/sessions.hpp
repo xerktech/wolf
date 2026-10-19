@@ -1,5 +1,6 @@
 #pragma once
 
+#include <boost/algorithm/string/predicate.hpp>
 #include <events/events.hpp>
 #include <helpers/logger.hpp>
 #include <helpers/utils.hpp>
@@ -65,6 +66,21 @@ inline std::optional<events::Lobby> get_lobby_by_connected_session(const immer::
     return lobby;
   }
   return {};
+}
+
+/**
+ * Reads WOLF_RTSP_REQUIRE_ENCRYPTION. It's a security switch: a value that's neither clearly on nor off turns it on
+ * (with a warning) instead of silently leaving it off.
+ */
+inline bool parse_rtsp_require_encryption(std::string_view value) {
+  auto is = [value](std::string_view option) { return boost::algorithm::iequals(value, option); };
+  if (value.empty() || is("FALSE") || is("0") || is("NO") || is("OFF")) {
+    return false;
+  }
+  if (!is("TRUE") && !is("1") && !is("YES") && !is("ON")) {
+    logs::log(logs::warning, "WOLF_RTSP_REQUIRE_ENCRYPTION={} is neither TRUE nor FALSE: requiring encryption", value);
+  }
+  return true;
 }
 
 inline std::shared_ptr<events::StreamSession> create_stream_session(immer::box<state::AppState> state,

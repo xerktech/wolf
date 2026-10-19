@@ -1404,6 +1404,16 @@
           "rtsp_fake_ip": {
             "type": "string"
           },
+          "rtsp_encrypted": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "video_width": {
             "type": "integer"
           },
@@ -1893,11 +1903,15 @@
           },
           "session_id": {
             "type": "string"
+          },
+          "rtsp_encrypted": {
+            "type": "boolean"
           }
         },
         "required": [
           "success",
-          "session_id"
+          "session_id",
+          "rtsp_encrypted"
         ]
       },
       "wolf__api__StreamSessionHandleInputRequest": {
@@ -1930,6 +1944,16 @@
           },
           "rtsp_fake_ip": {
             "type": "string"
+          },
+          "rtsp_encrypted": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "video_width": {
             "type": "integer"
