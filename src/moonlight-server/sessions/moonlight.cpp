@@ -145,10 +145,12 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
   auto plugged_devices_queue = std::make_shared<immer::atom<session_devices>>();
 
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::StopStreamEvent>>(
-      [&app_state, plugged_devices_queue](const immer::box<events::StopStreamEvent> &ev) {
+      // By value: the handler outlives the caller's app_state reference
+      [running_sessions = app_state->running_sessions,
+       plugged_devices_queue](const immer::box<events::StopStreamEvent> &ev) {
         // Remove session from app state so that HTTP/S applist gets updated
         // This should effectively destroy the virtual Wayland session since it holds the last reference
-        app_state->running_sessions->update([&ev](const immer::vector<events::StreamSession> &ses_v) {
+        running_sessions->update([&ev](const immer::vector<events::StreamSession> &ses_v) {
           return state::remove_session(ses_v, {.session_id = ev->session_id});
         });
 

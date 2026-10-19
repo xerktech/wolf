@@ -334,6 +334,7 @@ void run_server(int port, const state::SessionsAtoms &running_sessions) {
     }
   } catch (std::exception &e) {
     logs::log(logs::error, "Unable to create RTSP server on port: {} ex: {}", port, e.what());
+    throw; // Wolf can't stream without it: let the caller shut down
   }
 }
 

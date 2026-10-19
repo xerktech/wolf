@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <exceptions/exceptions.h>
 #include <filesystem>
+#include <functional>
 #include <immer/array_transient.hpp>
 #include <immer/map_transient.hpp>
 #include <immer/vector_transient.hpp>
@@ -42,6 +43,23 @@ static std::atomic_bool shutdown_requested = false;
 
 static void graceful_shutdown_handler(int signum) {
   shutdown_requested.store(true, std::memory_order_relaxed);
+}
+
+/** What Wolf exits with once shut down: set when a server couldn't run */
+static std::atomic_int exit_code = EXIT_SUCCESS;
+
+/**
+ * Runs a server; if it throws (e.g. its port is already taken), logs why and shuts Wolf down with an error.
+ * An exception escaping a server thread would otherwise std::terminate Wolf as if it had crashed.
+ */
+static void run_server(std::string_view name, const std::function<void()> &server) {
+  try {
+    server();
+  } catch (const std::exception &e) {
+    logs::log(logs::error, "Unable to run the {} server, shutting down: {}", name, e.what());
+    exit_code.store(EXIT_FAILURE);
+    shutdown_requested.store(true);
+  }
 }
 
 /**
@@ -193,32 +211,44 @@ void run() {
 
   // HTTP APIs
   std::thread([local_state]() {
-    HttpServer server = HttpServer();
-    HTTPServers::startServer(&server, local_state, state::get_port(state::HTTP_PORT));
+    run_server("HTTP", [&]() {
+      HttpServer server = HttpServer();
+      HTTPServers::startServer(&server, local_state, state::get_port(state::HTTP_PORT));
+    });
   }).detach();
 
   // HTTPS APIs
   std::thread([local_state, p_key_file, p_cert_file]() {
-    HttpsServer server = HttpsServer(p_cert_file, p_key_file);
-    HTTPServers::startServer(&server, local_state, state::get_port(state::HTTPS_PORT));
+    run_server("HTTPS", [&]() {
+      HttpsServer server = HttpsServer(p_cert_file, p_key_file);
+      HTTPServers::startServer(&server, local_state, state::get_port(state::HTTPS_PORT));
+    });
   }).detach();
 
   // RTSP
   std::thread([sessions = local_state->running_sessions]() {
-    rtsp::run_server(state::get_port(state::RTSP_SETUP_PORT), sessions);
+    run_server("RTSP", [&]() { rtsp::run_server(state::get_port(state::RTSP_SETUP_PORT), sessions); });
   }).detach();
 
   // Control
   std::thread([sessions = local_state->running_sessions, ev_bus = local_state->event_bus]() {
-    control::run_control(state::get_port(state::CONTROL_PORT), sessions, ev_bus);
+    run_server("control", [&]() { control::run_control(state::get_port(state::CONTROL_PORT), sessions, ev_bus); });
   }).detach();
 
   // RTP
-  rtp::start_rtp_ping(state::get_port(state::VIDEO_PING_PORT),
-                      state::get_port(state::AUDIO_PING_PORT),
-                      local_state->event_bus);
-  // Wolf API server
-  std::thread([local_state, runtime_dir]() { wolf::api::start_server(runtime_dir, local_state); }).detach();
+  run_server("RTP ping", [&]() {
+    rtp::start_rtp_ping(state::get_port(state::VIDEO_PING_PORT),
+                        state::get_port(state::AUDIO_PING_PORT),
+                        local_state->event_bus);
+  });
+  // Wolf API server: Moonlight clients don't need it, so Wolf keeps streaming without it
+  std::thread([local_state, runtime_dir]() {
+    try {
+      wolf::api::start_server(runtime_dir, local_state);
+    } catch (const std::exception &e) {
+      logs::log(logs::error, "Unable to start the Wolf API server, the API won't be available: {}", e.what());
+    }
+  }).detach();
 
   // mDNS
   std::thread([hostname = local_state->config->hostname]() {
@@ -255,7 +285,7 @@ void run() {
     std::this_thread::sleep_for(200ms);
   }
 
-  logs::log(logs::info, "Received shutdown signal, stopping all sessions and lobbies");
+  logs::log(logs::info, "Shutting down, stopping all sessions and lobbies");
 
   // Runner threads remove these after the app exits, which can be after we _Exit below; collect them so the
   // shutdown can remove leftovers itself (deleting a sink twice is a no-op).
@@ -310,7 +340,7 @@ void run() {
   std::clog.flush();
   std::cout.flush();
   std::fflush(nullptr);
-  std::_Exit(EXIT_SUCCESS);
+  std::_Exit(exit_code.load());
 }
 
 int main(int argc, char *argv[]) try {

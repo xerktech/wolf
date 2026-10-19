@@ -49,5 +49,5 @@ paths:
   --load=module-null-sink`) and set `PULSE_SERVER=unix:<dir>/native`.
 - Without a GPU set `WOLF_RENDER_NODE=SOFTWARE` and install gstreamer1.0-plugins-{good,bad,ugly}
   (startup aborts if no H.264 encoder is found).
-- Keep `WOLF_SOCKET_PATH` short (under ~100 chars): a long Unix socket path aborts startup with
-  "File name too long".
+- Keep `WOLF_SOCKET_PATH` short (under ~100 chars): with a long Unix socket path Wolf starts
+  without the API ("Unable to start the Wolf API server … File name too long").

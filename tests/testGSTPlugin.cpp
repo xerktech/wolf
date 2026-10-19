@@ -606,6 +606,7 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a stuck pipeline doesn't block
     auto other = event_bus->register_handler<immer::box<events::IDRRequestEvent>>([]() {});
     return std::chrono::steady_clock::now() - start;
   };
+  CHECK(fire_then_register(events::IDRRequestEvent{.session_id = 1}) < 1s);
   CHECK(fire_then_register(events::PauseStreamEvent{.session_id = 1}) < 1s);
   CHECK(fire_then_register(events::StopStreamEvent{.session_id = 2}) < 1s);
   CHECK(fire_then_register(events::StopStreamEvent{.session_id = 3}) < 1s);
@@ -616,4 +617,46 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a stuck pipeline doesn't block
   REQUIRE(stopped_video.wait_for(10s) == std::future_status::ready);
   REQUIRE(stopped_audio.wait_for(10s) == std::future_status::ready);
   REQUIRE(paused_audio.wait_for(10s) == std::future_status::ready);
+}
+
+/*
+ * A stop while the pipeline is still prerolling (its first buffer hasn't reached the sink) must still end it.
+ * An EOS sent to the pipeline itself holds the pipeline's STATE_LOCK until the source takes it, and the preroll needs
+ * that lock to finish: the pipeline would hang forever, leaking it and a GStreamer pool thread.
+ */
+TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a pipeline during preroll ends it", "[GSTPlugin]") {
+  using namespace wolf::core;
+  using namespace std::chrono_literals;
+
+  auto event_bus = std::make_shared<events::EventBusType>();
+  // The first buffer parks the streaming thread for 2s, so the (async) sink is still prerolling when the stop comes
+  auto video_session = immer::box<events::VideoSession>(
+      events::VideoSession{.display_mode = {.width = 64, .height = 64, .refreshRate = 30},
+                           .gst_pipeline = "videotestsrc ! identity sleep-time=2000000 ! fakesink",
+                           .session_id = 1,
+                           .timeout_ms = 1000,
+                           .packet_size = 1024,
+                           .fec_percentage = 20,
+                           .min_required_fec_packets = 2,
+                           .bitrate_kbps = 1000,
+                           .slices_per_frame = 1,
+                           .client_ip = "127.0.0.1"});
+  // Not std::async: its future would block the test forever in its destructor if the pipeline hangs
+  auto ended = std::make_shared<std::promise<void>>();
+  auto ended_future = ended->get_future();
+  std::thread([=]() {
+    streaming::start_streaming_video(
+        video_session,
+        [] { return std::string(); },
+        event_bus,
+        "127.0.0.1",
+        1,
+        std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>(),
+        nullptr);
+    ended->set_value();
+  }).detach();
+  std::this_thread::sleep_for(500ms);
+
+  event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = 1}));
+  REQUIRE(ended_future.wait_for(10s) == std::future_status::ready);
 }

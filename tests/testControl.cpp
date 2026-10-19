@@ -10,6 +10,7 @@ using Catch::Matchers::Equals;
 #include <future>
 #include <moonlight/control.hpp>
 #include <mutex>
+#include <sessions/handlers.hpp>
 #include <set>
 #include <state/sessions.hpp>
 #include <streaming/streaming.hpp>
@@ -1146,4 +1147,127 @@ TEST_CASE("control: a replayed encrypted packet is dropped", "[ENET]") {
   v1_client.send_idr(old_key, 7, ControlEncryption::V1);
   v1_client.service(200ms);
   REQUIRE(idr_requests == 7);
+}
+
+TEST_CASE("control: a port that's already taken throws instead of crashing", "[ENET]") {
+  boost::asio::io_context io;
+  // Port 0: the kernel picks a free one, which this socket then holds
+  boost::asio::ip::udp::socket taken(io, boost::asio::ip::udp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+  auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<wolf::core::events::StreamSession>>>();
+  REQUIRE(control::init());
+  REQUIRE_THROWS(
+      control::run_control(taken.local_endpoint().port(), running_sessions, event_bus, 20, 10ms, "127.0.0.1"));
+}
+
+/*
+ * The pipelines Wolf itself starts for a Moonlight stream (setup_moonlight_handlers) must resolve their producer with
+ * the session's lobby: a stream whose session joined a lobby before its pipelines started (e.g. a /resume) shows the
+ * lobby, not the session's own app (XERK-2045). Only gst-interpipe tells the two apart, hence the real pipelines.
+ */
+TEST_CASE("sessions: Moonlight's pipelines start on the lobby their session joined", "[GSTREAMER]") {
+  using namespace wolf::core;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  boost::asio::io_context io;
+
+  // Live producers, each sending datagrams of its own size: the session's own app, and the lobby it joined
+  auto start_producer = [](const std::string &name, int size, int samples) {
+    auto producer = gst_parse_launch(
+        fmt::format("videotestsrc is-live=true ! video/x-raw,format=I420,width={0},height={0} ! "
+                    "interpipesink name={2}_video sync=false "
+                    "audiotestsrc is-live=true samplesperbuffer={1} ! audio/x-raw,format=S16LE,channels=1,rate=48000 ! "
+                    "interpipesink name={2}_audio sync=false",
+                    size,
+                    samples,
+                    name)
+            .c_str(),
+        nullptr);
+    REQUIRE(producer);
+    gst_element_set_state(producer, GST_STATE_PLAYING);
+    return producer;
+  };
+  auto own = start_producer("42_cafe", 16, 100), lobby_producer = start_producer("some-lobby", 32, 300);
+
+  events::StreamSession session{.event_bus = event_bus, .session_id = 42};
+  session.producer_name = "42_cafe";
+  events::Lobby lobby{.id = "some-lobby"};
+  lobby.connected_sessions->store(immer::vector<immer::box<std::string>>{immer::box<std::string>{"42"}});
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>(immer::vector{session});
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions)),
+      .host = immer::box<state::Host>(state::Host{}),
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(immer::vector{lobby}),
+      .running_sessions = running_sessions});
+  auto handlers = sessions::setup_moonlight_handlers(app_state, "/tmp", {});
+
+  std::array<char, 16> secret{9};
+  events::VideoSession video{.gst_pipeline = "interpipesrc name=interpipesrc_{session_id}_video "
+                                             "listen-to={session_id}_video is-live=true ! "
+                                             "appsink name=wolf_udp_sink sync=false",
+                             .session_id = 42};
+  video.display_mode = {.width = 16, .height = 16, .refreshRate = 30};
+  video.bitrate_kbps = 1000;
+  video.packet_size = 1024;
+  video.rtp_secret_payload = secret;
+  events::AudioSession audio{.gst_pipeline = "interpipesrc name=interpipesrc_{session_id}_audio "
+                                             "listen-to={session_id}_audio is-live=true ! "
+                                             "appsink name=wolf_udp_sink sync=false",
+                             .session_id = 42};
+  audio.rtp_secret_payload = secret;
+  event_bus->fire_event(immer::box<events::VideoSession>(video));
+  event_bus->fire_event(immer::box<events::AudioSession>(audio));
+
+  auto client = [&] {
+    auto socket = std::make_shared<boost::asio::ip::udp::socket>(
+        io,
+        boost::asio::ip::udp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+    socket->non_blocking(true);
+    return socket;
+  };
+  // The sizes of the datagrams that reach `socket` over the next 500 ms
+  auto received = [](const std::shared_ptr<boost::asio::ip::udp::socket> &socket) {
+    std::array<char, 65536> buf{};
+    std::set<std::size_t> sizes;
+    for (auto until = std::chrono::steady_clock::now() + 500ms; std::chrono::steady_clock::now() < until;) {
+      boost::system::error_code ec;
+      if (auto size = socket->receive(boost::asio::buffer(buf), 0, ec); size > 0) {
+        sizes.insert(size);
+      } else {
+        std::this_thread::sleep_for(5ms);
+      }
+    }
+    return sizes;
+  };
+  auto video_client = client(), audio_client = client();
+  auto send_socket = std::make_shared<boost::asio::ip::udp::socket>(io, boost::asio::ip::udp::v4());
+  // The client's first pings start the pipelines; repeat them until the pipelines' threads are waiting for them
+  for (int i = 0; i < 20; i++) {
+    event_bus->fire_event(immer::box<events::RTPVideoPingEvent>(
+        events::RTPVideoPingEvent{.client_ip = "127.0.0.1",
+                                  .client_port = video_client->local_endpoint().port(),
+                                  .video_socket = send_socket,
+                                  .payload = secret}));
+    event_bus->fire_event(immer::box<events::RTPAudioPingEvent>(
+        events::RTPAudioPingEvent{.client_ip = "127.0.0.1",
+                                  .client_port = audio_client->local_endpoint().port(),
+                                  .audio_socket = send_socket,
+                                  .payload = secret}));
+    std::this_thread::sleep_for(50ms);
+  }
+  std::this_thread::sleep_for(500ms);
+  received(video_client);
+  received(audio_client);
+
+  CHECK(received(video_client) == std::set<std::size_t>{32 * 32 * 3 / 2});
+  CHECK(received(audio_client) == std::set<std::size_t>{300 * 2});
+
+  event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = 42}));
+  std::this_thread::sleep_for(500ms);
+  for (auto pipeline : {own, lobby_producer}) {
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+  }
 }

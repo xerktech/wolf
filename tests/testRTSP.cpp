@@ -843,3 +843,11 @@ TEST_CASE("RTSP deadline holds for many concurrent trickling clients", "[RTSP]")
   }
   REQUIRE(closed_in_time == n_clients);
 }
+
+TEST_CASE("RTSP server on a port that's already taken throws instead of running without RTSP", "[RTSP]") {
+  boost::asio::io_context io;
+  // Port 0: the kernel picks a free one, which this acceptor then holds
+  boost::asio::ip::tcp::acceptor taken(io, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), 0));
+  auto sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  REQUIRE_THROWS(rtsp::run_server(taken.local_endpoint().port(), sessions));
+}

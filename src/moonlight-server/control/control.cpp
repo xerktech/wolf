@@ -4,6 +4,7 @@
 #include <events/events.hpp>
 #include <immer/box.hpp>
 #include <state/sessions.hpp>
+#include <stdexcept>
 #include <sys/socket.h>
 
 namespace control {
@@ -191,6 +192,9 @@ void run_control(int port,
                  const std::string &host_ip) {
 
   enet_host host = create_host(host_ip, port, peers);
+  if (!host) { // e.g. the port is already taken; servicing a null host would segfault
+    throw std::runtime_error(fmt::format("Unable to bind the ENet control server on port {}", port));
+  }
   logs::log(logs::info, "Control server started on port: {}", port);
 
   ENetEvent event;
