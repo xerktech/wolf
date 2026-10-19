@@ -26,5 +26,5 @@ paths:
 - A flake that shows only on CI's 4 vCPUs reproduces with `taskset -c 0-3` and the JUnit reporter.
 - Running it by hand: Ubuntu 26.04 + CI's apt list + `gstreamer1.0-plugins-{base,good}` (without
   `videotestsrc` "Stopping a stuck pipeline doesn't block the event bus" fails and hangs the run).
-  - The whole suite takes ~6 min under TSan; `TSAN_OPTIONS=log_path=<prefix>` keeps reports out of
-    the console.
+  - The suite takes ~2 min under TSan (CI and 4 pinned cores).
+  - `TSAN_OPTIONS=log_path=<prefix>` keeps reports out of the console.
