@@ -20,8 +20,10 @@ paths:
 - The other sites (hot-plug handler, API pair endpoints, `pair_next_phase`, control's session lookups)
   have storm tests (`tests/storm.hpp` helpers): a reader races a thread that keeps replacing the atom.
   - A normal build rarely crashes with a fix reverted; the CI ASan leg is what catches the read of
-    the freed snapshot. Keep that leg's `-DIMMER_NO_FREE_LIST=1`: immer otherwise recycles freed nodes
-    through its own free lists, where ASan can't see them.
+    the freed snapshot. Its `-DIMMER_NO_FREE_LIST=1` sends freed nodes straight back to malloc, where
+    ASan watches them; it's a safeguard (every reverted fix was also caught without it).
+  - The storms are probabilistic: each test caught its reverted fix ~10/10 runs on a 4-core box.
+    Don't cut their iteration counts; they end well inside their time budgets when the code is right.
   - Tests: "Pairing: a phase lookup racing other clients' pairing", "Pair API: completing pairings
     while other pairing requests come and go", "control: a connecting peer's session lookup racing
     session updates", "control: a stopped stream's peer lookup racing peers connecting",

@@ -206,8 +206,8 @@ jobs:
           SANITIZER_FLAGS=()
           if [ -n "$SANITIZE" ]; then
             BUILD_TYPE=RelWithDebInfo # line numbers in the sanitizer's report
-            # IMMER_NO_FREE_LIST: immer otherwise recycles freed nodes through its own free lists, out of the
-            # sanitizer's sight, so a read of a freed snapshot would go unnoticed
+            # IMMER_NO_FREE_LIST: freed immer nodes go straight back to malloc, where the sanitizer watches them,
+            # instead of immer's own free lists, where a reused node could hide a read of a freed snapshot
             FLAGS="-fsanitize=$SANITIZE -fno-omit-frame-pointer -DIMMER_NO_FREE_LIST=1"
             SANITIZER_FLAGS=(-DCMAKE_C_FLAGS="$FLAGS" -DCMAKE_CXX_FLAGS="$FLAGS"
                              -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=$SANITIZE"

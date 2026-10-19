@@ -1231,7 +1231,9 @@ TEST_CASE("Hot-plugging devices while other streams start and stop", "[API]") {
       event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = 4343}));
     });
 
-    result = storm(4, 5'000, 5s, [&]() {
+    // Many hot-plugs: each one only races a stream start/stop for a few instructions (5'000 per thread missed a
+    // reverted fix ~1 run in 10 on 4 cores)
+    result = storm(4, 50'000, 5s, [&]() {
       event_bus->fire_event(
           immer::box<events::PlugDeviceEvent>(events::PlugDeviceEvent{.session_id = std::to_string(plugged_session)}));
       return true;
