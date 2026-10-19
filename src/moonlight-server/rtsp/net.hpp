@@ -6,6 +6,7 @@
 #include <boost/lexical_cast.hpp>
 #include <boost/shared_ptr.hpp>
 #include <rtsp/commands.hpp>
+#include <rtsp/encryption.hpp>
 #include <state/sessions.hpp>
 #include <string_view>
 #include <thread>
@@ -90,6 +91,9 @@ public:
     }
     std::optional<events::StreamSession> rejected;
     for (const events::StreamSession &session : sessions) {
+      if (session.rtsp_encrypted) { // Only reachable via encrypted RTSP, see get_encrypted_session()
+        continue;
+      }
       bool fake_ip_match = session.rtsp_fake_ip == packet.request.uri.ip || host_option == session.rtsp_fake_ip;
       // RTSP is unauthenticated and the fake IP is no secret, so
       // it only picks between the sessions of the client that is talking to us: a request from any other address
@@ -119,6 +123,27 @@ public:
   }
 
   /**
+   * An encrypted message carries no plaintext session hint, so it belongs to the (encrypted RTSP) session whose key
+   * authenticates it. Only the paired client that launched that session knows its key.
+   *
+   * @return the matching session and the decrypted RTSP message
+   */
+  static std::optional<std::pair<events::StreamSession, std::string>>
+  get_encrypted_session(const immer::vector<events::StreamSession> &sessions, std::string_view raw_msg) {
+    for (const events::StreamSession &session : sessions) {
+      if (!session.rtsp_encrypted) {
+        continue;
+      }
+      if (auto plaintext =
+              encryption::unseal(raw_msg, crypto::hex_to_str(session.aes_key, true), encryption::CLIENT_ORIGINATED)) {
+        logs::log(logs::debug, "[RTSP] found session by encryption key: {}", session.session_id);
+        return std::make_pair(session, std::move(*plaintext));
+      }
+    }
+    return std::nullopt;
+  }
+
+  /**
    * Will start the following (async) chain:
    *  1- wait for a message
    *  2- once received, parse it
@@ -141,7 +166,11 @@ public:
     }
     std::string user_ip = remote.address().to_string();
     logs::log(logs::trace, "[RTSP] received connection from IP: {}", user_ip);
-    receive_message([self = shared_from_this(), user_ip](auto parsed_msg) {
+    receive_raw([self = shared_from_this(), user_ip](std::optional<std::string> raw_msg) {
+      if (raw_msg && encryption::is_encrypted(*raw_msg)) {
+        return self->handle_encrypted(*raw_msg, user_ip);
+      }
+      auto parsed_msg = raw_msg ? rtsp::parse(*raw_msg) : std::nullopt;
       if (parsed_msg) {
         auto session = get_session(self->stream_sessions->load(), parsed_msg.value(), user_ip);
         if (session) {
@@ -158,6 +187,36 @@ public:
     });
   }
 
+  void handle_encrypted(std::string_view raw_msg, const std::string &user_ip) {
+    auto found = get_encrypted_session(stream_sessions->load(), raw_msg);
+    if (!found) {
+      // We can't even answer: there's no key to seal a reply with
+      logs::log(logs::warning, "[RTSP] received encrypted packet that no session's key opens, from: {}", user_ip);
+      close();
+      return;
+    }
+    auto &[session, plaintext] = *found;
+    auto parsed_msg = rtsp::parse(plaintext);
+    auto response = parsed_msg ? commands::message_handler(parsed_msg.value(), session)
+                               : rtsp::commands::error_msg(400, "BAD REQUEST");
+    if (!parsed_msg) {
+      logs::log(logs::error, "[RTSP] error parsing encrypted message");
+    }
+    auto raw_response = rtsp::to_string(response);
+    logs::log(logs::trace, "[RTSP] sending encrypted reply: \n{}", raw_response);
+    auto sealed = encryption::seal(raw_response,
+                                   crypto::hex_to_str(session.aes_key, true),
+                                   ++encryption_seq_,
+                                   encryption::HOST_ORIGINATED);
+    send_raw(std::move(sealed), [self = shared_from_this()](auto bytes) { self->close(); });
+  }
+
+  void receive_message(const std::function<void(std::optional<RTSP_PACKET>)> &on_msg_read) {
+    receive_raw([on_msg_read](std::optional<std::string> raw_msg) {
+      on_msg_read(raw_msg ? rtsp::parse(*raw_msg) : std::nullopt);
+    });
+  }
+
   /**
    * We have no way to know the size of the message and there's no special sequence of characters to delimit the very
    * end (including payload). So we'll try to read everything that has been sent, we enforce a max message size AND a
@@ -166,13 +225,16 @@ public:
    * Timeout is adapted from:
    * https://www.boost.org/doc/libs/1_79_0/doc/html/boost_asio/example/cpp11/timeouts/async_tcp_client.cpp
    *
-   * @return Will call the callback passing a string representation of the message and the transferred bytes
+   * @return Will call the callback passing the full raw message (plaintext or still encrypted), or nullopt when it's
+   * too big or doesn't fully arrive before the deadline
+   *
+   * @note: an encrypted message (see rtsp/encryption.hpp) states its length in its header instead.
    *
    * @note: ANNOUNCE messages will be bigger than the default 512 bytes that boost reads, fortunately we receive an
    * option in the message: Content-length which represent the size in bytes of the payload. We'll keep recursively call
-   * receive_message() until our payload size matches the specified Content-length
+   * receive_raw() until our payload size matches the specified Content-length
    */
-  void receive_message(const std::function<void(std::optional<RTSP_PACKET>)> &on_msg_read) {
+  void receive_raw(const std::function<void(std::optional<std::string>)> &on_msg_read) {
     // One deadline for the whole message, armed on its first read only: re-arming it on every read would let a
     // client trickling a byte at a time hold the connection open indefinitely.
     // Set the expiry BEFORE waiting: expires_after() cancels any pending wait.
@@ -199,7 +261,7 @@ public:
             return;
           }
           // Hands the (possibly invalid) message over, once it's complete or we've given up on it
-          auto finish = [&self, &on_msg_read](std::optional<RTSP_PACKET> msg) {
+          auto finish = [&self, &on_msg_read](std::optional<std::string> msg) {
             self->deadline_.cancel();
             self->prev_read_ = "";
             self->prev_read_bytes_ = 0;
@@ -210,11 +272,32 @@ public:
           bool timed_out = error_code == boost::asio::error::operation_aborted ||
                            self->deadline_.expiry() <= asio::steady_timer::clock_type::now();
           std::string raw_msg = {std::istreambuf_iterator<char>(&self->streambuf_), {}};
-          logs::log(logs::trace, "[RTSP] received message {} bytes \n{}", bytes_transferred, raw_msg);
+          logs::log(logs::trace,
+                    "[RTSP] received message {} bytes \n{}",
+                    bytes_transferred,
+                    encryption::is_encrypted(self->prev_read_ + raw_msg) ? "<encrypted>" : raw_msg);
 
           auto full_raw_msg = self->prev_read_ + raw_msg;
           auto total_bytes_transferred = self->prev_read_bytes_ + bytes_transferred;
           full_raw_msg.resize(total_bytes_transferred);
+
+          if (encryption::is_encrypted(full_raw_msg)) { // The header states the full length, see rtsp/encryption.hpp
+            auto total_length = encryption::full_message_size(full_raw_msg);
+            if (total_length && *total_length > max_encrypted_msg_size) {
+              logs::log(logs::warning, "[RTSP] encrypted message too big: {} bytes", *total_length);
+              return finish(std::nullopt);
+            }
+            if (!total_length || total_bytes_transferred < *total_length) {
+              if (timed_out) {
+                logs::log(logs::warning, "[RTSP] timed out waiting for the rest of an encrypted message");
+                return finish(std::nullopt);
+              }
+              self->prev_read_ = full_raw_msg;
+              self->prev_read_bytes_ += bytes_transferred;
+              return self->receive_raw(on_msg_read);
+            }
+            return finish(full_raw_msg);
+          }
 
           // We should be able to rtsp::parse() even when getting a partial message
           // Since we had a few issues with this approach in the past now I'm manually reading the "Content-length"
@@ -231,7 +314,7 @@ public:
               // The header line itself was split across reads, wait for the rest of it
               self->prev_read_ = full_raw_msg;
               self->prev_read_bytes_ += bytes_transferred;
-              return self->receive_message(on_msg_read);
+              return self->receive_raw(on_msg_read);
             }
             auto total_length_str = full_raw_msg.substr(content_length_pos, content_lenght_end - content_length_pos);
             // The header comes from an unauthenticated peer: reject anything that isn't a plain number, or that
@@ -249,11 +332,11 @@ public:
               }
               self->prev_read_ = full_raw_msg;
               self->prev_read_bytes_ += bytes_transferred;
-              return self->receive_message(on_msg_read);
+              return self->receive_raw(on_msg_read);
             }
           }
 
-          finish(rtsp::parse(full_raw_msg));
+          finish(full_raw_msg);
         });
   }
 
@@ -263,12 +346,17 @@ public:
    */
   void send_message(const rtsp::RTSP_PACKET &response,
                     const std::function<void(int /* bytes_transferred */)> &on_sent) {
+    auto raw_response = rtsp::to_string(response);
+    logs::log(logs::trace, "[RTSP] sending reply: \n{}", raw_response);
+    send_raw(std::move(raw_response), on_sent);
+  }
+
+  void send_raw(std::string raw_msg, const std::function<void(int /* bytes_transferred */)> &on_sent) {
     // async_write returns before the bytes are sent: the handler owns the buffer until it's done
-    auto raw_response = std::make_shared<std::string>(rtsp::to_string(response));
-    logs::log(logs::trace, "[RTSP] sending reply: \n{}", *raw_response);
+    auto buffer = std::make_shared<std::string>(std::move(raw_msg));
     boost::asio::async_write(socket(),
-                             boost::asio::buffer(*raw_response),
-                             [on_sent, raw_response](auto error_code, auto bytes_transferred) {
+                             boost::asio::buffer(*buffer),
+                             [on_sent, buffer](auto error_code, auto bytes_transferred) {
                                if (error_code) {
                                  logs::log(logs::error, "[RTSP] error during transmission: {}", error_code.message());
                                }
@@ -283,9 +371,17 @@ protected:
         stream_sessions(std::move(stream_sessions)), prev_read_bytes_(0) {}
   tcp::socket socket_;
 
+  /**
+   * Sequence number of the last encrypted RTSP message we sent: it's the GCM IV, so it must never repeat under one key.
+   * Process wide, not per session: two sessions may share a key (an API caller or a /resume reusing a rikey).
+   */
+  static inline std::atomic<std::uint32_t> encryption_seq_ = 0;
+
   static constexpr auto max_msg_size = 2048;
   /** Upper bound on a message's declared Content-length; Moonlight's largest (ANNOUNCE) is a few KiB */
   static constexpr std::size_t max_total_msg_size = 64 * 1024;
+  // Moonlight's largest message (ANNOUNCE) is ~1KB; this also bounds the stack buffer AES-GCM decrypts into
+  static constexpr std::size_t max_encrypted_msg_size = 16 * 1024;
   static constexpr auto timeout_millis = 2500;
 
   boost::asio::streambuf streambuf_;

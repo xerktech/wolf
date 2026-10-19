@@ -92,6 +92,11 @@ struct ProfileRemoveRequest {
 struct StreamSessionCreated {
   bool success = true;
   std::string session_id;
+  /**
+   * Whether the stream uses encrypted RTSP: the caller must then give the client an rtspenc:// URL.
+   * Older Wolf versions don't send it, and only speak plaintext RTSP.
+   */
+  bool rtsp_encrypted = false;
 };
 
 using StreamStateName = rfl::Literal<"setup", "streaming", "paused">;

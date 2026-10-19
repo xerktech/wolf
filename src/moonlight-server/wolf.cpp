@@ -25,6 +25,7 @@
 #include <sessions/common.hpp>
 #include <sessions/handlers.hpp>
 #include <state/config.hpp>
+#include <state/sessions.hpp>
 #include <streaming/streaming.hpp>
 #include <vector>
 
@@ -100,6 +101,12 @@ state::Host get_host_config(std::string_view pkey_filename, std::string_view cer
   std::string host_base_state_folder = local_base_state_folder;
   std::string host_xdg_runtime_dir = utils::get_env("XDG_RUNTIME_DIR", "/tmp/sockets");
 
+  bool rtsp_require_encryption =
+      state::parse_rtsp_require_encryption(utils::get_env("WOLF_RTSP_REQUIRE_ENCRYPTION", ""));
+  if (rtsp_require_encryption) {
+    logs::log(logs::info, "Encrypted RTSP is required: refusing Moonlight clients that don't support it");
+  }
+
   docker::DockerAPI docker_api(utils::get_env("WOLF_DOCKER_SOCKET", "/var/run/docker.sock"));
   if (auto container = introspect::get_current_container(docker_api)) {
     host_base_state_folder =
@@ -119,7 +126,8 @@ state::Host get_host_config(std::string_view pkey_filename, std::string_view cer
           mac_address,
           host_base_state_folder,
           local_base_state_folder,
-          host_xdg_runtime_dir};
+          host_xdg_runtime_dir,
+          rtsp_require_encryption};
 }
 
 /**

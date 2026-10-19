@@ -523,6 +523,13 @@ struct StreamSession {
    */
   std::string rtsp_fake_ip;
 
+  /**
+   * Sunshine's encrypted RTSP (rtspenc://), set when the client advertised it at launch (corever >= 1).
+   * RTSP messages are then AES-GCM sealed with aes_key, which only the paired client knows, and plaintext RTSP is
+   * refused for this session: nobody else (same NAT, on-path) can SETUP/ANNOUNCE it or read its secrets.
+   */
+  bool rtsp_encrypted = false;
+
   // client info
   std::size_t session_id;
   std::string ip;
