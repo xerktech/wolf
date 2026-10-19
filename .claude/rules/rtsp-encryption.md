@@ -11,6 +11,8 @@ paths:
 
 - A client that sends `corever>=1` on /launch or /resume gets `rtspenc://` in `sessionUrl0`; its
   `StreamSession::rtsp_encrypted` is set. Over the API, the caller (fenrir) sets `rtsp_encrypted`.
+  - `sessions/add` echoes `rtsp_encrypted` in its reply; fenrir hands out `rtspenc://` only on that
+    answer, since an older Wolf ignores the field and speaks plaintext. Keep the echo truthful.
   - Wire format and IVs: `src/moonlight-protocol/rtsp/encryption.hpp` (mirrors moonlight-common-c
     `RtspConnection.c`). Key = the launch's rikey (`aes_key`, hex), the same key the control stream uses.
 - An encrypted message has no plaintext session hint, so the session is the one whose key
@@ -23,6 +25,7 @@ paths:
   nonce under one key. A /resume is a new session with a new key and counter.
 - A message no key opens gets no reply at all (there's nothing to seal it with): Moonlight times out.
 - `WOLF_RTSP_REQUIRE_ENCRYPTION=TRUE` refuses plaintext-only clients at /launch, /resume (XML
-  status 403) and API `sessions/add`; default FALSE keeps old clients working.
+  status 403) and API `sessions/add` (HTTP 403); never `setenv` it in a test (`tests.md`); default FALSE keeps old clients working.
 - Tests: `tests/testRTSP.cpp` "Encrypted RTSP wire format" (an independently generated vector),
-  "Commands (Encrypted RTSP)"; `tests/testMoonlight.cpp` "launch", "Multiple users" (corever parsing).
+  "Commands (Encrypted RTSP)"; `tests/testWolfAPI.cpp` "Sessions API: a session added with encrypted
+  RTSP says so"; `tests/testMoonlight.cpp` "launch", "Multiple users" (corever parsing).

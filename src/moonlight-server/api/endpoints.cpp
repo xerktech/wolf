@@ -370,7 +370,7 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
     if (!rtsp_encrypted && state::rtsp_encryption_required()) {
       logs::log(logs::warning, "[API] Refusing a session without encrypted RTSP (WOLF_RTSP_REQUIRE_ENCRYPTION)");
       auto res = GenericErrorResponse{.error = "Encrypted RTSP is required by this host (rtsp_encrypted)"};
-      send_http(socket, 500, rfl::json::write(res));
+      send_http(socket, 403, rfl::json::write(res));
       return;
     }
 
@@ -406,7 +406,9 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
     }
     state_->app_state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
 
-    auto res = StreamSessionCreated{.success = true, .session_id = std::to_string(new_session->session_id)};
+    auto res = StreamSessionCreated{.success = true,
+                                    .session_id = std::to_string(new_session->session_id),
+                                    .rtsp_encrypted = new_session->rtsp_encrypted};
     send_http(socket, 200, rfl::json::write(res));
   } else {
     logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, session.error().what());

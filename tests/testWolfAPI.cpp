@@ -607,6 +607,7 @@ TEST_CASE("Sessions APIs", "[API]") {
   response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
   REQUIRE(response);
   REQUIRE_THAT(response->second, Catch::Matchers::ContainsSubstring("{\"success\":true,\"session_id\":"));
+  REQUIRE_THAT(response->second, ContainsSubstring("\"rtsp_encrypted\":false")); // Not asked for: plaintext RTSP
 
   // Test that the new session is in the list
   response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/sessions");
@@ -2131,6 +2132,48 @@ TEST_CASE("A failed docker pull is reported as a failure", "[API]") {
   // The name is escaped: it can't add query parameters
   REQUIRE_THAT(pull_request, ContainsSubstring("/images/create?fromImage=nope%26tag%3Devil%3Alatest "));
   std::filesystem::remove(socket_path);
+}
+
+TEST_CASE("Sessions API: a session added with encrypted RTSP says so", "[API]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .running_sessions = running_sessions});
+  auto socket_path = api_socket_path();
+  start_api_server(app_state);
+  auto curl = curl_ptr(curl_easy_init(), ::curl_easy_cleanup);
+  curl_easy_setopt(curl.get(), CURLOPT_UNIX_SOCKET_PATH, socket_path.c_str());
+  curl_easy_setopt(curl.get(), CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
+
+  // No client_id: a dummy client, so this test's session can't collide with another one's
+  auto session = rfl::Reflector<wolf::core::events::StreamSession>::ReflType{
+      .client_ip = "127.0.0.1",
+      .aes_key = "00112233445566778899aabbccddeeff",
+      .aes_iv = "1",
+      .rtsp_encrypted = true,
+      .video_width = 1920,
+      .video_height = 1080,
+      .video_refresh_rate = 60,
+      .app_id = "304556286", // test cfg file
+  };
+  auto response = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/sessions/add", rfl::json::write(session));
+  REQUIRE(response);
+  REQUIRE(response->first == 200);
+  // The caller (fenrir) hands out rtspenc:// only on this answer: an older Wolf would ignore the field
+  REQUIRE(rfl::json::read<StreamSessionCreated>(response->second).value().rtsp_encrypted);
+  REQUIRE(running_sessions->load()->size() == 1);
+  REQUIRE(running_sessions->load()->front().rtsp_encrypted);
+
+  response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/sessions");
+  REQUIRE(response);
+  auto listed = rfl::json::read<StreamSessionListResponse>(response->second).value();
+  REQUIRE(listed.sessions.size() == 1);
+  REQUIRE(listed.sessions[0].session.get().rtsp_encrypted == true);
 }
 
 TEST_CASE("The OpenAPI spec in the docs matches the served one", "[API]") {
