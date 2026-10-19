@@ -5,7 +5,8 @@ project(moonlight)
 # Optionally glob, but only for CMake 3.12 or later:
 file(GLOB HEADER_LIST CONFIGURE_DEPENDS
         moonlight/*.hpp
-        rtsp/parser.hpp)
+        rtsp/parser.hpp
+        rtsp/encryption.hpp)
 
 
 # Make an automatic library - will be static or dynamic based on user setting

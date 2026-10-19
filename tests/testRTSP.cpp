@@ -967,3 +967,108 @@ TEST_CASE("Session matching is bound to the client IP", "[RTSP]") {
     REQUIRE_FALSE(tcp_connection::get_session(*sessions, no_host, "127.0.0.2"));
   }
 }
+
+TEST_CASE("Encrypted RTSP wire format", "[RTSP]") {
+  auto key = crypto::hex_to_str("9d804e47a6aa6624b7d4b502b32cc522", true);
+  auto msg = "OPTIONS rtsp://10.1.2.49:48010 RTSP/1.0\r\n"
+             "CSeq: 1\r\n"
+             "X-GS-ClientVersion: 14\r\n"
+             "Host: 10.1.2.49\r\n\r\n"s;
+
+  SECTION("Opens a message sealed like moonlight-common-c does") {
+    // Generated independently (Python cryptography AESGCM) following moonlight-common-c sealRtspMessage(), seq = 7
+    auto sealed = crypto::hex_to_str(
+        "8000005d000000078ef566d2cc987513e6cf0bf8e751c712ff471e2a957daaac190aa9bc92f02763d8a5af30d465f88cca5bc2420e7b"
+        "458248fb471734042df1dec809944645f4122b928029cd3c2d40290c7a9a1b301c3e2913f1152f4a2aea63a9dc8529f3093dc06ce2fa"
+        "8a9c7554ee3dcf94e3",
+        true);
+    REQUIRE(encryption::is_encrypted(sealed));
+    REQUIRE(encryption::full_message_size(sealed) == sealed.size());
+    REQUIRE(encryption::unseal(sealed, key, encryption::CLIENT_ORIGINATED) == msg);
+    REQUIRE(encryption::seal(msg, key, 7, encryption::CLIENT_ORIGINATED) == sealed);
+  }
+
+  SECTION("Rejects anything that doesn't authenticate") {
+    auto sealed = encryption::seal(msg, key, 1, encryption::HOST_ORIGINATED);
+    REQUIRE(encryption::unseal(sealed, key, encryption::HOST_ORIGINATED) == msg);
+    // Wrong direction (IV), wrong key, tampered or truncated messages, plaintext
+    REQUIRE_FALSE(encryption::unseal(sealed, key, encryption::CLIENT_ORIGINATED));
+    REQUIRE_FALSE(encryption::unseal(sealed, crypto::hex_to_str("00804e47a6aa6624b7d4b502b32cc522", true), 'H'));
+    auto tampered = sealed;
+    tampered.back() ^= 0x01;
+    REQUIRE_FALSE(encryption::unseal(tampered, key, encryption::HOST_ORIGINATED));
+    REQUIRE_FALSE(encryption::unseal(sealed.substr(0, sealed.size() - 1), key, encryption::HOST_ORIGINATED));
+    REQUIRE_FALSE(encryption::unseal(sealed + "x", key, encryption::HOST_ORIGINATED));
+    REQUIRE_FALSE(encryption::unseal(sealed.substr(0, encryption::HEADER_SIZE), key, encryption::HOST_ORIGINATED));
+    REQUIRE_FALSE(encryption::is_encrypted(msg));
+    REQUIRE_FALSE(encryption::unseal(msg, key, encryption::HOST_ORIGINATED));
+  }
+}
+
+TEST_CASE("Commands (Encrypted RTSP)", "[RTSP]") {
+  auto key_hex = "9d804e47a6aa6624b7d4b502b32cc522"s;
+  auto key = crypto::hex_to_str(key_hex, true);
+
+  auto session = test_init_state()->load()->front();
+  session.aes_key = key_hex; // As received in the launch's rikey
+  session.rtsp_fake_ip = "55.66.77.88";
+  session.rtsp_encrypted = true;
+  // Only the encrypted session: plaintext IP matching would otherwise find another one
+  auto sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>(
+      immer::vector<events::StreamSession>{session});
+  auto port = 48558;
+  std::thread([sessions, port]() { rtsp::run_server(port, sessions); }).detach();
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  auto describe = "DESCRIBE rtsp://55.66.77.88:48010 RTSP/1.0\r\n"
+                  "CSeq: 2\r\n"
+                  "X-GS-ClientVersion: 14\r\n"
+                  "Host: 55.66.77.88\r\n"
+                  "Accept: application/sdp\r\n\r\n"s;
+
+  // An encrypted request gets an encrypted reply
+  for (std::uint32_t expected_seq = 1; expected_seq <= 2; expected_seq++) {
+    auto reply = rtsp_raw_exchange(port, encryption::seal(describe, key, expected_seq, encryption::CLIENT_ORIGINATED));
+    REQUIRE(encryption::is_encrypted(reply));
+    // Every reply must use a new IV
+    REQUIRE(encryption::read_be32(reply, sizeof(std::uint32_t)) == expected_seq);
+    auto plaintext = encryption::unseal(reply, key, encryption::HOST_ORIGINATED);
+    REQUIRE(plaintext);
+    auto response = rtsp::parse(*plaintext);
+    REQUIRE(response);
+    REQUIRE(response->response.status_code == 200);
+    REQUIRE(response->seq_number == 2);
+    REQUIRE_FALSE(response->payloads.empty());
+  }
+
+  // Plaintext RTSP can't reach an encrypted session: neither by its fake IP nor by the client's source IP
+  REQUIRE(rtsp_raw_exchange(port, describe).empty());
+  REQUIRE(
+      rtsp_raw_exchange(port, "OPTIONS rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 1\r\nHost: 0.0.0.0\r\n\r\n").empty());
+
+  // A message sealed with another key is dropped
+  auto other_key = crypto::hex_to_str("00112233445566778899aabbccddeeff", true);
+  REQUIRE(rtsp_raw_exchange(port, encryption::seal(describe, other_key, 1, encryption::CLIENT_ORIGINATED)).empty());
+
+  // A tampered message is dropped
+  auto tampered = encryption::seal(describe, key, 3, encryption::CLIENT_ORIGINATED);
+  tampered[encryption::HEADER_SIZE] ^= 0x01;
+  REQUIRE(rtsp_raw_exchange(port, tampered).empty());
+
+  // An oversized length is dropped without waiting for the payload
+  auto start = std::chrono::steady_clock::now();
+  auto huge = encryption::seal(describe, key, 4, encryption::CLIENT_ORIGINATED).substr(0, encryption::HEADER_SIZE);
+  huge[1] = '\x7f'; // ~8MB claimed length
+  REQUIRE(rtsp_raw_exchange(port, huge).empty());
+  REQUIRE(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
+
+  // A truncated message is dropped once the deadline passes
+  start = std::chrono::steady_clock::now();
+  auto sealed = encryption::seal(describe, key, 5, encryption::CLIENT_ORIGINATED);
+  REQUIRE(rtsp_raw_exchange(port, sealed.substr(0, sealed.size() - 10)).empty());
+  REQUIRE(std::chrono::steady_clock::now() - start < std::chrono::seconds(5));
+
+  // The session still answers its client afterwards
+  auto reply = rtsp_raw_exchange(port, encryption::seal(describe, key, 6, encryption::CLIENT_ORIGINATED));
+  REQUIRE(encryption::unseal(reply, key, encryption::HOST_ORIGINATED));
+}

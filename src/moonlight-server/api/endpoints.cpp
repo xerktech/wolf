@@ -366,6 +366,14 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
 
     choosen_client.settings = ss.client_settings.value_or(config::ClientSettings{});
 
+    auto rtsp_encrypted = ss.rtsp_encrypted.value_or(false);
+    if (!rtsp_encrypted && state::rtsp_encryption_required()) {
+      logs::log(logs::warning, "[API] Refusing a session without encrypted RTSP (WOLF_RTSP_REQUIRE_ENCRYPTION)");
+      auto res = GenericErrorResponse{.error = "Encrypted RTSP is required by this host (rtsp_encrypted)"};
+      send_http(socket, 500, rfl::json::write(res));
+      return;
+    }
+
     auto new_session = state::create_stream_session( //
         state_->app_state,
         choosen_app,
@@ -380,6 +388,7 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
         ss.aes_iv);
     new_session->ip = ss.client_ip;
     new_session->rtsp_fake_ip = ss.rtsp_fake_ip;
+    new_session->rtsp_encrypted = rtsp_encrypted;
 
     // Every session event is keyed by session_id: a second session under the same one would be unreachable.
     // Checked inside the update, so that concurrent adds for one client can't all pass the check.

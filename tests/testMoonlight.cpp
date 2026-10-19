@@ -1066,6 +1066,23 @@ TEST_CASE("launch", "[MoonlightProtocol]") {
                                 "<sessionUrl0>rtsp://192.168.1.1:3021</sessionUrl0>"
                                 "<gamesession>1</gamesession>"
                                 "</root>");
+
+  REQUIRE(xml_to_str(launch_success("192.168.1.1", "3021", true)) ==
+          "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+          "<root status_code=\"200\">"
+          "<sessionUrl0>rtspenc://192.168.1.1:3021</sessionUrl0>"
+          "<gamesession>1</gamesession>"
+          "</root>");
+  REQUIRE(xml_to_str(launch_resume("192.168.1.1", "3021", true)) ==
+          "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+          "<root status_code=\"200\">"
+          "<sessionUrl0>rtspenc://192.168.1.1:3021</sessionUrl0>"
+          "<resume>1</resume>"
+          "</root>");
+  REQUIRE(xml_to_str(launch_error(403, "nope")) == "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                                                   "<root status_code=\"403\" status_message=\"nope\">"
+                                                   "<gamesession>0</gamesession>"
+                                                   "</root>");
 }
 
 TEST_CASE("Multiple users", "[HTTP]") {
@@ -1086,6 +1103,14 @@ TEST_CASE("Multiple users", "[HTTP]") {
 
   REQUIRE(session1->video_stream_port == 48100);
   REQUIRE(session1->audio_stream_port == 48200);
+  REQUIRE_FALSE(session1->rtsp_encrypted); // No corever: plaintext RTSP
+
+  for (auto [corever, encrypted] : {std::pair{"1", true}, {"2", true}, {"0", false}, {"junk", false}}) {
+    auto headers = client1_headers;
+    headers.emplace("corever", corever);
+    REQUIRE(endpoints::https::create_run_session(headers, client1_ip, client1, app_state, app1)->rtsp_encrypted ==
+            encrypted);
+  }
 
   app_state.running_sessions->update([session1](auto &sessions) { return sessions.push_back(*session1); });
   auto session2 = endpoints::https::create_run_session(client1_headers, client1_ip, client1, app_state, app1);

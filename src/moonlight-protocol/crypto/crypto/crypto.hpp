@@ -93,6 +93,7 @@ std::pair<std::string, std::string> aes_encrypt_gcm(std::string_view msg,
  * @param iv: optional, if not provided a random one will be generated
  * @param padding: optional, enables or disables padding
  * @return: the decrypted string
+ * @throws std::runtime_error when the tag doesn't match (wrong key, IV or a tampered message)
  */
 std::string aes_decrypt_gcm(std::string_view msg,
                             std::string_view enc_key,

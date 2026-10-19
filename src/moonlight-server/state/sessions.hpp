@@ -67,6 +67,14 @@ inline std::optional<events::Lobby> get_lobby_by_connected_session(const immer::
   return {};
 }
 
+/**
+ * WOLF_RTSP_REQUIRE_ENCRYPTION=TRUE refuses sessions whose client can't do Sunshine's encrypted RTSP (no corever),
+ * instead of falling back to plaintext RTSP for them.
+ */
+inline bool rtsp_encryption_required() {
+  return std::string_view(utils::get_env("WOLF_RTSP_REQUIRE_ENCRYPTION", "FALSE")) == "TRUE";
+}
+
 inline std::shared_ptr<events::StreamSession> create_stream_session(immer::box<state::AppState> state,
                                                                     const events::App &run_app,
                                                                     const wolf::config::PairedClient &current_client,
