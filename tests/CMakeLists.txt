@@ -79,6 +79,12 @@ if (UNIX AND NOT APPLE)
                 "platforms/linux/inputtino.cpp")
     endif ()
     list(APPEND SRC_LIST "platforms/linux/process.cpp")
+
+    # Starts private PulseAudio daemons: needs the `pulseaudio` binary on PATH
+    option(TEST_PULSE "Enable PulseAudio tests" ON)
+    if (TEST_PULSE)
+        list(APPEND SRC_LIST "platforms/linux/pulse.cpp")
+    endif ()
 endif ()
 
 find_package(CURL)

@@ -9,6 +9,7 @@
 
 using Catch::Matchers::Equals;
 
+#include <boost/asio/local/stream_protocol.hpp>
 #include <client_http.hpp>
 #include <crypto/crypto.hpp>
 #include <filesystem>
@@ -261,6 +262,16 @@ TEST_CASE("Default config: every encoder has video_params", "[LocalState]") {
   }
 }
 
+TEST_CASE("PulseAudio server name to socket path", "[Sessions]") {
+  using wolf::core::sessions::audio_server_socket_path;
+  REQUIRE(audio_server_socket_path("/tmp/sockets/pulse-socket") == "/tmp/sockets/pulse-socket");
+  // Docker splits binds on ':', so the prefix must not reach the mount
+  REQUIRE(audio_server_socket_path("unix:/run/pulse/native") == "/run/pulse/native");
+  REQUIRE(audio_server_socket_path("{0123abcd}unix:/run/pulse/native") == "/run/pulse/native");
+  REQUIRE(audio_server_socket_path("tcp:localhost:4713").empty());
+  REQUIRE(audio_server_socket_path("").empty());
+}
+
 TEST_CASE("Wayland socket wait", "[Sessions]") {
   // CTest sets WOLF_SKIP_WAYLAND_SOCKET_WAIT for the whole suite; this test needs the real wait
   std::optional<std::string> skip_wait;
@@ -271,10 +282,25 @@ TEST_CASE("Wayland socket wait", "[Sessions]") {
   auto runtime_dir = std::filesystem::temp_directory_path().string();
 
   // No virtual compositor (e.g. "Test ball"): no socket name, must not wait for the runtime dir to become one
-  REQUIRE(wolf::core::sessions::wait_for_wayland_socket(runtime_dir, "", std::chrono::milliseconds(100)));
+  REQUIRE(wolf::core::sessions::wait_for_wayland_socket(runtime_dir, "", false, std::chrono::milliseconds(100)));
+  // A compositor that reports no socket can't be reached by the runner
+  REQUIRE_FALSE(wolf::core::sessions::wait_for_wayland_socket(runtime_dir, "", true, std::chrono::milliseconds(100)));
   REQUIRE_FALSE(wolf::core::sessions::wait_for_wayland_socket(runtime_dir,
                                                               "wolf-no-such-socket",
+                                                              true,
                                                               std::chrono::milliseconds(100)));
+
+  // A timeout of 0 still finds a socket that's already there (it used to always fail)
+  auto socket_name = fmt::format("wolf-test-socket-{}", getpid());
+  auto socket_path = std::filesystem::path(runtime_dir) / socket_name;
+  std::filesystem::remove(socket_path);
+  {
+    boost::asio::io_context io;
+    boost::asio::local::stream_protocol::acceptor listener(io, socket_path.string());
+    REQUIRE(
+        wolf::core::sessions::wait_for_wayland_socket(runtime_dir, socket_name, true, std::chrono::milliseconds(0)));
+  }
+  std::filesystem::remove(socket_path);
 
   if (skip_wait) {
     ::setenv("WOLF_SKIP_WAYLAND_SOCKET_WAIT", skip_wait->c_str(), 1);

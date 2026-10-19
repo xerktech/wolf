@@ -158,6 +158,7 @@ jobs:
               libwayland-dev libwayland-server0 wayland-protocols libinput-dev libxkbcommon-dev libgbm-dev \
               libcurl4-openssl-dev \
               libpulse-dev \
+              pulseaudio \
               libevdev-dev \
               libudev-dev \
               libdrm-dev \

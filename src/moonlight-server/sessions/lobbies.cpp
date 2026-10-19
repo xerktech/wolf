@@ -116,7 +116,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                 // Set the wayland display
                 lobby->wayland_display->store(wl_state);
 
-                if (!wait_for_wayland_socket(runtime_dir, ready.wayland_socket_name)) {
+                if (!wait_for_wayland_socket(runtime_dir, ready.wayland_socket_name, true)) {
                   logs::log(logs::error,
                             "[LOBBY] Wayland socket {} was not ready, aborting runner startup",
                             ready.wayland_socket_name);

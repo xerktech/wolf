@@ -58,6 +58,19 @@ struct close_inherited_fds : bp::extend::handler {
   }
 };
 
+/**
+ * Runs inside an event-bus handler, so it must not throw: the bus swallows a std::system_error by skipping every
+ * handler after this one (the pipelines' and the session's own stop). killpg fails once the group is gone, e.g. a stop
+ * that races the app's own exit, or a second stop of the same session (EINVAL: terminate() invalidated the group).
+ */
+static void terminate_group(bp::group &group_proc) {
+  std::error_code ec;
+  group_proc.terminate(ec); // Manually terminate the process
+  if (ec) {
+    logs::log(logs::debug, "[PROCESS] Unable to terminate process group: {}", ec.message());
+  }
+}
+
 void RunProcess::run(std::string_view session_id,
                      std::string_view app_state_folder,
                      std::string_view host_xdg_runtime_dir,
@@ -99,14 +112,14 @@ void RunProcess::run(std::string_view session_id,
   auto terminate_handler = this->ev_bus->register_handler<immer::box<StopStreamEvent>>(
       [&group_proc, session_id](const immer::box<StopStreamEvent> &terminate_ev) {
         if (std::to_string(terminate_ev->session_id) == session_id) {
-          group_proc.terminate(); // Manually terminate the process
+          terminate_group(group_proc);
         }
       });
 
   auto terminate_lobby_handler = this->ev_bus->register_handler<immer::box<StopLobbyEvent>>(
       [&group_proc, session_id](const immer::box<StopLobbyEvent> &terminate_ev) {
         if (terminate_ev->lobby_id == session_id) {
-          group_proc.terminate(); // Manually terminate the process
+          terminate_group(group_proc);
         }
       });
 

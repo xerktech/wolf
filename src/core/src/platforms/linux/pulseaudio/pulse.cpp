@@ -179,6 +179,23 @@ void queue_op(const std::shared_ptr<Server> &server, const std::function<void()>
 }
 
 /**
+ * `ref` is owned by `op`'s result callback, which deletes it. When the connection fails or closes while the request is
+ * pending, libpulse cancels the operation without ever calling that callback: release `ref` then instead, or it leaks
+ * (and anything waiting on what it holds, like a promise, is never woken up).
+ * Must be called with the mainloop lock held, right after the request was sent.
+ */
+template <typename T> static void release_if_cancelled(pa_operation *op, std::shared_ptr<T> *ref) {
+  pa_operation_set_state_callback(
+      op,
+      [](pa_operation *o, void *data) {
+        if (pa_operation_get_state(o) == PA_OPERATION_CANCELLED) {
+          delete static_cast<std::shared_ptr<T> *>(data);
+        }
+      },
+      ref);
+}
+
+/**
  * Must be called with the mainloop lock held; doesn't wait for the module to be unloaded.
  */
 static void unload_sink(pa_context *ctx, uint32_t sink_idx) {
@@ -203,13 +220,13 @@ std::shared_ptr<VSink> create_virtual_sink(const std::shared_ptr<Server> &server
   auto vsink = std::make_shared<VSink>();
   vsink->device = device;
 
-  queue_op(server, [server, vsink]() {
-    auto device = vsink->device;
-    auto channel_spec = fmt::format("rate={} sink_name={} channels={} channel_map={}",
-                                    device.mode.sample_rate,
-                                    device.sink_name,
-                                    device.mode.channels,
-                                    fmt::join(device.mode.speakers, ","));
+  // Formatted now: device.sink_name is a view of the caller's string, which is gone by the time a queued op runs
+  auto channel_spec = fmt::format("rate={} sink_name={} channels={} channel_map={}",
+                                  device.mode.sample_rate,
+                                  device.sink_name,
+                                  device.mode.channels,
+                                  fmt::join(device.mode.speakers, ","));
+  queue_op(server, [server, vsink, channel_spec]() {
     auto vsink_ref = new std::shared_ptr<VSink>(vsink); // released by the callback below
     auto operation = pa_context_load_module(
         server->ctx,
@@ -227,6 +244,7 @@ std::shared_ptr<VSink> create_virtual_sink(const std::shared_ptr<Server> &server
         },
         vsink_ref);
     if (operation) {
+      release_if_cancelled(operation, vsink_ref);
       pa_operation_unref(operation);
     } else { // The callback will never run
       logs::log(logs::warning, "[PULSE] Unable to create virtual sink: {}", pa_strerror(pa_context_errno(server->ctx)));
@@ -253,6 +271,47 @@ void delete_virtual_sink(const std::shared_ptr<Server> &server, const std::share
   });
 }
 
+/**
+ * The sink_name=<name> argument of a module-null-sink as create_virtual_sink() loads it, or "" if it has none.
+ */
+static std::string_view null_sink_name(std::string_view module_args) {
+  constexpr std::string_view key = "sink_name=";
+  for (auto pos = module_args.find(key); pos != std::string_view::npos; pos = module_args.find(key, pos + 1)) {
+    if (pos == 0 || module_args[pos - 1] == ' ') {
+      auto value = module_args.substr(pos + key.size());
+      return value.substr(0, value.find(' '));
+    }
+  }
+  return {};
+}
+
+void remove_stale_virtual_sinks(const std::shared_ptr<Server> &server, std::string_view sink_name_prefix) {
+  queue_op(server, [server, prefix = std::string(sink_name_prefix)]() {
+    auto prefix_ref = new std::shared_ptr<std::string>(std::make_shared<std::string>(prefix)); // released at eol
+    auto operation = pa_context_get_module_info_list(
+        server->ctx,
+        [](pa_context *c, const pa_module_info *info, int eol, void *data) {
+          auto prefix = static_cast<std::shared_ptr<std::string> *>(data);
+          if (eol) { // the last call, also on error
+            delete prefix;
+            return;
+          }
+          if (info && info->name && info->argument && std::string_view(info->name) == "module-null-sink" &&
+              null_sink_name(info->argument).starts_with(**prefix)) {
+            logs::log(logs::info, "[PULSE] Removing leftover virtual sink: {}", null_sink_name(info->argument));
+            unload_sink(c, info->index);
+          }
+        },
+        prefix_ref);
+    if (operation) {
+      release_if_cancelled(operation, prefix_ref);
+      pa_operation_unref(operation);
+    } else { // The callback will never run
+      delete prefix_ref;
+    }
+  });
+}
+
 bool flush(const std::shared_ptr<Server> &server, std::chrono::milliseconds timeout) {
   auto done = std::make_shared<boost::promise<void>>();
   auto done_fut = done->get_future();
@@ -269,6 +328,7 @@ bool flush(const std::shared_ptr<Server> &server, std::chrono::milliseconds time
         },
         done_ref);
     if (operation) {
+      release_if_cancelled(operation, done_ref); // breaks the promise, so a dying server doesn't wait out the timeout
       pa_operation_unref(operation);
     } else { // The callback will never run
       delete done_ref;

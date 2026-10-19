@@ -20,3 +20,11 @@ paths:
     wrongly starts below 3, and the test no longer catches it.
 - Tests: `tests/platforms/linux/process.cpp` "Process runner doesn't leak Wolf's sockets to the child"
   (fails without the initializer; its stderr assertion catches a range that starts below 3).
+  - The same inheritance kept a sibling's stdout/stderr pipe open, so a runner waited for its siblings
+    to exit (zombies meanwhile): "Process runner returns when its app exits while a sibling runner still
+  runs".
+- The stop handlers use `bp::group::terminate(std::error_code &)`: the throwing overload throws once the
+  group is gone (a second stop gets `killpg(-1)` → EINVAL).
+  - `fire_event` swallows a `std::system_error` (Boost.Process' errors are one) by abandoning the
+    loop: every handler registered after the throwing one silently never runs.
+  - Tests: "Process runner survives a repeated stop".

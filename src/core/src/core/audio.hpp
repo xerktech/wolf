@@ -76,6 +76,12 @@ std::shared_ptr<VSink> create_virtual_sink(const std::shared_ptr<Server> &server
 void delete_virtual_sink(const std::shared_ptr<Server> &server, const std::shared_ptr<VSink> &vsink);
 
 /**
+ * Unloads every null sink whose name starts with `sink_name_prefix`, without waiting for it.
+ * Meant for startup: a Wolf that crashed or was killed never removed its sessions' sinks.
+ */
+void remove_stale_virtual_sinks(const std::shared_ptr<Server> &server, std::string_view sink_name_prefix);
+
+/**
  * Waits (up to timeout) until PulseAudio has handled every request sent so far on this connection.
  * Returns false on timeout.
  */

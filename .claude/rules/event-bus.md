@@ -12,6 +12,9 @@ paths:
   - A handler that blocks stalls every runner start/stop server-wide (XERK-1966: a stuck pipeline's
     synchronous EOS from HTTPS `/cancel` hung all launches and RTSP).
   - Never block in a handler: hand slow or lock-taking work to another thread.
+- Never let a handler throw. `fire_event` catches `std::system_error` (Boost.Process/asio errors are
+  one) and abandons the loop, so later handlers of that event silently never run; anything else
+  escapes a `noexcept` function and terminates Wolf. Use the `std::error_code` overloads.
 - Send EOS to a pipeline with `gstreamer::send_eos_async`, never `gst_element_send_event` from a
   handler. A synchronous EOS waits on the source's stream lock, which a stuck streaming thread holds.
   - `send_eos_async` sends the EOS to each source, never to the pipeline: a bin holds its STATE_LOCK

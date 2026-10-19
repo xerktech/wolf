@@ -22,6 +22,7 @@
 #include <memory>
 #include <rest/rest.hpp>
 #include <rtsp/net.hpp>
+#include <sessions/common.hpp>
 #include <sessions/handlers.hpp>
 #include <state/config.hpp>
 #include <streaming/streaming.hpp>
@@ -148,9 +149,16 @@ auto initialize(std::string_view config_file, std::string_view pkey_filename, st
  */
 std::optional<sessions::AudioServer> setup_audio_server(const std::string &host_runtime_dir,
                                                         const std::string &runtime_dir) {
+  // A Wolf that crashed or was killed left its sessions' sinks behind; a new session's sink of the same name would
+  // then fail to load. Only Wolf creates sinks with this prefix.
+  auto with_stale_sinks_removed = [](sessions::AudioServer server) {
+    audio::remove_stale_virtual_sinks(server.server, sessions::VIRTUAL_SINK_PREFIX);
+    return std::optional<sessions::AudioServer>(std::move(server));
+  };
+
   auto audio_server = audio::connect();
   if (audio::connected(audio_server)) {
-    return {{.server = audio_server}};
+    return with_stale_sinks_removed({.server = audio_server});
   } else {
     logs::log(logs::info, "Starting PulseAudio docker container");
     docker::DockerAPI docker_api(utils::get_env("WOLF_DOCKER_SOCKET", "/var/run/docker.sock"));
@@ -183,7 +191,10 @@ std::optional<sessions::AudioServer> setup_audio_server(const std::string &host_
     if (container && docker_api.start_by_id(container.value().id)) {
       auto ms = std::stoi(utils::get_env("WOLF_PULSE_CONTAINER_TIMEOUT_MS", "2000"));
       std::this_thread::sleep_for(std::chrono::milliseconds(ms)); // TODO: Better way of knowing when ready?
-      return {{.server = audio::connect(fmt::format("{}/pulse-socket", runtime_dir)), .container = container}};
+      auto container_server = audio::connect(fmt::format("{}/pulse-socket", runtime_dir));
+      if (audio::connected(container_server)) {
+        return with_stale_sinks_removed({.server = container_server, .container = container});
+      }
     }
   }
 

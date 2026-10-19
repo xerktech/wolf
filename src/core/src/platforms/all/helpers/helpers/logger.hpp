@@ -132,7 +132,8 @@ inline void log(severity_level lvl, fmt::format_string<Args...> format_str, Args
     auto msg = fmt::format(format_str, std::forward<Args>(args)...);
     BOOST_LOG_SEV(my_logger::get(), lvl) << msg;
   } catch (const std::exception &e) {
-    std::cout << "Failed to format log message: " << e.what();
+    // endl flushes: the process may be about to _Exit, which drops anything still buffered
+    std::cout << "Failed to format log message: " << e.what() << std::endl;
   }
 }
 

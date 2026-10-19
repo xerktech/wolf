@@ -50,7 +50,7 @@ paths:
 
 # Running wolf locally to drive the API
 
-- Wolf segfaults at startup when no PulseAudio server is reachable; start one first
+- Without a reachable PulseAudio server Wolf starts with no audio (XERK-2005); for audio start one first
   (`pulseaudio -D -n --load="module-native-protocol-unix socket=<dir>/native auth-anonymous=1"
   --load=module-null-sink`) and set `PULSE_SERVER=unix:<dir>/native`.
 - Without a GPU set `WOLF_RENDER_NODE=SOFTWARE` and install gstreamer1.0-plugins-{good,bad,ugly}

@@ -24,15 +24,20 @@ void start_runner(std::shared_ptr<events::Runner> runner,
   auto audio_server_name = args->audio_server ? audio::get_server_name(args->audio_server->server) : "";
   // Without an audio server there's no socket to share: an empty mount destination would make the runner invalid
   if (!audio_server_name.empty()) {
-    // TODO: properly separate XDG_RUNTIME_DIR from <pulse socket path>
-    // for example on my dev machine it's ${XDG_RUNTIME_DIR}/pulse/native
-    // but we know that on our images it's ${XDG_RUNTIME_DIR}/pulse-socket so this should be fine..
-    auto audio_server_on_host = std::filesystem::path(args->host->host_xdg_runtime_dir) /
-                                std::filesystem::path(audio_server_name).filename();
     full_env.set("PULSE_SINK", pulse_sink_name);
     full_env.set("PULSE_SOURCE", pulse_sink_name + ".monitor");
     full_env.set("PULSE_SERVER", audio_server_name);
-    mounted_paths.push_back({audio_server_on_host, audio_server_name});
+    // libpulse names a socket "unix:<path>" (e.g. from PULSE_SERVER): the mount needs the bare path, since Docker
+    // splits binds on ':'. A non-socket server (tcp:...) has nothing to mount.
+    auto socket_path = audio_server_socket_path(audio_server_name);
+    if (!socket_path.empty()) {
+      // TODO: properly separate XDG_RUNTIME_DIR from <pulse socket path>
+      // for example on my dev machine it's ${XDG_RUNTIME_DIR}/pulse/native
+      // but we know that on our images it's ${XDG_RUNTIME_DIR}/pulse-socket so this should be fine..
+      auto audio_server_on_host = std::filesystem::path(args->host->host_xdg_runtime_dir) /
+                                  std::filesystem::path(socket_path).filename();
+      mounted_paths.push_back({audio_server_on_host, socket_path});
+    }
   }
 
   full_env.set("GAMESCOPE_WIDTH", std::to_string(args->video_settings.width));
