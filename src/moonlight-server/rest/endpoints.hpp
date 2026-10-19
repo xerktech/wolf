@@ -292,9 +292,8 @@ std::optional<XMLResult> pair_next_phase(const immer::box<state::AppState> &stat
       if (state::pair(state->config, client)) {
         logs::log(logs::info, "Succesfully paired {}", client_ip);
       } else {
-        // Not persisted, so the pairing would be lost on restart: fail it now, the client can retry
+        // Not persisted (pair() left the paired clients as they were), so fail it now: the client can retry
         logs::log(logs::error, "Failed pairing with {}: config.toml couldn't be saved", client_ip);
-        state::unpair(state->config, client);
         result = {SimpleWeb::StatusCode::server_error_internal_server_error, fail_pair("Unable to save the pairing")};
       }
     } else {

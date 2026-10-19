@@ -413,6 +413,14 @@ TEST_CASE("LocalState reports a config file it couldn't save", "[LocalState]") {
   // keep only the client being paired
   { std::ofstream(cfg_file, std::ios::trunc); }
   REQUIRE_FALSE(state::pair(cfg, {.client_cert = "unsaved-cert"}));
+  // A failed pairing changes nothing in memory either, and a failed re-pair keeps the existing pairing
+  REQUIRE_FALSE(state::pair(cfg, {.client_cert = "saved-cert"}));
+  auto has_cert = [&](const std::string &cert) {
+    auto clients = cfg.paired_clients->load();
+    return std::ranges::any_of(*clients, [&](const auto &c) { return c->client_cert == cert; });
+  };
+  REQUIRE(has_cert("saved-cert"));
+  REQUIRE_FALSE(has_cert("unsaved-cert"));
   REQUIRE_FALSE(state::unpair(cfg, {.client_cert = "saved-cert"}));
   REQUIRE(state::update_client_settings(cfg, client_id, keep_client) == state::ConfigUpdate::NOT_SAVED);
   REQUIRE_FALSE(state::update_profiles(cfg, keep_profiles));

@@ -573,6 +573,7 @@ template <typename F> static bool update_config_file(const Config &cfg, F &&upda
 
 bool pair(const Config &cfg, const PairedClient &client) {
   std::lock_guard lock(config_file_mutex);
+  auto previous_clients = cfg.paired_clients->load();
   // Update CFG
   cfg.paired_clients->update([&client](const PairedClientList &paired_clients) {
     // Removing the client if already present (see: https://github.com/games-on-whales/wolf/issues/211)
@@ -585,7 +586,13 @@ bool pair(const Config &cfg, const PairedClient &client) {
   });
 
   // Update TOML
-  return update_config_file(cfg, [&client](WolfConfig &tml) { tml.paired_clients.push_back(client); });
+  if (!update_config_file(cfg, [&client](WolfConfig &tml) { tml.paired_clients.push_back(client); })) {
+    // An unsaved pairing would vanish on restart, so it fails; and a re-pair must not lose the client's
+    // existing (saved) pairing, which the update above replaced. Paired clients only change under this lock.
+    cfg.paired_clients->store(previous_clients);
+    return false;
+  }
+  return true;
 }
 
 bool unpair(const Config &cfg, const PairedClient &client) {

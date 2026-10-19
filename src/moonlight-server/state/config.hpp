@@ -43,7 +43,7 @@ std::string encoder_video_params(std::string_view tech, // "h264", "h265" or "av
 /**
  * Side effect, will atomically update the paired clients list in cfg
  * and persist the new state to disk
- * Returns false when the config file couldn't be saved: the change is still applied in memory
+ * Returns false when the config file couldn't be saved: the paired clients are then left as they were
  */
 bool pair(const Config &cfg, const PairedClient &client);
 
