@@ -243,21 +243,25 @@ void run() {
   // Before the servers start, so that no session's sink can be among them
   auto stale_sinks = audio_server && audio_server->server ? find_stale_sinks(*audio_server) : 0;
 
-  // HTTP APIs
-  std::thread([local_state]() {
-    run_server("HTTP", [&]() {
-      HttpServer server = HttpServer();
-      HTTPServers::startServer(&server, local_state, state::get_port(state::HTTP_PORT));
-    });
-  }).detach();
+  if (state::http_servers_enabled()) {
+    // HTTP APIs
+    std::thread([local_state]() {
+      run_server("HTTP", [&]() {
+        HttpServer server = HttpServer();
+        HTTPServers::startServer(&server, local_state, state::get_port(state::HTTP_PORT));
+      });
+    }).detach();
 
-  // HTTPS APIs
-  std::thread([local_state, p_key_file, p_cert_file]() {
-    run_server("HTTPS", [&]() {
-      HttpsServer server = HttpsServer(p_cert_file, p_key_file);
-      HTTPServers::startServer(&server, local_state, state::get_port(state::HTTPS_PORT));
-    });
-  }).detach();
+    // HTTPS APIs
+    std::thread([local_state, p_key_file, p_cert_file]() {
+      run_server("HTTPS", [&]() {
+        HttpsServer server = HttpsServer(p_cert_file, p_key_file);
+        HTTPServers::startServer(&server, local_state, state::get_port(state::HTTPS_PORT));
+      });
+    }).detach();
+  } else {
+    logs::log(logs::info, "WOLF_HTTP_SERVERS=FALSE: not starting the HTTP, HTTPS and mDNS servers");
+  }
 
   // RTSP
   std::thread([sessions = local_state->running_sessions]() {
@@ -284,23 +288,25 @@ void run() {
     }
   }).detach();
 
-  // mDNS
-  std::thread([hostname = local_state->config->hostname]() {
-    logs::log(logs::info, "Starting mDNS service");
-    try {
-      mdns_cpp::Logger::setLoggerSink([](const std::string &msg) {
-        // msg here will include a /n at the end, so we remove it
-        logs::log(logs::trace, "mDNS: {}", msg.substr(0, msg.size() - 1));
-      });
-      mdns_cpp::mDNS mdns;
-      mdns.setServiceName("_nvstream._tcp.local.");
-      mdns.setServiceHostname(hostname);
-      mdns.setServicePort(state::HTTP_PORT);
-      mdns.startService(false);
-    } catch (const std::exception &e) {
-      logs::log(logs::error, "mDNS error: {}", e.what());
-    }
-  }).detach();
+  // mDNS: advertises the HTTP server
+  if (state::http_servers_enabled()) {
+    std::thread([hostname = local_state->config->hostname]() {
+      logs::log(logs::info, "Starting mDNS service");
+      try {
+        mdns_cpp::Logger::setLoggerSink([](const std::string &msg) {
+          // msg here will include a /n at the end, so we remove it
+          logs::log(logs::trace, "mDNS: {}", msg.substr(0, msg.size() - 1));
+        });
+        mdns_cpp::mDNS mdns;
+        mdns.setServiceName("_nvstream._tcp.local.");
+        mdns.setServiceHostname(hostname);
+        mdns.setServicePort(state::get_port(state::HTTP_PORT));
+        mdns.startService(false);
+      } catch (const std::exception &e) {
+        logs::log(logs::error, "mDNS error: {}", e.what());
+      }
+    }).detach();
+  }
 
   // Only once the servers had their chance to bind: a second Wolf started by mistake fails to bind and exits, and
   // must not have touched the running Wolf's sinks first. The servers bind as their threads start, they don't say when.

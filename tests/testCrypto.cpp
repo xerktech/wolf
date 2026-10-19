@@ -6,6 +6,7 @@ using Catch::Matchers::Equals;
 #include <algorithm>
 #include <crypto/crypto.hpp>
 #include <moonlight/protocol.hpp>
+#include <openssl/x509.h>
 #include <string>
 
 using namespace std::string_literals;
@@ -215,5 +216,54 @@ TEST_CASE("OpenSSL sign", "[Crypto]") {
     auto signature = crypto::sign(msg, private_key);
 
     REQUIRE(crypto::verify(msg, signature, public_cert));
+  }
+}
+/**
+ * A cert that names an issuer Wolf doesn't have, signed by a key of the client's choosing: it proves nothing.
+ */
+static x509::x509_ptr cert_with_unknown_issuer() {
+  auto pkey = x509::generate_key();
+  auto cert = x509::x509_ptr(X509_new(), X509_free);
+  ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), 1);
+  X509_set_version(cert.get(), 2);
+  X509_gmtime_adj(X509_get_notBefore(cert.get()), 0);
+  X509_gmtime_adj(X509_get_notAfter(cert.get()), 3600);
+  X509_set_pubkey(cert.get(), pkey.get());
+  X509_NAME_add_entry_by_txt(X509_get_subject_name(cert.get()),
+                             "CN",
+                             MBSTRING_ASC,
+                             (unsigned char *)"client",
+                             -1,
+                             -1,
+                             0);
+  auto issuer = X509_NAME_new();
+  X509_NAME_add_entry_by_txt(issuer, "CN", MBSTRING_ASC, (unsigned char *)"Unknown CA", -1, -1, 0);
+  X509_set_issuer_name(cert.get(), issuer);
+  X509_NAME_free(issuer);
+  X509_sign(cert.get(), pkey.get(), EVP_sha256());
+  return cert;
+}
+
+TEST_CASE("x509 verification of a client cert against a paired one", "[Crypto]") {
+  auto paired = x509::generate_x509(x509::generate_key());
+
+  SECTION("The paired cert itself passes") {
+    REQUIRE_FALSE(x509::verification_error(paired, paired).has_value());
+  }
+
+  SECTION("Another self-signed cert is refused") {
+    auto other = x509::generate_x509(x509::generate_key());
+    REQUIRE(x509::verification_error(paired, other).has_value());
+  }
+
+  SECTION("A cert naming an unknown issuer is refused by default") {
+    auto forged = cert_with_unknown_issuer();
+    auto error = x509::verification_error(paired, forged);
+    REQUIRE(error.has_value());
+    REQUIRE_THAT(error.value(), Equals("unable to get local issuer certificate"));
+  }
+
+  SECTION("...and accepted only with the moonlight-embedded workaround on") {
+    REQUIRE_FALSE(x509::verification_error(paired, cert_with_unknown_issuer(), true).has_value());
   }
 }

@@ -60,6 +60,30 @@ inline int get_port(STANDARD_PORTS_MAPPING port) {
   return -1;
 }
 
+/**
+ * The address the Moonlight HTTP and HTTPS servers listen on (WOLF_HTTP_BIND_ADDRESS), all interfaces by default
+ */
+inline std::string get_http_bind_address() {
+  return utils::get_env("WOLF_HTTP_BIND_ADDRESS", "0.0.0.0");
+}
+
+/**
+ * WOLF_HTTP_SERVERS=FALSE starts neither the HTTP nor the HTTPS server (nor mDNS, which advertises them): for setups
+ * where something else terminates Moonlight's pairing and app list and drives Wolf through its API.
+ */
+inline bool http_servers_enabled() {
+  return utils::get_env("WOLF_HTTP_SERVERS", "") != std::string("FALSE");
+}
+
+/**
+ * WOLF_ALLOW_UNKNOWN_ISSUER_CERTS=TRUE brings back the old moonlight-embedded workaround: a client cert naming an
+ * issuer that isn't one of the paired certs is accepted. It then matches whatever cert it is checked against, so ANY
+ * client passes as the first paired one: only for trusted networks, off by default.
+ */
+inline bool allow_unknown_issuer_certs() {
+  return utils::get_env("WOLF_ALLOW_UNKNOWN_ISSUER_CERTS", "") == std::string("TRUE");
+}
+
 using PairedClientList = immer::vector<immer::box<wolf::config::PairedClient>>;
 using ProfilesList = immer::vector<immer::box<events::Profile>>;
 
