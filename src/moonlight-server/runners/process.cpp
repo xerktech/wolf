@@ -1,7 +1,5 @@
-#include <boost/asio/io_context.hpp>
 #include <control/control.hpp>
 #include <events/events.hpp>
-#include <future>
 #include <helpers/logger.hpp>
 #include <immer/atom.hpp>
 #include <runners/process.hpp>
@@ -68,8 +66,6 @@ void RunProcess::run(std::string_view session_id,
                      std::string_view render_node) {
   logs::log(logs::debug, "[PROCESS] Starting process: {}", this->run_cmd);
 
-  std::future<std::string> std_out = {}, err_out = {};
-  boost::asio::io_context ios;
   bp::child child_proc;
   bp::group group_proc;
 
@@ -84,13 +80,9 @@ void RunProcess::run(std::string_view session_id,
     child_proc = bp::child(this->run_cmd,
                            env,
                            bp::std_in.close(),
-#if BOOST_VERSION < 108800
-                           bp::std_out > std_out,
-                           bp::std_err > err_out,
-                           ios,
-#endif
+                           // stdout/stderr are inherited, so the app's output lands in Wolf's own log
                            group_proc,
-                           // last, so it runs after the stdio redirects have set up fds 0-2
+                           // last, so it runs after any stdio redirect has set up fds 0-2
                            close_inherited_fds{});
 
   } catch (const std::system_error &e) {
@@ -113,9 +105,6 @@ void RunProcess::run(std::string_view session_id,
       });
 
   // This will stop here until the process is over
-#if BOOST_VERSION < 108800
-  ios.run();
-#endif
   child_proc.wait(); // to avoid a zombie process & get the exit code
 
   auto ex_code = child_proc.exit_code();

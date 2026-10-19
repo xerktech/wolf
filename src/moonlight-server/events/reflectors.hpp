@@ -9,6 +9,7 @@
 #include <rfl.hpp>
 #include <rfl/parsing/Parser.hpp>
 #include <state/serialised_config.hpp>
+#include <utility>
 
 namespace rfl {
 
@@ -250,6 +251,45 @@ struct Parser<ReaderType, WriterType, std::size_t, ProcessorsType> {
 
   static schema::Type to_schema(std::map<std::string, schema::Type> *definitions) {
     return Parser<ReaderType, WriterType, std::string, ProcessorsType>::to_schema(definitions);
+  }
+};
+
+/**
+ * reflect-cpp's JSON reader static_casts every integer to the target type, so an API request with
+ * width=4294967297 silently reads as width=1. Reject integers that don't fit the field instead.
+ * Only types narrower than 64 bits wrap; std::size_t has its own (string) parser above.
+ * bool and character types are left to reflect-cpp: std::in_range doesn't accept them.
+ */
+template <class T, class ProcessorsType>
+requires(std::is_integral_v<T> && sizeof(T) < sizeof(std::int64_t) && !std::is_same_v<T, bool> &&
+         !std::is_same_v<T, char> && !std::is_same_v<T, wchar_t> && !std::is_same_v<T, char8_t> &&
+         !std::is_same_v<T, char16_t> && !std::is_same_v<T, char32_t>)
+struct Parser<json::Reader, json::Writer, T, ProcessorsType> {
+  using InputVarType = typename json::Reader::InputVarType;
+  using Int64Parser = Parser<json::Reader, json::Writer, std::int64_t, ProcessorsType>;
+
+  static Result<T> read(const json::Reader &, const InputVarType &var) noexcept {
+    if (!yyjson_is_int(var.val_)) {
+      return error("Could not cast to int.");
+    }
+    // yyjson stores non-negative integers as uint64 and negative ones as int64
+    if (yyjson_is_uint(var.val_)) {
+      if (auto v = yyjson_get_uint(var.val_); std::in_range<T>(v)) {
+        return static_cast<T>(v);
+      }
+    } else if (auto v = yyjson_get_sint(var.val_); std::in_range<T>(v)) {
+      return static_cast<T>(v);
+    }
+    return error("Integer out of range.");
+  }
+
+  template <class ParentType>
+  static void write(const json::Writer &writer, const T &v, const ParentType &parent) noexcept {
+    Int64Parser::write(writer, static_cast<std::int64_t>(v), parent);
+  }
+
+  static schema::Type to_schema(std::map<std::string, schema::Type> *definitions) {
+    return Int64Parser::to_schema(definitions);
   }
 };
 } // namespace parsing

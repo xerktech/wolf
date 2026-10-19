@@ -500,6 +500,9 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
     auto result = setup_over_future.wait_for(std::chrono::seconds(20));
     if (result == std::future_status::timeout) {
       logs::log(logs::warning, "[API] Lobby setup timed out");
+      // The caller is told it failed, so don't leave a half-started lobby listed (and running) behind
+      state_->app_state->event_bus->fire_event(
+          immer::box<events::StopLobbyEvent>(events::StopLobbyEvent{.lobby_id = lobby_id}));
       send_http(socket, 500, rfl::json::write(GenericErrorResponse{.error = "Lobby setup timed out"}));
     } else {
       auto res = LobbyCreateResponse{.lobby_id = lobby_id};
