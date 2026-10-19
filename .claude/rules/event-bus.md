@@ -23,6 +23,10 @@ paths:
   - An appsrc source (interpipesrc) gets `gst_app_src_end_of_stream` instead: an EOS event only
     reaches its streaming thread with the next buffer, so a consumer with no producer never ends.
     Tests: "Stopping a consumer whose producer never sends ends it" (needs gst-interpipe).
+  - Only the first `send_eos_async` per pipeline sends anything: a pause and a stop can both end one
+    pipeline, and two concurrent EOS events into one basesrc abort Wolf inside GStreamer
+    (`gst_base_src_loop: has_pending_eos`). Tests: "Ending a pipeline twice at once sends one EOS"
+    (probabilistic: without the guard it aborts in ~2 of 5 runs).
   - Other events into a pipeline (e.g. the IDR's force-key-unit) go through `send_message_async`.
 - `SwitchStreamProducerEvents` stays synchronous (`g_object_set` "listen-to"): an async switch runs on
   an unordered thread pool, so a quick join + leave could land in the wrong order.
