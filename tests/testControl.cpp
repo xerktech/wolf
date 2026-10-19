@@ -1,3 +1,4 @@
+#include "storm.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -5,10 +6,12 @@
 using Catch::Matchers::Equals;
 
 #include <algorithm>
+#include <array>
 #include <control/control.hpp>
 #include <control/input_handler.hpp>
 #include <cstring>
 #include <future>
+#include <immer/vector_transient.hpp>
 #include <moonlight/control.hpp>
 #include <mutex>
 #include <sessions/handlers.hpp>
@@ -1375,4 +1378,70 @@ TEST_CASE("sessions: Moonlight's pipelines start on the lobby their session join
     gst_element_set_state(pipeline, GST_STATE_NULL);
     gst_object_unref(pipeline);
   }
+}
+
+TEST_CASE("control: a connecting peer's session lookup racing session updates", "[ENET]") {
+  using wolf::core::events::StreamSession;
+  immer::vector_transient<StreamSession> sessions;
+  for (std::size_t id = 0; id < 64; id++) {
+    StreamSession session{.session_id = id};
+    session.enet_secret_payload = 1000 + id;
+    session.ip = "10.255.255.1"; // never matches the peer below, so an unknown secret walks every session twice
+    sessions.push_back(session);
+  }
+  state::SessionsAtoms running_sessions =
+      std::make_shared<immer::atom<immer::vector<StreamSession>>>(sessions.persistent());
+
+  QuietLogs quiet;
+  // Streams starting and stopping: each update swaps the vector out and frees the previous one, so a lookup that
+  // doesn't hold its snapshot walks freed memory (XERK-2023)
+  Hammer streams([&]() {
+    running_sessions->update([](const immer::vector<StreamSession> &running) {
+      return running.take(running.size() - 1).push_back(running.back());
+    });
+  });
+
+  ENetPeer peer{};
+  auto connect = [&](std::uint32_t enet_secret) {
+    ENetEvent event{.type = ENET_EVENT_TYPE_CONNECT, .peer = &peer, .data = enet_secret};
+    return control::get_current_session({}, running_sessions, "127.0.0.1", event);
+  };
+  auto result = storm(4, 20'000, 5s, [&]() {
+    auto known = connect(1000 + 63);
+    return known && known->session_id == 63 && !connect(1).has_value();
+  });
+  REQUIRE(result.runs > 0);
+  REQUIRE(result.failures == 0);
+  REQUIRE(streams.iterations > 0);
+}
+
+TEST_CASE("control: a stopped stream's peer lookup racing peers connecting", "[ENET]") {
+  using wolf::core::events::StreamSession;
+  // Stand-ins for ENet peers: only their addresses are used, as map keys
+  std::array<ENetPeer, 17> peers{};
+  immer::atom<control::enet_clients_map> connected_clients;
+  for (std::size_t id = 0; id < 16; id++) {
+    connected_clients.update([&](const control::enet_clients_map &clients) {
+      return clients.set(&peers[id], immer::box<StreamSession>(StreamSession{.session_id = id}));
+    });
+  }
+
+  QuietLogs quiet;
+  // Another client's peer connecting and disconnecting: each update swaps the map out and frees the previous one, so a
+  // lookup (the StopStreamEvent handler's) that doesn't hold its snapshot walks freed memory (XERK-2023)
+  Hammer other_peer([&]() {
+    connected_clients.update([&](const control::enet_clients_map &clients) {
+      return clients.set(&peers[16], immer::box<StreamSession>(StreamSession{.session_id = 16}));
+    });
+    connected_clients.update([&](const control::enet_clients_map &clients) { return clients.erase(&peers[16]); });
+  });
+
+  auto result = storm(4, 50'000, 5s, [&]() {
+    auto found = control::find_connected_peer(connected_clients, 15);
+    return found && found->first == &peers[15] && found->second->session_id == 15 &&
+           !control::find_connected_peer(connected_clients, 999);
+  });
+  REQUIRE(result.runs > 0);
+  REQUIRE(result.failures == 0);
+  REQUIRE(other_peer.iterations > 0);
 }

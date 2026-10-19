@@ -1,3 +1,4 @@
+#include "storm.hpp"
 #include <api/api.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -1329,6 +1330,178 @@ TEST_CASE("Runners: a lobby stopped while its runner starts doesn't leave the ap
   event_bus->fire_event(immer::box<events::StopLobbyEvent>(events::StopLobbyEvent{.lobby_id = lobby_id}));
   std::this_thread::sleep_for(500ms);
   REQUIRE_FALSE(orphan);
+}
+
+TEST_CASE("Pair API: completing pairings while other pairing requests come and go", "[API]") {
+  using namespace std::chrono_literals;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .running_sessions = running_sessions});
+
+  auto pair_request = [](const std::shared_ptr<boost::promise<std::string>> &pin) {
+    return immer::box<events::PairSignal>{events::PairSignal{.client_ip = "1234", .host_ip = "5678", .user_pin = pin}};
+  };
+  constexpr int pairings = 400;
+  std::vector<std::shared_ptr<boost::promise<std::string>>> pins;
+  for (int i = 0; i < pairings; i++) {
+    auto pin = pins.emplace_back(std::make_shared<boost::promise<std::string>>());
+    app_state->pairing_atom->update(
+        [&](const auto &pairing) { return pairing.set("secret-" + std::to_string(i), pair_request(pin)); });
+  }
+  start_api_server(app_state);
+  auto socket_path = api_socket_path();
+
+  QuietLogs quiet;
+  // Other Moonlight clients asking to pair and giving up: each update swaps the map out and frees the previous one, so
+  // an endpoint that doesn't hold its snapshot reads freed memory (XERK-2023)
+  Hammer other_clients([&, i = 0]() mutable {
+    auto secret = "other-" + std::to_string(i++ % 8);
+    auto pin = std::make_shared<boost::promise<std::string>>();
+    app_state->pairing_atom->update([&](const auto &pairing) { return pairing.set(secret, pair_request(pin)); });
+    app_state->pairing_atom->update([&](const auto &pairing) { return pairing.erase(secret); });
+  });
+
+  std::atomic_int next_pairing = 0;
+  auto result = storm(8, pairings / 8, 60s, [&]() {
+    auto i = next_pairing++;
+    auto curl = curl_ptr(curl_easy_init(), ::curl_easy_cleanup);
+    curl_easy_setopt(curl.get(), CURLOPT_UNIX_SOCKET_PATH, socket_path.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
+    auto paired = req(
+        curl.get(),
+        HTTPMethod::POST,
+        "http://localhost/api/v1/pair/client",
+        rfl::json::write(PairRequest{.pair_secret = "secret-" + std::to_string(i), .pin = std::to_string(1000 + i)}));
+    auto pending = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/pair/pending");
+    return paired && paired->first == 200 && pending && pending->first == 200;
+  });
+  REQUIRE(result.runs == pairings);
+  REQUIRE(result.failures == 0);
+  REQUIRE(other_clients.iterations > 0);
+  for (int i = 0; i < pairings; i++) {
+    auto pin = pins[i]->get_future();
+    REQUIRE(pin.is_ready());
+    REQUIRE(pin.get() == std::to_string(1000 + i));
+  }
+}
+
+/**
+ * A runner that returns at once, or, given `release`, holds its session open until released. Either way it counts
+ * the devices hot-plugged into its session's queue.
+ */
+struct CountingRunner : events::Runner {
+  std::shared_future<void> release;
+  std::shared_ptr<std::atomic_size_t> plugged = std::make_shared<std::atomic_size_t>(0);
+  std::shared_ptr<std::promise<void>> done = std::make_shared<std::promise<void>>();
+
+  void run(std::string_view,
+           std::string_view,
+           std::string_view,
+           std::shared_ptr<events::devices_atom_queue> plugged_devices_queue,
+           const immer::array<std::string> &,
+           const immer::array<std::pair<std::string, std::string>> &,
+           const immer::map<std::string, std::string> &,
+           std::string_view,
+           const std::function<bool()> &) override {
+    if (release.valid()) {
+      release.wait();
+      while (plugged_devices_queue->pop(std::chrono::milliseconds(0))) {
+        (*plugged)++;
+      }
+      done->set_value();
+    }
+  }
+
+  events::RunnerTypes serialize() const override {
+    return wolf::config::AppCMD{.run_cmd = "counting"};
+  }
+};
+
+TEST_CASE("Hot-plugging devices while other streams start and stop", "[API]") {
+  using namespace std::chrono_literals;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .host = immer::box<state::Host>(state::Host{}),
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
+      .running_sessions = running_sessions});
+  auto handlers = sessions::setup_moonlight_handlers(app_state, api_runtime_dir(), {});
+
+  // No compositor here (start_virtual_compositor = false), so runners don't wait for a Wayland socket
+  auto make_app = [&](const std::shared_ptr<events::Runner> &runner) {
+    return std::make_shared<events::App>(
+        events::App{.base = {.title = "counting", .id = "counting", .support_hdr = false},
+                    .start_virtual_compositor = false,
+                    .start_audio_server = false,
+                    .runner = runner});
+  };
+  auto make_session = [&](std::size_t session_id, const std::shared_ptr<events::App> &app) {
+    return immer::box<events::StreamSession>(
+        events::StreamSession{.event_bus = event_bus, .app = app, .enet_secret_payload = 1, .session_id = session_id});
+  };
+
+  // The session devices get hot-plugged into: its runner holds it open until the storm is over
+  std::promise<void> release;
+  auto held_runner = std::make_shared<CountingRunner>();
+  held_runner->release = release.get_future().share();
+  constexpr std::size_t plugged_session = 4242;
+  event_bus->fire_event(make_session(plugged_session, make_app(held_runner)));
+
+  // Every stream start below ends in a StartRunner, fired from a thread of its own
+  std::atomic_size_t other_runners = 0;
+  auto runner_observer =
+      event_bus->register_handler<immer::box<events::StartRunner>>([&](const immer::box<events::StartRunner> &ev) {
+        if (ev->stream_session->session_id == 4343) {
+          other_runners++;
+        }
+      });
+
+  QuietLogs quiet;
+  StormResult result;
+  std::size_t other_starts = 0;
+  {
+    // Another client's streams starting and stopping: each one adds and removes its devices queue, which swaps the
+    // map of queues out and frees the previous one, so a hot-plug that doesn't hold its snapshot reads freed memory
+    // (XERK-2023)
+    auto other_app = make_app(std::make_shared<CountingRunner>());
+    Hammer other_streams([&]() {
+      event_bus->fire_event(make_session(4343, other_app));
+      event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = 4343}));
+    });
+
+    // Many hot-plugs: each one only races a stream start/stop for a few instructions (5'000 per thread missed a
+    // reverted fix ~1 run in 10 on 4 cores)
+    result = storm(4, 50'000, 5s, [&]() {
+      event_bus->fire_event(
+          immer::box<events::PlugDeviceEvent>(events::PlugDeviceEvent{.session_id = std::to_string(plugged_session)}));
+      return true;
+    });
+    other_starts = other_streams.stop();
+  }
+  REQUIRE(other_starts > 0);
+
+  // Every hot-plug reached the session's runner
+  release.set_value();
+  REQUIRE(held_runner->done->get_future().wait_for(10s) == std::future_status::ready);
+  REQUIRE(*held_runner->plugged >= result.runs);
+
+  // Let the other streams' threads finish: one still running when wolftests exits reads freed globals
+  for (int i = 0; i < 3000 && other_runners < other_starts; i++) { // up to 60 s on a starved runner
+    std::this_thread::sleep_for(20ms);
+  }
+  REQUIRE(other_runners == other_starts);
+  std::this_thread::sleep_for(200ms); // their runner threads return right after starting
 }
 
 TEST_CASE("Session APIs without app_id or client_id", "[API]") {
