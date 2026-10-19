@@ -18,8 +18,8 @@ paths:
     lost and buffered whole in memory.
 - The fcntl fallback (kernel < 5.11) is capped at 65536 fds. One fcntl per possible fd up to an
   `infinity` RLIMIT_NOFILE (~1e9) would stall every launch for minutes.
-- Keep `close_inherited_fds{}` last in the `bp::child` arguments, after the stdio redirects.
-  - Placed earlier, a redirect's dup2 re-clears close-on-exec on fds 1-2, which masks a range that
-    wrongly starts below 3, and the test no longer catches it.
+- Keep `close_inherited_fds{}` last in the `bp::child` arguments, after any stdio redirect.
+  - Placed before a stdout/stderr redirect, the redirect's dup2 would re-clear close-on-exec on
+    fds 1-2, masking a range that wrongly starts below 3, and the test would no longer catch it.
 - Tests: `tests/platforms/linux/process.cpp` "Process runner doesn't leak Wolf's sockets to the child"
   (fails without the initializer; its stderr assertion catches a range that starts below 3).

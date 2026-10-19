@@ -80,7 +80,7 @@ void RunProcess::run(std::string_view session_id,
                            bp::std_in.close(),
                            // stdout/stderr are inherited, so the app's output lands in Wolf's own log
                            group_proc,
-                           // last, so it runs after the stdio redirects have set up fds 0-2
+                           // last, so it runs after any stdio redirect has set up fds 0-2
                            close_inherited_fds{});
 
   } catch (const std::system_error &e) {

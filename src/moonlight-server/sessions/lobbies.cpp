@@ -108,17 +108,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           }).detach();
 
           auto w_display_ready = on_ready->get_future().then(
-              [lobby, runtime_dir, ev_bus, audio_server, lobby_settings, app_state](auto fut) {
+              [lobby, runtime_dir, ev_bus, audio_server, lobby_settings, host = app_state->host](auto fut) {
                 streaming::WaylandDisplayReady ready = fut.get();
-                auto host = app_state->host;
-
-                if (!state::get_lobby_by_id(app_state->lobbies->load().get(), lobby->id)) {
-                  // Stopped while setting up (e.g. the API create call timed out): don't start the runner.
-                  // Stop again, for the producer pipeline that may have come up after the first stop.
-                  logs::log(logs::warning, "[LOBBY] Lobby {} was stopped during setup", lobby->id);
-                  ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
-                  return;
-                }
 
                 auto wl_state =
                     virtual_display::create_wayland_display(ready.wayland_plugin, ready.wayland_socket_name);
@@ -129,6 +120,15 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                   logs::log(logs::error,
                             "[LOBBY] Wayland socket {} was not ready, aborting runner startup",
                             ready.wayland_socket_name);
+                  ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
+                  return;
+                }
+
+                if (lobby->runner_claimed->exchange(true)) {
+                  // Stopped while setting up (e.g. the API create call timed out): don't start the runner.
+                  // Stop again, for the producer pipeline that may have come up after the first stop.
+                  logs::log(logs::warning, "[LOBBY] Lobby {} was stopped during setup", lobby->id);
+                  lobby->wayland_display->store(nullptr);
                   ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
                   return;
                 }
@@ -284,6 +284,15 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           return;
         }
         logs::log(logs::info, "[LOBBY] stopping lobby {}", stop_lobby_event->lobby_id);
+
+        if (!lobby->runner_claimed->exchange(true)) {
+          // Its runner never started: remove the audio sink the runner would have removed on exit.
+          // On another thread: an event handler must not block on PulseAudio.
+          if (std::shared_ptr<audio::VSink> sink = lobby->audio_sink->exchange(nullptr);
+              sink && audio_server && audio_server->server) {
+            std::thread([server = audio_server->server, sink]() { audio::delete_virtual_sink(server, sink); }).detach();
+          }
+        }
 
         immer::vector<immer::box<std::string>> sessions = lobby->connected_sessions->load();
         for (auto &session_id : sessions) {

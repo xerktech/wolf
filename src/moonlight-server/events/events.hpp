@@ -134,6 +134,13 @@ struct Lobby {
       std::make_shared<immer::atom<std::shared_ptr<audio::VSink>>>();
 
   /**
+   * Set once by whichever comes first: the setup starting the runner, or a StopLobbyEvent.
+   * The stop that sets it owns the teardown the runner would otherwise do on exit, and the setup must not
+   * start the runner anymore (a check of the lobby list instead would race with a stop).
+   */
+  std::shared_ptr<std::atomic_bool> runner_claimed = std::make_shared<std::atomic_bool>(false);
+
+  /**
    * A queue of devices that will be plugged into the runner when ready
    */
   std::shared_ptr<events::devices_atom_queue> plugged_devices_queue = std::make_shared<events::devices_atom_queue>();
