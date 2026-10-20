@@ -412,7 +412,7 @@ void appasset(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>
   auto icon_path = app.value()->base.icon_png_path.value();
   if (auto icon = utils::get_icon(state->host->local_base_state_folder, icon_path)) {
     SimpleWeb::CaseInsensitiveMultimap asset_headers;
-    asset_headers.emplace("Content-Type", "image/png");
+    asset_headers.emplace("Content-Type", utils::image_mime_type(icon.value()).value_or("image/png"));
     response->write(SimpleWeb::StatusCode::success_ok, icon.value(), asset_headers);
     response->close_connection_after_response = true;
   } else {
