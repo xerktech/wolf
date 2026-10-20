@@ -19,6 +19,9 @@
 #include <sessions/handlers.hpp>
 #include <state/config.hpp>
 #include <state/sessions.hpp>
+#include <state/utils.hpp>
+#include <sys/stat.h>
+#include <unistd.h>
 
 using Catch::Matchers::ContainsSubstring;
 using Catch::Matchers::Equals;
@@ -1895,6 +1898,114 @@ TEST_CASE("Utils APIs", "[API]") {
     REQUIRE(response);
     REQUIRE(response->first == 404);
   }
+
+  { // A remote resource that isn't an image (an HTML page) is not served either
+    auto response = req(curl.get(),
+                        HTTPMethod::GET,
+                        "http://localhost/api/v1/utils/get-icon?icon_path=https://games-on-whales.github.io/wildlife/");
+
+    REQUIRE(response);
+    REQUIRE(response->first == 404);
+  }
+
+  // Local files: only images are served, anything else (keys, config, /etc/shadow, ...) is refused
+  // One dir per process: concurrent runs on a host must not share it
+  auto icons_dir = std::filesystem::temp_directory_path() / ("wolf-test-icons-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(icons_dir); // Leftovers of a previous failed run (mkfifo below needs a clean dir)
+  std::filesystem::create_directories(icons_dir);
+  auto png_path = icons_dir / "icon.png";
+  auto key_path = icons_dir / "key.png"; // Extension must not matter, only the content
+  std::ofstream(png_path, std::ios::binary) << std::string("\x89PNG\r\n\x1a\n-fake-png-body", 22);
+  std::ofstream(key_path, std::ios::binary) << "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n";
+  auto svg_path = icons_dir / "icon.svg";
+  std::ofstream(svg_path) << R"(<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>)";
+
+  auto big_png_path = icons_dir / "big.png"; // Over the 10 MiB limit
+  std::ofstream(big_png_path, std::ios::binary)
+      << std::string("\x89PNG\r\n\x1a\n", 8) << std::string(10 * 1024 * 1024, 'x');
+
+  auto fifo_path = icons_dir / "fifo.png";
+  REQUIRE(::mkfifo(fifo_path.c_str(), 0600) == 0);
+
+  // Directories, devices, FIFOs and oversized files are refused, and must not take the server down (it has to answer
+  // the next requests)
+  for (const auto &path : {icons_dir.string(), std::string("/dev/zero"), fifo_path.string(), big_png_path.string()}) {
+    auto response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/utils/get-icon?icon_path=" + path);
+    REQUIRE(response);
+    REQUIRE(response->first == 404);
+  }
+
+  { // A local PNG is served, with its detected Content-Type
+    auto response =
+        req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/utils/get-icon?icon_path=" + png_path.string());
+    REQUIRE(response);
+    REQUIRE(response->first == 200);
+    REQUIRE_THAT(response->second, ContainsSubstring("PNG"));
+    char *content_type = nullptr;
+    curl_easy_getinfo(curl.get(), CURLINFO_CONTENT_TYPE, &content_type);
+    REQUIRE(content_type);
+    REQUIRE_THAT(content_type, Equals("image/png"));
+  }
+
+  { // Content-Type follows the detected image type
+    auto response =
+        req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/utils/get-icon?icon_path=" + svg_path.string());
+    REQUIRE(response);
+    REQUIRE(response->first == 200);
+    char *content_type = nullptr;
+    curl_easy_getinfo(curl.get(), CURLINFO_CONTENT_TYPE, &content_type);
+    REQUIRE(content_type);
+    REQUIRE_THAT(content_type, Equals("image/svg+xml"));
+  }
+
+  for (const auto &path : {key_path.string(), std::string("/etc/passwd"), std::string("config.test.toml")}) {
+    auto response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/utils/get-icon?icon_path=" + path);
+    REQUIRE(response);
+    REQUIRE(response->first == 404);
+    REQUIRE_THAT(response->second, !ContainsSubstring("PRIVATE KEY") && !ContainsSubstring("root:"));
+  }
+
+  std::filesystem::remove_all(icons_dir);
+}
+
+TEST_CASE("image_mime_type sniffs content and not extensions", "[API]") {
+  using namespace std::string_literals;
+  REQUIRE(utils::image_mime_type("\x89PNG\r\n\x1a\nrest"s) == "image/png");
+  REQUIRE(utils::image_mime_type("\xff\xd8\xff\xe0rest"s) == "image/jpeg");
+  REQUIRE(utils::image_mime_type("GIF89arest"s) == "image/gif");
+  REQUIRE(utils::image_mime_type("RIFF\x10\x00\x00\x00WEBPVP8 "s) == "image/webp");
+  REQUIRE(utils::image_mime_type("\x00\x00\x01\x00\x01\x00"s) == "image/x-icon");
+  REQUIRE(utils::image_mime_type("<?xml version=\"1.0\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\"/>"s) ==
+          "image/svg+xml");
+  REQUIRE(utils::image_mime_type("<!DOCTYPE svg [\n  <!ENTITY ns_svg \"http://www.w3.org/2000/svg\">\n] >\n<svg>"s) ==
+          "image/svg+xml"); // DOCTYPE with an internal subset
+  REQUIRE(utils::image_mime_type("<!DOCTYPE svg SYSTEM \"x[1].dtd\" [<!ENTITY a \"]>\"><!-- ] > -->]><svg/>"s) ==
+          "image/svg+xml"); // Brackets and > inside literals and comments
+  REQUIRE(utils::image_mime_type("<!DOCTYPE svg [<?pi ' \" ]> ?>]><svg/>"s) == "image/svg+xml"); // ... and PIs
+  REQUIRE(utils::image_mime_type("  <svg/>"s) == "image/svg+xml");
+  REQUIRE(utils::image_mime_type("\xef\xbb\xbf<svg>"s) == "image/svg+xml"); // UTF-8 BOM
+  REQUIRE(utils::image_mime_type("<?xml version=\"1.0\"?><!-- made by hand -->\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG "
+                                 "1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n<svg>"s) ==
+          "image/svg+xml");
+
+  REQUIRE_FALSE(utils::image_mime_type(""s));
+  REQUIRE_FALSE(utils::image_mime_type("-----BEGIN PRIVATE KEY-----\n"s));
+  REQUIRE_FALSE(utils::image_mime_type("root:$6$hash:19000:0:99999:7:::\n"s));
+  REQUIRE_FALSE(utils::image_mime_type("[[apps]]\ntitle = \"<svg>\"\n"s));
+  REQUIRE_FALSE(utils::image_mime_type("RIFF\x10\x00\x00\x00WAVE"s));
+  REQUIRE_FALSE(utils::image_mime_type("\xff\x00secret"s));    // Not a full JPEG magic
+  REQUIRE_FALSE(utils::image_mime_type("<?><svg/>?>SECRET"s)); // Still in the PI
+  REQUIRE_FALSE(utils::image_mime_type("<!DOCTYPE config SYSTEM \"a[b\"><config>SECRET</config><!-- ] --><svg/>"s));
+  REQUIRE_FALSE(utils::image_mime_type("<!DOCTYPE html PUBLIC \"-//X//[secret\" \"x.dtd\"><html>SECRET ]><svg/>"s));
+  REQUIRE_FALSE(utils::image_mime_type("<!DOCTYPE x [<?p ' ?>]><x>SECRET ' ]><svg/></x>"s)); // PI in the subset
+  REQUIRE_FALSE(utils::image_mime_type("<!DOCTYPE x [<?p ]><svg/> ?>]><x>SECRET</x>"s));
+  REQUIRE_FALSE(utils::image_mime_type("<!DOCTYPE x [<?p ?>]><x>SECRET</x> ]><svg/>"s));    // PI ends at ?>, not >
+  REQUIRE_FALSE(utils::image_mime_type("<!DOCTYPE svg SYSTEM \"x.dtd><svg/>"s));            // Unterminated literal
+  REQUIRE_FALSE(utils::image_mime_type("<!--><svg/>-->SECRET"s));                           // Still in the comment
+  REQUIRE_FALSE(utils::image_mime_type("<!-- <svg > --><secrets>KEY</secrets>"s));          // <svg isn't the root
+  REQUIRE_FALSE(utils::image_mime_type("<html><body><svg width=1/>SECRET</body></html>"s)); // <svg isn't the root
+  REQUIRE_FALSE(utils::image_mime_type("<svg-not-really> -----BEGIN PRIVATE KEY-----"s));   // Not an <svg> tag
+  REQUIRE_FALSE(utils::image_mime_type("<config>" + std::string(1024, ' ') + "<svg/>"));    // Too far from the start
 }
 
 struct SSEEvent {

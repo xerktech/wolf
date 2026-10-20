@@ -807,10 +807,17 @@ void UnixSocketServer::endpoint_GetIcon(const HTTPRequest &req, std::shared_ptr<
   }
   // TODO: implement coroutines for CURL
   std::thread([this, socket, icon_path = utils::to_string(icon_path[1])]() {
-    if (auto icon = utils::get_icon(this->state_->app_state->host->local_base_state_folder, icon_path)) {
+    std::optional<std::string> icon;
+    try { // An exception escaping this detached thread would terminate Wolf
+      icon = utils::get_icon(this->state_->app_state->host->local_base_state_folder, icon_path);
+    } catch (const std::exception &e) {
+      logs::log(logs::warning, "[API] Failed to get icon {}: {}", icon_path, e.what());
+    }
+    if (icon) {
       send_http(socket,
                 200,
-                {"Content-Length: " + std::to_string(icon->size()), "Content-Type: image/png"},
+                {"Content-Length: " + std::to_string(icon->size()),
+                 "Content-Type: " + utils::image_mime_type(icon.value()).value_or("image/png")},
                 icon.value());
     } else {
       auto res = GenericErrorResponse{.error = "Icon not found"};
