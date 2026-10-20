@@ -12,6 +12,9 @@ paths:
   - A handler that blocks stalls every runner start/stop server-wide (XERK-1966: a stuck pipeline's
     synchronous EOS from HTTPS `/cancel` hung all launches and RTSP).
   - Never block in a handler: hand slow or lock-taking work to another thread.
+- Never register or unregister a handler from inside a handler: that takes the lock exclusively while
+  `fire_event` holds it shared on the same thread (deadlock, or a swallowed `system_error` and no
+  handler). Register at setup time, or from a thread the handler starts.
 - Never let a handler throw. `fire_event` catches `std::system_error` (Boost.Process/asio errors are
   one) and abandons the loop, so later handlers of that event silently never run; anything else
   escapes a `noexcept` function and terminates Wolf. Use the `std::error_code` overloads.

@@ -695,6 +695,40 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a pipeline during preroll ends
   REQUIRE(ended_future.wait_for(10s) == std::future_status::ready);
 }
 
+// XERK-2111: a pause/stop that fired after the client's ping but before the pipeline registered its own handlers
+TEST_CASE_METHOD(GStreamerTestsFixture, "A pipeline whose stream already ended is never played", "[GSTPlugin]") {
+  using namespace wolf::core;
+  using namespace std::chrono_literals;
+  // Live and never ending: once played, it would only end on an EOS, which nothing sends here
+  auto audio_session = immer::box<events::AudioSession>(
+      events::AudioSession{.gst_pipeline = "audiotestsrc is-live=true ! fakesink",
+                           .session_id = 1,
+                           .client_ip = "127.0.0.1",
+                           .packet_duration = 5,
+                           .audio_mode = {.channels = 2, .streams = 1, .coupled_streams = 1, .bitrate = 64000}});
+  auto stopped = std::make_shared<std::atomic_bool>(true);
+
+  // Not std::async: its future would block the test forever in its destructor if the pipeline never ends
+  auto ended = std::make_shared<std::promise<void>>();
+  auto ended_future = ended->get_future();
+  auto event_bus = std::make_shared<events::EventBusType>();
+  std::thread([=]() {
+    streaming::start_streaming_audio(
+        audio_session,
+        [] { return std::string(); },
+        event_bus,
+        "127.0.0.1",
+        1,
+        nullptr,
+        "sink",
+        "",
+        stopped);
+    ended->set_value();
+  }).detach();
+  REQUIRE(ended_future.wait_for(2s) == std::future_status::ready);
+  REQUIRE(event_bus->handler_count() == 0);
+}
+
 TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping a consumer whose producer never sends ends it", "[GSTPlugin]") {
   using namespace wolf::core;
   // No interpipesink named nobody_audio: the source never gets a buffer (an app without an audio server)
