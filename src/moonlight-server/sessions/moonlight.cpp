@@ -1,4 +1,5 @@
 #include <atomic>
+#include <future>
 #include <immer/array_transient.hpp>
 #include <immer/map_transient.hpp>
 #include <immer/vector_transient.hpp>
@@ -12,12 +13,73 @@ namespace wolf::core::sessions {
 using session_devices = immer::map<std::string /* session_id */, std::shared_ptr<events::devices_atom_queue>>;
 
 /**
+ * A consumer pipeline only registers its own Pause/Stop/EndSuperseded handlers once the client's first RTP ping
+ * arrived and the pipeline has been built: an event fired before that would never reach it and the pipeline would run
+ * forever. Each consumer gets a flag here as soon as its Video/AudioSession is created; those events flip
+ * (and drop) it.
+ */
+struct PendingConsumer {
+  std::array<char, 16> rtp_secret_payload;
+  std::shared_ptr<std::atomic_bool> stopped;
+};
+
+using session_consumers = immer::map<std::size_t /* session_id */, immer::vector<PendingConsumer>>;
+
+static std::shared_ptr<std::atomic_bool> track_consumer(immer::atom<session_consumers> &consumers,
+                                                        std::size_t session_id,
+                                                        const std::array<char, 16> &rtp_secret_payload) {
+  auto stopped = std::make_shared<std::atomic_bool>(false);
+  consumers.update([&](const session_consumers &map) {
+    auto pending = map.find(session_id);
+    return map.set(session_id,
+                   (pending ? *pending : immer::vector<PendingConsumer>{})
+                       .push_back(PendingConsumer{.rtp_secret_payload = rtp_secret_payload, .stopped = stopped}));
+  });
+  return stopped;
+}
+
+/**
+ * Removes the consumers of `session_id` that `ends` matches, returning them
+ */
+static immer::vector<PendingConsumer> remove_consumers(immer::atom<session_consumers> &consumers,
+                                                       std::size_t session_id,
+                                                       const std::function<bool(const PendingConsumer &)> &ends) {
+  immer::vector<PendingConsumer> removed;
+  consumers.update([&](const session_consumers &map) {
+    removed = {}; // update() may run this more than once
+    auto pending = map.find(session_id);
+    if (!pending) {
+      return map;
+    }
+    immer::vector<PendingConsumer> remaining;
+    for (const auto &consumer : *pending) {
+      if (ends(consumer)) {
+        removed = removed.push_back(consumer);
+      } else {
+        remaining = remaining.push_back(consumer);
+      }
+    }
+    return remaining.empty() ? map.erase(session_id) : map.set(session_id, remaining);
+  });
+  return removed;
+}
+
+static void stop_consumers(immer::atom<session_consumers> &consumers,
+                           std::size_t session_id,
+                           const std::function<bool(const PendingConsumer &)> &ends) {
+  for (const auto &consumer : remove_consumers(consumers, session_id, ends)) {
+    consumer.stopped->store(true);
+  }
+}
+
+/**
  * Will stop the execution until an event of type RTPPingType is triggered
  * and the signature is matching the input `sess`.
- * Returns the RTPPingType event
+ * Returns the RTPPingType event, or nothing if `stopped` was set before the ping arrived
  */
 template <typename RTPPingType>
-immer::box<RTPPingType> wait_for_ping(std::shared_ptr<events::EventBusType> ev_bus, const auto &sess) {
+std::optional<immer::box<RTPPingType>>
+wait_for_ping(std::shared_ptr<events::EventBusType> ev_bus, const auto &sess, const std::atomic_bool &stopped) {
   auto ping_promise = std::make_shared<std::promise<RTPPingType>>();
   auto ping_future = ping_promise->get_future();
   auto resolved = std::make_shared<std::atomic_bool>(false);
@@ -36,13 +98,17 @@ immer::box<RTPPingType> wait_for_ping(std::shared_ptr<events::EventBusType> ev_b
         }
       });
 
-  // Wait for the promise to be fulfilled
-  auto ping_ev = ping_future.get();
+  // Wait for the promise to be fulfilled, giving up if the stream ends in the meantime
+  while (ping_future.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready && !stopped.load()) {
+  }
 
   // Unregister the handler since we only need it once
   handler.unregister();
 
-  return ping_ev;
+  if (stopped.load()) {
+    return std::nullopt;
+  }
+  return ping_future.get();
 }
 
 /**
@@ -67,24 +133,44 @@ setup_stream_pipeline_handlers(const std::shared_ptr<events::EventBusType> &ev_b
                                const StreamPipelines &pipelines) {
   immer::vector_transient<immer::box<events::EventBusHandlers>> handlers;
 
+  auto consumers = std::make_shared<immer::atom<session_consumers>>();
+
   handlers.push_back(ev_bus->register_handler<immer::box<events::PauseStreamEvent>>(
-      [running_sessions](const immer::box<events::PauseStreamEvent> &ev) {
+      [running_sessions, consumers](const immer::box<events::PauseStreamEvent> &ev) {
+        stop_consumers(*consumers, ev->session_id, [](const auto &) { return true; });
         update_stream_state(running_sessions, ev->session_id, [](events::StreamState state) {
           state.paused = true;
           return state;
         });
       }));
 
+  handlers.push_back(ev_bus->register_handler<immer::box<events::StopStreamEvent>>(
+      [consumers](const immer::box<events::StopStreamEvent> &ev) {
+        stop_consumers(*consumers, ev->session_id, [](const auto &) { return true; });
+      }));
+
+  handlers.push_back(ev_bus->register_handler<immer::box<events::EndSupersededStreamEvent>>(
+      [consumers](const immer::box<events::EndSupersededStreamEvent> &ev) {
+        stop_consumers(*consumers, ev->session_id, [&ev](const PendingConsumer &consumer) {
+          return consumer.rtp_secret_payload == ev->rtp_secret_payload;
+        });
+      }));
+
   handlers.push_back(ev_bus->register_handler<immer::box<events::VideoSession>>(
-      [ev_bus, running_sessions, pipelines](const immer::box<events::VideoSession> &sess) {
+      [ev_bus, running_sessions, pipelines, consumers](const immer::box<events::VideoSession> &sess) {
         update_stream_state(running_sessions, sess->session_id, [](events::StreamState state) {
           state.paused = false;
           return state;
         });
+        auto stopped = track_consumer(*consumers, sess->session_id, sess->rtp_secret_payload);
 
         // Start a thread that will wait for the RTP ping event
-        std::thread([sess, ev_bus, running_sessions, pipelines]() {
-          auto ping_ev = wait_for_ping<events::RTPVideoPingEvent>(ev_bus, sess);
+        std::thread([sess, ev_bus, running_sessions, pipelines, consumers, stopped]() {
+          auto ping_ev = wait_for_ping<events::RTPVideoPingEvent>(ev_bus, sess, *stopped);
+          if (!ping_ev) {
+            logs::log(logs::debug, "[STREAM_SESSION] Video stream {} ended before it started", sess->session_id);
+            return;
+          }
 
           // Start streaming
           auto stream_state = update_stream_state(running_sessions, sess->session_id, [](events::StreamState state) {
@@ -92,7 +178,10 @@ setup_stream_pipeline_handlers(const std::shared_ptr<events::EventBusType> &ev_b
             state.paused = false; // a pipeline started after a pause is streaming again
             return state;
           });
-          pipelines.video(sess, ping_ev);
+          pipelines.video(sess, *ping_ev, stopped);
+          remove_consumers(*consumers, sess->session_id, [&stopped](const PendingConsumer &consumer) {
+            return consumer.stopped == stopped;
+          });
           if (stream_state) {
             stream_state->update([](events::StreamState state) {
               state.video_pipelines--;
@@ -103,15 +192,20 @@ setup_stream_pipeline_handlers(const std::shared_ptr<events::EventBusType> &ev_b
       }));
 
   handlers.push_back(ev_bus->register_handler<immer::box<events::AudioSession>>(
-      [ev_bus, running_sessions, pipelines](const immer::box<events::AudioSession> &sess) {
+      [ev_bus, running_sessions, pipelines, consumers](const immer::box<events::AudioSession> &sess) {
         update_stream_state(running_sessions, sess->session_id, [](events::StreamState state) {
           state.paused = false;
           return state;
         });
+        auto stopped = track_consumer(*consumers, sess->session_id, sess->rtp_secret_payload);
 
         // Start a thread that will wait for the RTP ping event
-        std::thread([sess, ev_bus, running_sessions, pipelines]() {
-          auto ping_ev = wait_for_ping<events::RTPAudioPingEvent>(ev_bus, sess);
+        std::thread([sess, ev_bus, running_sessions, pipelines, consumers, stopped]() {
+          auto ping_ev = wait_for_ping<events::RTPAudioPingEvent>(ev_bus, sess, *stopped);
+          if (!ping_ev) {
+            logs::log(logs::debug, "[STREAM_SESSION] Audio stream {} ended before it started", sess->session_id);
+            return;
+          }
 
           // Start streaming
           auto stream_state = update_stream_state(running_sessions, sess->session_id, [](events::StreamState state) {
@@ -119,7 +213,10 @@ setup_stream_pipeline_handlers(const std::shared_ptr<events::EventBusType> &ev_b
             state.paused = false; // a pipeline started after a pause is streaming again
             return state;
           });
-          pipelines.audio(sess, ping_ev);
+          pipelines.audio(sess, *ping_ev, stopped);
+          remove_consumers(*consumers, sess->session_id, [&stopped](const PendingConsumer &consumer) {
+            return consumer.stopped == stopped;
+          });
           if (stream_state) {
             stream_state->update([](events::StreamState state) {
               state.audio_pipelines--;
@@ -381,7 +478,8 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                gst_context = app_state->gst_context,
                running_sessions = app_state->running_sessions,
                lobbies = app_state->lobbies](const immer::box<events::VideoSession> &sess,
-                                             const immer::box<events::RTPVideoPingEvent> &ping_ev) {
+                                             const immer::box<events::RTPVideoPingEvent> &ping_ev,
+                                             const std::shared_ptr<std::atomic_bool> &stopped) {
                 streaming::start_streaming_video(
                     sess,
                     [=] {
@@ -391,14 +489,16 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                     ping_ev->client_ip,
                     ping_ev->client_port,
                     gst_context,
-                    ping_ev->video_socket.get());
+                    ping_ev->video_socket.get(),
+                    stopped);
               },
           .audio =
               [ev_bus = app_state->event_bus,
                audio_server,
                running_sessions = app_state->running_sessions,
                lobbies = app_state->lobbies](const immer::box<events::AudioSession> &sess,
-                                             const immer::box<events::RTPAudioPingEvent> &ping_ev) {
+                                             const immer::box<events::RTPAudioPingEvent> &ping_ev,
+                                             const std::shared_ptr<std::atomic_bool> &stopped) {
                 auto audio_server_name = audio_server ? audio::get_server_name(audio_server->server)
                                                       : std::optional<std::string>();
                 auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, sess->session_id);
@@ -413,7 +513,8 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                     ping_ev->client_port,
                     ping_ev->audio_socket.get(),
                     sink_name,
-                    server_name);
+                    server_name,
+                    stopped);
               }});
   for (const auto &handler : pipeline_handlers) {
     handlers.push_back(handler);

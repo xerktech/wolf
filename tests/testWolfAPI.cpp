@@ -716,8 +716,10 @@ struct FakePipelines {
 
   sessions::StreamPipelines pipelines() const {
     return {.video = [*this](const immer::box<events::VideoSession> &sess,
+                             const auto &,
                              const auto &) { run(sess->session_id, sess->rtp_secret_payload); },
             .audio = [*this](const immer::box<events::AudioSession> &sess,
+                             const auto &,
                              const auto &) { run(sess->session_id, sess->rtp_secret_payload); }};
   }
 };
@@ -818,9 +820,20 @@ TEST_CASE("Sessions API: the listed state follows the stream's events", "[API]")
   REQUIRE(listed_state() == "setup");
   setup(1);
   REQUIRE(listed_state() == "setup"); // until the client's first ping
-  // A pause before the first ping, with no pipeline to end yet, doesn't hold the stream paused once it starts
+  // A pause before the first ping ends the stream before it starts: its pings start nothing
   event_bus->fire_event(immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = session_id}));
   REQUIRE(listed_state() == "paused");
+  std::this_thread::sleep_for(300ms); // the paused stream gives up waiting for its ping
+  for (int i = 0; i < 5; i++) {
+    event_bus->fire_event(immer::box<events::RTPVideoPingEvent>(
+        events::RTPVideoPingEvent{.client_ip = "127.0.0.1", .client_port = 9, .payload = rtp_secret(1)}));
+    std::this_thread::sleep_for(20ms);
+  }
+  REQUIRE(*fake.started == 0);
+  REQUIRE(listed_state() == "paused");
+  // Set up again (e.g. the API's sessions/start), it is no longer paused, and starts on its ping
+  setup(1);
+  REQUIRE(listed_state() == "setup");
   ping_until_started(1, 2);
   REQUIRE(listed_state() == "streaming");
 
@@ -877,6 +890,85 @@ TEST_CASE("Sessions API: the listed state follows the stream's events", "[API]")
   auto stream_state = running_sessions->load()->front().stream_state->load();
   REQUIRE(stream_state->video_pipelines == 0);
   REQUIRE(stream_state->audio_pipelines == 0);
+}
+
+// pipelines register their own pause/stop handlers only once they start, on the client's first ping
+TEST_CASE("sessions: a stream ended before its first ping never starts its pipelines", "[API]") {
+  using namespace std::chrono_literals;
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto fake = FakePipelines{.ev_bus = event_bus, .teardown = 0ms};
+  auto pipeline_handlers = sessions::setup_stream_pipeline_handlers(event_bus, running_sessions, fake.pipelines());
+  auto idle_handlers = event_bus->handler_count();
+
+  std::size_t session_id = 42;
+  auto rtp_secret = [](char id) { return std::array<char, 16>{id}; };
+  auto setup = [&](char secret) {
+    event_bus->fire_event(immer::box<events::VideoSession>(
+        events::VideoSession{.session_id = session_id, .rtp_secret_payload = rtp_secret(secret)}));
+    event_bus->fire_event(immer::box<events::AudioSession>(
+        events::AudioSession{.session_id = session_id, .rtp_secret_payload = rtp_secret(secret)}));
+    std::this_thread::sleep_for(50ms); // let both wait for their ping
+  };
+  auto ping = [&](char secret) {
+    for (int i = 0; i < 10; i++) {
+      event_bus->fire_event(immer::box<events::RTPVideoPingEvent>(
+          events::RTPVideoPingEvent{.client_ip = "127.0.0.1", .client_port = 9, .payload = rtp_secret(secret)}));
+      event_bus->fire_event(immer::box<events::RTPAudioPingEvent>(
+          events::RTPAudioPingEvent{.client_ip = "127.0.0.1", .client_port = 9, .payload = rtp_secret(secret)}));
+      std::this_thread::sleep_for(20ms);
+    }
+  };
+  // Once ended, the stream gives up waiting for its ping (it would otherwise also grab a later restart's ping)
+  auto require_gave_up = [&]() {
+    for (int i = 0; i < 50 && event_bus->handler_count() != idle_handlers; i++) {
+      std::this_thread::sleep_for(20ms);
+    }
+    REQUIRE(event_bus->handler_count() == idle_handlers);
+  };
+
+  SECTION("paused") {
+    setup('a');
+    event_bus->fire_event(immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = session_id}));
+    require_gave_up();
+    ping('a');
+    REQUIRE(*fake.started == 0);
+  }
+  SECTION("stopped") {
+    setup('a');
+    event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session_id}));
+    require_gave_up();
+    ping('a');
+    REQUIRE(*fake.started == 0);
+  }
+  SECTION("superseded") {
+    setup('a');
+    setup('b');
+    event_bus->fire_event(immer::box<events::EndSupersededStreamEvent>(
+        events::EndSupersededStreamEvent{.session_id = session_id, .rtp_secret_payload = rtp_secret('a')}));
+    ping('a');
+    REQUIRE(*fake.started == 0);
+    // ...but only the superseded instance
+    ping('b');
+    REQUIRE(*fake.started == 2);
+    event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session_id}));
+    for (int i = 0; i < 50 && *fake.ended < 2; i++) {
+      std::this_thread::sleep_for(20ms);
+    }
+    require_gave_up();
+  }
+  SECTION("restarted after a pause") {
+    setup('a');
+    event_bus->fire_event(immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = session_id}));
+    setup('a'); // e.g. the API's sessions/start: same instance, same secret
+    ping('a');
+    REQUIRE(*fake.started == 2); // one video and one audio, not the paused ones too
+    event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session_id}));
+    for (int i = 0; i < 50 && *fake.ended < 2; i++) {
+      std::this_thread::sleep_for(20ms);
+    }
+    require_gave_up();
+  }
 }
 
 TEST_CASE("utils::to_size_t", "[API]") {

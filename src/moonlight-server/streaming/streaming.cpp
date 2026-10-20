@@ -117,7 +117,7 @@ void start_video_producer(const std::string &session_id,
       std::make_shared<GstBusData>(GstBusData{.on_ready = std::move(on_ready), .wayland_plugin = nullptr});
   std::shared_ptr<NeedContextData> ctx_data_ptr =
       std::make_shared<NeedContextData>(NeedContextData{.device_path = render_node, .gst_context = video_context});
-  run_pipeline(pipeline, [=](auto pipeline) {
+  run_pipeline(pipeline, nullptr, [=](auto pipeline) {
     logs::log(logs::debug, "Setting up waylanddisplaysrc");
 
     auto wayland_plugin_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_wayland_source");
@@ -181,7 +181,7 @@ void start_audio_producer(const std::string &session_id,
                               fmt::arg("server_name", server_name));
   logs::log(logs::debug, "[GSTREAMER] Starting audio producer: {}", pipeline);
 
-  run_pipeline(pipeline, [=](auto pipeline) {
+  run_pipeline(pipeline, nullptr, [=](auto pipeline) {
     auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
         [session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
           if (std::to_string(ev->session_id) == session_id) {
@@ -463,7 +463,8 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
                            std::string client_ip,
                            unsigned short client_port,
                            std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
-                           std::shared_ptr<udp::socket> video_socket) {
+                           std::shared_ptr<udp::socket> video_socket,
+                           std::shared_ptr<std::atomic_bool> stopped) {
   auto [color_range, color_space] = get_color_params(video_session);
 
   auto pipeline = fmt::format(
@@ -498,7 +499,7 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
       }});
   std::shared_ptr<NeedContextData> ctx_data_ptr = std::make_shared<NeedContextData>(
       NeedContextData{.device_path = video_session->render_node, .gst_context = video_context});
-  run_pipeline(pipeline, [video_session, consumer, producer_name, event_bus, udp_sink, ctx_data_ptr](auto pipeline) {
+  run_pipeline(pipeline, stopped, [=](auto pipeline) {
     if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
       logs::log(logs::debug, "Setting up wolf_udp_sink");
       g_assert(GST_IS_APP_SINK(app_sink_el));
@@ -587,7 +588,8 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
                            unsigned short client_port,
                            std::shared_ptr<udp::socket> audio_socket,
                            const std::string &sink_name,
-                           const std::string &server_name) {
+                           const std::string &server_name,
+                           std::shared_ptr<std::atomic_bool> stopped) {
   auto pipeline = fmt::format(
       fmt::runtime(audio_session->gst_pipeline),
       fmt::arg("session_id", audio_session->session_id),
@@ -614,7 +616,7 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
       .client_endpoint = std::make_shared<udp::endpoint>(boost::asio::ip::make_address(client_ip), client_port)});
 
   auto session_id = audio_session->session_id;
-  run_pipeline(pipeline, [audio_session, session_id, consumer, producer_name, udp_sink, event_bus](auto pipeline) {
+  run_pipeline(pipeline, stopped, [=](auto pipeline) {
     if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
       logs::log(logs::debug, "Setting up wolf_udp_sink");
       g_assert(GST_IS_APP_SINK(app_sink_el));
