@@ -51,9 +51,9 @@ RUN <<_GST_WAYLAND_DISPLAY
     cargo cinstall --features="cuda" --prefix=/usr/local/lib/x86_64-linux-gnu/ --libdir=/usr/local/lib/x86_64-linux-gnu
 _GST_WAYLAND_DISPLAY
 
-# gst-interpipe with our teardown-race fixes, replacing the base image's copy: installs over it
-# into /usr/local/lib64/gstreamer-1.0, which the runner copies the plugin from.
-# Pinned so the patches keep applying; bump the ref and patches together.
+# gst-interpipe with our teardown-race and stop-hang fixes, replacing the base image's copy: installs over it
+# into /usr/local/lib64/gstreamer-1.0, which the runner copies the plugin from. The glob applies the
+# patches in name order. Pinned so they keep applying; bump the ref and patches together.
 ARG GST_INTERPIPE_REF=0c454917cb3cf4f2b2f2729f5f72a4dee072c7c9
 COPY docker/patches/gst-interpipe-*.patch /tmp/gst-interpipe-patches/
 RUN <<_GST_INTERPIPE

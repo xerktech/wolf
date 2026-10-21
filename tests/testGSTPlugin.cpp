@@ -831,6 +831,44 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Interpipe producer teardown with active
 }
 
 /**
+ * a live consumer set to NULL right after PLAYING. basesrc defers an unlock_stop to the streaming thread
+ * when it goes to PLAYING; landing after the stop's unlock, it left appsrc's create waiting forever under the stream
+ * lock, so set_state(NULL) hung (see docker/patches/gst-interpipe-unlock-stop-race.patch). Unpatched, this hangs in
+ * most runs on a 2-core box; patched, it takes about a second.
+ */
+TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping an interpipe consumer right after it starts ends it", "[GSTPlugin]") {
+  using namespace std::chrono_literals;
+  auto interpipe = gst_element_factory_find("interpipesrc");
+  REQUIRE(interpipe);
+  gst_object_unref(interpipe);
+
+  constexpr int n_threads = 8;
+  constexpr int n_rounds = 2000;
+  // Not std::async: a hung worker would block the test forever in the future's destructor
+  auto ended = std::make_shared<std::promise<void>>();
+  auto ended_future = ended->get_future();
+  std::thread([ended]() {
+    std::vector<std::thread> workers;
+    for (int i = 0; i < n_threads; i++) {
+      workers.emplace_back([]() {
+        for (int round = 0; round < n_rounds; round++) {
+          auto pipeline =
+              gst_parse_launch("interpipesrc listen-to=nobody_quick is-live=true ! fakesink sync=false", nullptr);
+          gst_element_set_state(pipeline, GST_STATE_PLAYING);
+          gst_element_set_state(pipeline, GST_STATE_NULL);
+          gst_object_unref(pipeline);
+        }
+      });
+    }
+    for (auto &w : workers) {
+      w.join();
+    }
+    ended->set_value();
+  }).detach();
+  REQUIRE(ended_future.wait_for(120s) == std::future_status::ready);
+}
+
+/**
  * An upstream event forwarded from a consumer is still inside the producer (held by a pad probe) when the producer is
  * disposed: tearing the producer down must wait for that forward to return instead of freeing the node under it.
  */
