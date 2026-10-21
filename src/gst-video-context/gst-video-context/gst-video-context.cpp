@@ -1,5 +1,5 @@
 #include "gst-video-context.hpp"
-#include <algorithm>
+#include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <gst/cuda/gstcudacontext.h>
@@ -8,7 +8,6 @@
 #include <helpers/logger.hpp>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
-#include <vector>
 
 namespace gst_video_context {
 
@@ -65,65 +64,46 @@ bool isNvidiaGpu(const std::string &pciBusId) {
   return vendor == "0x10de";
 }
 
+/**
+ * Ask the CUDA driver which ordinal it gave the GPU at this PCI bus ID.
+ *
+ * Ordinals are only meaningful to the driver that hands them out: it numbers just the GPUs this process
+ * can see (a container with one GPU passed through only sees ordinal 0, even though
+ * /proc/driver/nvidia/gpus lists every GPU on the host) and, unless CUDA_DEVICE_ORDER=PCI_BUS_ID, orders
+ * them fastest first rather than by PCI address. So we can't derive it ourselves, we have to ask.
+ *
+ * GStreamer's CUDA loader doesn't export cuDeviceGetByPCIBusId, so we resolve it from libcuda directly.
+ */
 std::optional<int> getCudaDeviceIndexFromPciBusId(const std::string &pciBusId) {
-  fs::path gpusDir = "/proc/driver/nvidia/gpus";
+  using cuInit_t = int (*)(unsigned int);
+  using cuDeviceGetByPCIBusId_t = int (*)(int *, const char *);
+  constexpr int CUDA_SUCCESS = 0;
 
-  std::error_code ec;
-  if (!fs::exists(gpusDir, ec) || !fs::is_directory(gpusDir, ec)) {
+  void *libcuda = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
+  if (!libcuda) {
+    logs::log(logs::warning, "Failed to load libcuda.so.1: {}", dlerror());
     return std::nullopt;
   }
 
-  auto normalize = [](std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-    return value;
-  };
-
-  std::vector<std::pair<std::string, std::string>> gpuBusIds;
-  for (const auto &entry : fs::directory_iterator(gpusDir, ec)) {
-    if (!entry.is_directory()) {
-      continue;
-    }
-
-    std::string busId = entry.path().filename().string();
-    logs::log(logs::debug, "Found Nvidia GPU: {}", busId);
-
-    gpuBusIds.emplace_back(busId, normalize(busId));
-  }
-
-  if (gpuBusIds.empty()) {
-    logs::log(logs::warning, "No NVIDIA GPUs found in {}", gpusDir.string());
-    return std::nullopt;
-  }
-
-  std::sort(gpuBusIds.begin(), gpuBusIds.end(), [](const auto &lhs, const auto &rhs) {
-    return lhs.second < rhs.second;
-  });
-
-  std::string target = normalize(pciBusId);
-  for (size_t index = 0; index < gpuBusIds.size(); ++index) {
-    if (gpuBusIds[index].second == target) {
-      logs::log(logs::debug,
-                "PCI bus ID {} mapped to CUDA device index {} (sorted order)",
-                gpuBusIds[index].first,
-                index);
-      return static_cast<int>(index);
+  std::optional<int> result;
+  auto cu_init = reinterpret_cast<cuInit_t>(dlsym(libcuda, "cuInit"));
+  auto cu_device_get_by_pci_bus_id = reinterpret_cast<cuDeviceGetByPCIBusId_t>(dlsym(libcuda, "cuDeviceGetByPCIBusId"));
+  if (!cu_init || !cu_device_get_by_pci_bus_id) {
+    logs::log(logs::warning, "libcuda.so.1 is missing cuInit or cuDeviceGetByPCIBusId");
+  } else if (auto res = cu_init(0); res != CUDA_SUCCESS) {
+    logs::log(logs::warning, "cuInit failed with error {}", res);
+  } else {
+    int device = -1;
+    if (auto res = cu_device_get_by_pci_bus_id(&device, pciBusId.c_str()); res == CUDA_SUCCESS) {
+      logs::log(logs::debug, "PCI bus ID {} is CUDA device {}", pciBusId, device);
+      result = device;
+    } else {
+      logs::log(logs::warning, "No CUDA device found for PCI bus ID {} (error {})", pciBusId, res);
     }
   }
 
-  std::string availableIds;
-  for (const auto &entry : gpuBusIds) {
-    if (!availableIds.empty()) {
-      availableIds.append(", ");
-    }
-    availableIds.append(entry.first);
-  }
-
-  logs::log(logs::warning,
-            "PCI bus ID {} not found when mapping to CUDA device index. Available GPUs: {}",
-            pciBusId,
-            availableIds);
-
-  return std::nullopt;
+  dlclose(libcuda);
+  return result;
 }
 
 std::optional<int> getCudaDeviceFromDri(const fs::path &driPath) {
