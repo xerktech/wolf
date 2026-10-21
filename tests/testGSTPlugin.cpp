@@ -869,6 +869,55 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Stopping an interpipe consumer right af
 }
 
 /**
+ * The XERK-2130 fix drops an unlock_stop only while the consumer is deactivating. basesrc also calls unlock_stop
+ * for a flush, while its pad is still flushing: dropping that one would leave the consumer wedged after any flush.
+ */
+TEST_CASE_METHOD(GStreamerTestsFixture, "An interpipe consumer keeps receiving after a flush", "[GSTPlugin]") {
+  using namespace std::chrono_literals;
+  auto interpipe = gst_element_factory_find("interpipesrc");
+  REQUIRE(interpipe);
+  gst_object_unref(interpipe);
+
+  static std::atomic<int> buffers = 0;
+  auto producer = gst_parse_launch("videotestsrc is-live=true ! video/x-raw,width=64,height=64,framerate=100/1 ! "
+                                   "interpipesink name=flush_prod sync=false",
+                                   nullptr);
+  gst_element_set_state(producer, GST_STATE_PLAYING);
+  auto consumer = gst_parse_launch("interpipesrc name=flush_c listen-to=flush_prod is-live=true format=time ! "
+                                   "fakesink name=flush_sink sync=false signal-handoffs=true",
+                                   nullptr);
+  auto sink = gst_bin_get_by_name(GST_BIN(consumer), "flush_sink");
+  g_signal_connect(sink,
+                   "handoff",
+                   G_CALLBACK(+[](GstElement *, GstBuffer *, GstPad *, gpointer) { buffers++; }),
+                   nullptr);
+  gst_object_unref(sink);
+  auto src = gst_bin_get_by_name(GST_BIN(consumer), "flush_c");
+  gst_element_set_state(consumer, GST_STATE_PLAYING);
+
+  auto receives = [] {
+    auto before = buffers.load();
+    auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (buffers - before < 3 && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(10ms);
+    }
+    return buffers - before >= 3;
+  };
+  REQUIRE(receives());
+  for (int round = 0; round < 5; round++) {
+    gst_element_send_event(src, gst_event_new_flush_start());
+    gst_element_send_event(src, gst_event_new_flush_stop(TRUE));
+    REQUIRE(receives());
+  }
+
+  gst_element_set_state(consumer, GST_STATE_NULL);
+  gst_object_unref(src);
+  gst_object_unref(consumer);
+  gst_element_set_state(producer, GST_STATE_NULL);
+  gst_object_unref(producer);
+}
+
+/**
  * An upstream event forwarded from a consumer is still inside the producer (held by a pad probe) when the producer is
  * disposed: tearing the producer down must wait for that forward to return instead of freeing the node under it.
  */
