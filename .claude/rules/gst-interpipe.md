@@ -18,7 +18,8 @@ paths:
     same race (GStreamer's, unfixed up to main).
   - Don't key it on the pad's FLUSHING flag: basesrc calls `unlock_stop` for a flushing seek or
     FLUSH_STOP before the pad is unflushed, so that would wedge every flushing seek.
-    Tests: "An interpipe consumer keeps receiving after a flush" (fails 5/5 with that mutant).
+    No test guards this: element flush events from an app thread trip TSan lock-order reports
+    inside GStreamer (and can hang), so a CI test can't send them.
   - Tests: `tests/testGSTPlugin.cpp` "Stopping an interpipe consumer right after it starts ends it".
 - A CI hang's last log line doesn't name the hung test: the interpipe tests log nothing, so the hang
   can be several tests past the last test that logged.
