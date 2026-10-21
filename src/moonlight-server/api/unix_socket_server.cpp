@@ -7,6 +7,9 @@ using namespace wolf::core;
 
 constexpr auto SSE_KEEPALIVE_INTERVAL = std::chrono::seconds(15);
 constexpr std::size_t MAX_WRITE_QUEUE_BYTES = 64 * 1024 * 1024;
+// Headers + body of one request: the buffer used to be unbounded, so a huge Content-Length was read (or waited for)
+// in full instead of being refused
+constexpr std::size_t MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 
 std::string to_str(boost::asio::streambuf &streambuf, std::size_t start, std::size_t end) {
   return {buffers_begin(streambuf.data()) + start, buffers_begin(streambuf.data()) + start + end};
@@ -409,14 +412,48 @@ void UnixSocketServer::cleanup_sockets() {
 }
 
 void UnixSocketServer::send_http(std::shared_ptr<UnixSocket> socket, int status_code, std::string_view body) {
-  send_http(socket, status_code, {{"Content-Length: " + std::to_string(body.size())}}, body);
+  if (body.empty()) {
+    send_http(socket, status_code, {{"Content-Length: 0"}}, body);
+  } else { // Every non-empty reply sent through here is JSON
+    send_http(socket,
+              status_code,
+              {{"Content-Length: " + std::to_string(body.size())}, {"Content-Type: application/json"}},
+              body);
+  }
+}
+
+static std::string_view status_reason(int status_code) {
+  switch (status_code) {
+  case 200:
+    return "OK";
+  case 400:
+    return "Bad Request";
+  case 403:
+    return "Forbidden";
+  case 404:
+    return "Not Found";
+  case 409:
+    return "Conflict";
+  case 413:
+    return "Payload Too Large";
+  case 500:
+    return "Internal Server Error";
+  case 501:
+    return "Not Implemented";
+  default:
+    return "Unknown";
+  }
 }
 
 void UnixSocketServer::send_http(std::shared_ptr<UnixSocket> socket,
                                  int status_code,
                                  const std::vector<std::string_view> &http_headers,
                                  std::string_view body) {
-  auto http_reply = fmt::format("HTTP/1.0 {} OK\r\n{}\r\n\r\n{}", status_code, fmt::join(http_headers, "\r\n"), body);
+  auto http_reply = fmt::format("HTTP/1.0 {} {}\r\n{}\r\n\r\n{}",
+                                status_code,
+                                status_reason(status_code),
+                                fmt::join(http_headers, "\r\n"),
+                                body);
   send_data(socket, std::move(http_reply));
 }
 
@@ -497,7 +534,7 @@ void UnixSocketServer::handle_request(const HTTPRequest &req, std::shared_ptr<Un
 }
 
 void UnixSocketServer::start_connection(std::shared_ptr<UnixSocket> socket) {
-  auto request_buf = std::make_shared<boost::asio::streambuf>(std::numeric_limits<std::size_t>::max());
+  auto request_buf = std::make_shared<boost::asio::streambuf>(MAX_REQUEST_BYTES);
   boost::asio::async_read_until(
       socket->socket,
       *request_buf,
@@ -526,7 +563,10 @@ void UnixSocketServer::start_connection(std::shared_ptr<UnixSocket> socket) {
 
         if (req.headers.contains("Transfer-Encoding") && req.headers.find("Transfer-Encoding")->second == "chunked") {
           logs::log(logs::error, "[API] Chunked encoding not supported, use HTTP/1.0 instead");
-          send_http(socket, 500, "Chunked encoding not supported, use HTTP/1.0 instead");
+          send_http(
+              socket,
+              501,
+              rfl::json::write(GenericErrorResponse{.error = "Chunked encoding not supported, use HTTP/1.0 instead"}));
           return;
         }
 
@@ -534,13 +574,13 @@ void UnixSocketServer::start_connection(std::shared_ptr<UnixSocket> socket) {
         if (req.headers.contains("Content-Length")) {
           auto parsed_content_length = utils::to_size_t(req.headers.find("Content-Length")->second);
           if (!parsed_content_length) {
-            send_http(socket, 400, "Invalid Content-Length");
+            send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Invalid Content-Length"}));
             return;
           }
           auto content_length = *parsed_content_length;
           std::size_t num_additional_bytes = request_buf->size() - bytes_transferred;
-          if (content_length > request_buf->max_size()) {
-            send_http(socket, 413, "Payload Too Large");
+          if (content_length > request_buf->max_size() - bytes_transferred) {
+            send_http(socket, 413, rfl::json::write(GenericErrorResponse{.error = "Payload Too Large"}));
             return;
           } else if (content_length > num_additional_bytes) {
             boost::asio::async_read(socket->socket,

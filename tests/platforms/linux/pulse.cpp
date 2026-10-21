@@ -219,6 +219,10 @@ TEST_CASE("PulseAudio virtual sinks", "[PULSE]") {
     // name, which the app (PULSE_SINK) and Wolf's pulsesrc attach to; "<name>.2" left them on the leftover
     auto same_client = create_sink(server, reclaimed_name);
     auto live = create_sink(server, fmt::format("{}5678", sessions::VIRTUAL_SINK_PREFIX));
+    // The reclaim loads only once PulseAudio reports the leftover gone (polled on a timer, which settle doesn't wait
+    // for): wait for the load itself, or a slow CI runner checks before it happened
+    REQUIRE(same_client->sink_idx_fut.wait_for(boost::chrono::seconds(3)) == boost::future_status::ready);
+    REQUIRE(live->sink_idx_fut.wait_for(boost::chrono::seconds(3)) == boost::future_status::ready);
     settle(server);
     REQUIRE(sink_exists(server, reclaimed_name));
     REQUIRE_FALSE(sink_exists(server, fmt::format("{}.2", reclaimed_name)));
@@ -234,6 +238,10 @@ TEST_CASE("PulseAudio virtual sinks", "[PULSE]") {
     // ...and the sink under the reclaimed name is the new session's own, not the leftover
     audio::delete_virtual_sink(server, same_client);
     settle(server);
+    // PulseAudio acks an unload before the sink is gone: give it a moment
+    for (int i = 0; i < 100 && sink_exists(server, reclaimed_name); i++) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
     REQUIRE_FALSE(sink_exists(server, reclaimed_name));
   }
 
