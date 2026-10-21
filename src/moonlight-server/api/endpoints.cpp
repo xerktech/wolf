@@ -817,7 +817,10 @@ void UnixSocketServer::endpoint_GetIcon(const HTTPRequest &req, std::shared_ptr<
       send_http(socket,
                 200,
                 {"Content-Length: " + std::to_string(icon->size()),
-                 "Content-Type: " + utils::image_mime_type(icon.value()).value_or("image/png")},
+                 "Content-Type: " + utils::image_mime_type(icon.value()).value_or("image/png"),
+                 // An SVG can carry scripts: never let a browser that reaches this run them or sniff another type
+                 "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox",
+                 "X-Content-Type-Options: nosniff"},
                 icon.value());
     } else {
       auto res = GenericErrorResponse{.error = "Icon not found"};

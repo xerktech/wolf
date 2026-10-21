@@ -550,6 +550,54 @@ TEST_CASE("control: joypad feedback reaches the resumed stream's client", "[ENET
 }
 
 /*
+ * Feedback is sent from a device thread while the control thread may sit in its socket wait: send_packet flushes it
+ * right away. Without that it waited for the control loop's next service, ~hundreds of ms at the production timeout
+ * (the other tests run run_control at 10 ms, where that delay hides).
+ */
+TEST_CASE("control: joypad feedback leaves at once at the production timeout", "[ENET]") {
+  using wolf::core::events::StreamSession;
+  using namespace std::chrono_literals;
+  constexpr int port = 47992;
+  const std::string key = "EDF04A215C4FBEA20934120C8480D855";
+  StreamSession session{.session_id = 43};
+  session.enet_secret_payload = 1;
+  session.aes_key = key;
+  session.ip = "10.255.255.1"; // never matches loopback, keep the IP fallback out of the way
+
+  auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
+  state::SessionsAtoms running_sessions =
+      std::make_shared<immer::atom<immer::vector<StreamSession>>>(immer::vector{session});
+  REQUIRE(control::init());
+  std::thread([=] { control::run_control(port, running_sessions, event_bus, 20, 1000ms, "127.0.0.1"); }).detach();
+  std::this_thread::sleep_for(200ms);
+
+  TestENetClient client(port, 1);
+  client.service(100ms);
+  client.send_idr(key, 0, ControlEncryption::V1);
+  client.service(1500ms); // let the control loop go back to its (long) wait
+
+  std::vector<std::chrono::steady_clock::duration> latencies;
+  for (int i = 0; i < 5; i++) {
+    auto received = client.received_packets.size();
+    auto sent_at = std::chrono::steady_clock::now();
+    if (auto feedback = session.control_feedback->load(); feedback->send) {
+      feedback->send(fmt::format("rumble {}", i));
+    }
+    while (client.received_packets.size() == received && std::chrono::steady_clock::now() - sent_at < 2s) {
+      client.service(1ms);
+    }
+    REQUIRE(client.received_packets.size() == received + 1);
+    latencies.push_back(std::chrono::steady_clock::now() - sent_at);
+    client.service(300ms);
+  }
+  std::sort(latencies.begin(), latencies.end());
+  // The median: one slow send on a loaded runner is fine, a missing flush makes them all slow
+  REQUIRE(latencies[2] < 100ms);
+  client.disconnect();
+  client.service(200ms);
+}
+
+/*
  * ENet isn't thread-safe: joypad feedback is sent from inputtino's device threads while the control thread services
  * the same host (XERK-2101). A data race corrupts ENet's packet lists only now and then, so this fails reliably only
  * under ThreadSanitizer; otherwise it checks that every packet arrives once, in order, and in send_seq order.

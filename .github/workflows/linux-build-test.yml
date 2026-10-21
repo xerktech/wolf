@@ -4,11 +4,11 @@ on:
   push:
     paths-ignore:
       - "docs/**"
-      - "docker/**"
+      - "docker/*" # not docker/patches/**: the test job applies those
   pull_request:
     paths-ignore:
       - "docs/**"
-      - "docker/**"
+      - "docker/*" # not docker/patches/**: the test job applies those
 
 env:
   GST_WAYLAND_COMMIT: 016b4fc

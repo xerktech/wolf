@@ -128,5 +128,7 @@ paths:
   - `run_control` never blocks inside `enet_host_service` (timeout 0 under the lock); it waits on the socket
     outside the lock, capped at `max_unlocked_wait` so ENet's retransmit and ping timers still run.
   - `send_seq++` and the send share one lock, so the wire order is the seq order.
+  - `send_packet` flushes each send: the control thread may be in its socket wait, so unflushed feedback
+    leaves only on its next service. Tests: "control: joypad feedback leaves at once at the production timeout".
   - Only ThreadSanitizer catches a missing lock (dozens of races); the seq order fails without it.
     Tests: "control: joypad feedback sent while the client streams input arrives intact".

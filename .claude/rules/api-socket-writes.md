@@ -45,6 +45,8 @@ paths:
   checks them in an encrypted `audio_session`. The audio payloader can't run without a 16-byte key (an empty
   `aes_key=` reaches it as NULL); it now errors out the stream, the API must not let one reach it.
 - `apps/add` with an id already in use is 409, checked inside the profiles update for the same reason.
+- The 3-argument `send_http` labels every non-empty body `application/json`: send other content types
+  (icons, SSE) through the overload with explicit headers. The status line's reason follows the code.
 - A malformed id or a body that doesn't parse is 400, a well-formed but unknown id 404, a wrong lobby PIN 403,
   a full lobby 409; 500 is for Wolf's own failures (a save that failed, a timeout).
 - Lobby joins and leaves are serialised by `membership_lock` in `setup_lobbies_handlers`: a join reads the

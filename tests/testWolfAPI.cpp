@@ -2050,6 +2050,43 @@ TEST_CASE("Utils APIs", "[API]") {
     REQUIRE_THAT(content_type, Equals("image/svg+xml"));
   }
 
+  { // An SVG may carry scripts: a browser must not run them; errors are labelled JSON with a matching reason
+    std::string headers;
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, &headers);
+    curl_easy_setopt(
+        curl.get(),
+        CURLOPT_HEADERFUNCTION,
+        static_cast<size_t (*)(char *, size_t, size_t, void *)>([](char *ptr, size_t size, size_t nmemb, void *buf) {
+          *(static_cast<std::string *>(buf)) += std::string{ptr, size * nmemb};
+          return size * nmemb;
+        }));
+    auto response =
+        req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/utils/get-icon?icon_path=" + svg_path.string());
+    REQUIRE(response);
+    REQUIRE_THAT(headers, ContainsSubstring("HTTP/1.0 200 OK\r\n"));
+    REQUIRE_THAT(
+        headers,
+        ContainsSubstring("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox\r\n"));
+    REQUIRE_THAT(headers, ContainsSubstring("X-Content-Type-Options: nosniff\r\n"));
+
+    headers.clear();
+    response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/utils/get-icon?icon_path=/etc/passwd");
+    REQUIRE(response);
+    REQUIRE(response->first == 404);
+    REQUIRE_THAT(headers, ContainsSubstring("HTTP/1.0 404 Not Found\r\n"));
+    REQUIRE_THAT(headers, ContainsSubstring("Content-Type: application/json\r\n"));
+
+    headers.clear();
+    response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/no-such-endpoint");
+    REQUIRE(response);
+    REQUIRE(response->first == 404);
+    REQUIRE_THAT(headers, ContainsSubstring("HTTP/1.0 404 Not Found\r\n"));
+    REQUIRE_THAT(headers, !ContainsSubstring("Content-Type"));
+
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERFUNCTION, nullptr);
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, nullptr);
+  }
+
   for (const auto &path : {key_path.string(), std::string("/etc/passwd"), std::string("config.test.toml")}) {
     auto response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/utils/get-icon?icon_path=" + path);
     REQUIRE(response);
