@@ -207,6 +207,10 @@ TEST_CASE("PulseAudio virtual sinks", "[PULSE]") {
     // ...and the sink under the reclaimed name is the new session's own, not the leftover
     audio::delete_virtual_sink(server, same_client);
     settle(server);
+    // PulseAudio acks an unload before the sink is gone: give it a moment
+    for (int i = 0; i < 100 && sink_exists(server, reclaimed_name); i++) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
     REQUIRE_FALSE(sink_exists(server, reclaimed_name));
   }
 

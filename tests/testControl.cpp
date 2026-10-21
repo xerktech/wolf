@@ -550,9 +550,10 @@ TEST_CASE("control: joypad feedback reaches the resumed stream's client", "[ENET
 }
 
 /*
- * Feedback is sent from a device thread while the control thread may sit in its socket wait: send_packet flushes it
- * right away. Without that it waited for the control loop's next service, ~hundreds of ms at the production timeout
- * (the other tests run run_control at 10 ms, where that delay hides).
+ * Feedback is sent from a device thread while the control thread may sit in its socket wait (up to the 1000 ms
+ * production timeout). Two things get it out promptly: send_packet's flush (~0.2 ms) and the max_unlocked_wait cap on
+ * that wait (<= 10 ms). Either alone keeps this under its bound, so it fails only when both are gone; the other tests
+ * run run_control at 10 ms, where neither matters.
  */
 TEST_CASE("control: joypad feedback leaves at once at the production timeout", "[ENET]") {
   using wolf::core::events::StreamSession;

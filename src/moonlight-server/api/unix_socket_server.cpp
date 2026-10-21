@@ -7,6 +7,9 @@ using namespace wolf::core;
 
 constexpr auto SSE_KEEPALIVE_INTERVAL = std::chrono::seconds(15);
 constexpr std::size_t MAX_WRITE_QUEUE_BYTES = 64 * 1024 * 1024;
+// Headers + body of one request: the buffer used to be unbounded, so a huge Content-Length was read (or waited for)
+// in full instead of being refused
+constexpr std::size_t MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 
 std::string to_str(boost::asio::streambuf &streambuf, std::size_t start, std::size_t end) {
   return {buffers_begin(streambuf.data()) + start, buffers_begin(streambuf.data()) + start + end};
@@ -531,7 +534,7 @@ void UnixSocketServer::handle_request(const HTTPRequest &req, std::shared_ptr<Un
 }
 
 void UnixSocketServer::start_connection(std::shared_ptr<UnixSocket> socket) {
-  auto request_buf = std::make_shared<boost::asio::streambuf>(std::numeric_limits<std::size_t>::max());
+  auto request_buf = std::make_shared<boost::asio::streambuf>(MAX_REQUEST_BYTES);
   boost::asio::async_read_until(
       socket->socket,
       *request_buf,
@@ -576,7 +579,7 @@ void UnixSocketServer::start_connection(std::shared_ptr<UnixSocket> socket) {
           }
           auto content_length = *parsed_content_length;
           std::size_t num_additional_bytes = request_buf->size() - bytes_transferred;
-          if (content_length > request_buf->max_size()) {
+          if (content_length > request_buf->max_size() - bytes_transferred) {
             send_http(socket, 413, rfl::json::write(GenericErrorResponse{.error = "Payload Too Large"}));
             return;
           } else if (content_length > num_additional_bytes) {
