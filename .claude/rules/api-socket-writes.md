@@ -47,7 +47,7 @@ paths:
 - `apps/add` with an id already in use is 409, checked inside the profiles update for the same reason.
 - A request (headers + body) is capped at `MAX_REQUEST_BYTES` by the read buffer's max size; a larger
   Content-Length gets 413 before any body is read. Never make the buffer unbounded again: it read or waited
-  for any length, growing quadratically. Tests: "API refuses requests it can't read, with a JSON error".
+  for any length, growing quadratically. Tests: "API refuses requests it can't read with a JSON error".
 - The 3-argument `send_http` labels every non-empty body `application/json`: send other content types
   (icons, SSE) through the overload with explicit headers. The status line's reason follows the code.
 - A malformed id or a body that doesn't parse is 400, a well-formed but unknown id 404, a wrong lobby PIN 403,

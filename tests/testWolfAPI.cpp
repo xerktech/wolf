@@ -2306,7 +2306,7 @@ TEST_CASE("SSE APIs large events", "[API]") {
   REQUIRE(drained < 80 * big_event.container_id.size());
 }
 
-TEST_CASE("API refuses requests it can't read, with a JSON error", "[API]") {
+TEST_CASE("API refuses requests it can't read with a JSON error", "[API]") {
   auto event_bus = std::make_shared<events::EventBusType>();
   auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
   auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
@@ -2360,6 +2360,15 @@ TEST_CASE("API refuses requests it can't read, with a JSON error", "[API]") {
                     "Invalid Content-Length");
   // Refused at once, not read (or waited for) in full
   expect_json_error(raw("POST /api/v1/apps/add HTTP/1.0\r\nContent-Length: 99999999999999\r\n\r\n"),
+                    "HTTP/1.0 413 Payload Too Large\r\n",
+                    "Payload Too Large");
+  // The cap (MAX_REQUEST_BYTES, 64 MiB) counts the headers too: a body one byte over what's left is refused, never
+  // read into the buffer (which then overflowed when the body was copied out)
+  auto headers = [](std::size_t length) {
+    return fmt::format("POST /api/v1/apps/add HTTP/1.0\r\nContent-Length: {:010}\r\n\r\n", length);
+  };
+  constexpr std::size_t cap = 64 * 1024 * 1024;
+  expect_json_error(raw(headers(cap - headers(0).size() + 1)),
                     "HTTP/1.0 413 Payload Too Large\r\n",
                     "Payload Too Large");
 }
