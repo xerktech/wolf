@@ -1,5 +1,6 @@
 #include "storm.hpp"
 #include <api/api.hpp>
+#include <array>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <core/docker.hpp>
@@ -2050,6 +2051,43 @@ TEST_CASE("Utils APIs", "[API]") {
     REQUIRE_THAT(content_type, Equals("image/svg+xml"));
   }
 
+  { // An SVG may carry scripts: a browser must not run them; errors are labelled JSON with a matching reason
+    std::string headers;
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, &headers);
+    curl_easy_setopt(
+        curl.get(),
+        CURLOPT_HEADERFUNCTION,
+        static_cast<size_t (*)(char *, size_t, size_t, void *)>([](char *ptr, size_t size, size_t nmemb, void *buf) {
+          *(static_cast<std::string *>(buf)) += std::string{ptr, size * nmemb};
+          return size * nmemb;
+        }));
+    auto response =
+        req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/utils/get-icon?icon_path=" + svg_path.string());
+    REQUIRE(response);
+    REQUIRE_THAT(headers, ContainsSubstring("HTTP/1.0 200 OK\r\n"));
+    REQUIRE_THAT(
+        headers,
+        ContainsSubstring("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox\r\n"));
+    REQUIRE_THAT(headers, ContainsSubstring("X-Content-Type-Options: nosniff\r\n"));
+
+    headers.clear();
+    response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/utils/get-icon?icon_path=/etc/passwd");
+    REQUIRE(response);
+    REQUIRE(response->first == 404);
+    REQUIRE_THAT(headers, ContainsSubstring("HTTP/1.0 404 Not Found\r\n"));
+    REQUIRE_THAT(headers, ContainsSubstring("Content-Type: application/json\r\n"));
+
+    headers.clear();
+    response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/no-such-endpoint");
+    REQUIRE(response);
+    REQUIRE(response->first == 404);
+    REQUIRE_THAT(headers, ContainsSubstring("HTTP/1.0 404 Not Found\r\n"));
+    REQUIRE_THAT(headers, !ContainsSubstring("Content-Type"));
+
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERFUNCTION, nullptr);
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, nullptr);
+  }
+
   for (const auto &path : {key_path.string(), std::string("/etc/passwd"), std::string("config.test.toml")}) {
     auto response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/utils/get-icon?icon_path=" + path);
     REQUIRE(response);
@@ -2266,6 +2304,73 @@ TEST_CASE("SSE APIs large events", "[API]") {
   }
   REQUIRE(ec == boost::asio::error::eof);
   REQUIRE(drained < 80 * big_event.container_id.size());
+}
+
+TEST_CASE("API refuses requests it can't read with a JSON error", "[API]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .running_sessions = running_sessions});
+  auto socket_path = api_socket_path();
+  start_api_server(app_state);
+
+  // Raw requests: curl won't send a lying Content-Length. Returns what the server answered within 5 s.
+  auto raw = [&](const std::string &request) {
+    boost::asio::io_context ctx;
+    boost::asio::local::stream_protocol::socket client(ctx);
+    client.connect(boost::asio::local::stream_protocol::endpoint(socket_path));
+    boost::asio::write(client, boost::asio::buffer(request));
+    std::string reply;
+    std::array<char, 4096> chunk{};
+    boost::system::error_code ec;
+    pollfd fd{.fd = client.native_handle(), .events = POLLIN};
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!ec && std::chrono::steady_clock::now() < deadline) {
+      if (poll(&fd, 1, 100) > 0) {
+        reply.append(chunk.data(), client.read_some(boost::asio::buffer(chunk), ec));
+      }
+      auto end_of_headers = reply.find("\r\n\r\n");
+      auto length = reply.find("Content-Length: ");
+      if (end_of_headers != std::string::npos && length != std::string::npos &&
+          reply.size() >= end_of_headers + 4 + std::stoul(reply.substr(length + 16))) {
+        break;
+      }
+    }
+    return reply;
+  };
+  auto expect_json_error = [](const std::string &reply, std::string_view status_line, std::string_view error) {
+    INFO(reply);
+    REQUIRE(reply.starts_with(status_line));
+    REQUIRE_THAT(reply, ContainsSubstring("Content-Type: application/json\r\n"));
+    auto body = rfl::json::read<GenericErrorResponse>(reply.substr(reply.find("\r\n\r\n") + 4));
+    REQUIRE(body);
+    REQUIRE(body->error == error);
+  };
+
+  expect_json_error(raw("POST /api/v1/apps/add HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"),
+                    "HTTP/1.0 501 Not Implemented\r\n",
+                    "Chunked encoding not supported, use HTTP/1.0 instead");
+  expect_json_error(raw("POST /api/v1/apps/add HTTP/1.0\r\nContent-Length: -1\r\n\r\n"),
+                    "HTTP/1.0 400 Bad Request\r\n",
+                    "Invalid Content-Length");
+  // Refused at once, not read (or waited for) in full
+  expect_json_error(raw("POST /api/v1/apps/add HTTP/1.0\r\nContent-Length: 99999999999999\r\n\r\n"),
+                    "HTTP/1.0 413 Payload Too Large\r\n",
+                    "Payload Too Large");
+  // The cap (MAX_REQUEST_BYTES, 64 MiB) counts the headers too: a body one byte over what's left is refused, never
+  // read into the buffer (which then overflowed when the body was copied out)
+  auto headers = [](std::size_t length) {
+    return fmt::format("POST /api/v1/apps/add HTTP/1.0\r\nContent-Length: {:010}\r\n\r\n", length);
+  };
+  constexpr std::size_t cap = 64 * 1024 * 1024;
+  expect_json_error(raw(headers(cap - headers(0).size() + 1)),
+                    "HTTP/1.0 413 Payload Too Large\r\n",
+                    "Payload Too Large");
 }
 
 TEST_CASE("API reports a config change that couldn't be saved", "[API]") {

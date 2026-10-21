@@ -68,7 +68,10 @@ void UnixSocketServer::endpoint_Pair(const HTTPRequest &req, std::shared_ptr<Uni
       send_http(socket, 404, rfl::json::write(res));
     }
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, event.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              event.error().what());
     auto res = GenericErrorResponse{.error = event.error().what()};
     send_http(socket, 400, rfl::json::write(res));
   }
@@ -169,7 +172,10 @@ void UnixSocketServer::endpoint_AddApp(const HTTPRequest &req, std::shared_ptr<U
     }
     send_http(socket, 200, rfl::json::write(GenericSuccessResponse{.success = true}));
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, app.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              app.error().what());
     auto res = GenericErrorResponse{.error = app.error().what()};
     send_http(socket, 400, rfl::json::write(res));
   }
@@ -201,7 +207,10 @@ void UnixSocketServer::endpoint_RemoveApp(const HTTPRequest &req, std::shared_pt
     }
     send_http(socket, 200, rfl::json::write(GenericSuccessResponse{.success = true}));
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, app.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              app.error().what());
     auto res = GenericErrorResponse{.error = app.error().what()};
     send_http(socket, 400, rfl::json::write(res));
   }
@@ -233,7 +242,10 @@ void UnixSocketServer::endpoint_AddProfile(const HTTPRequest &req, std::shared_p
     }
     send_http(socket, 200, rfl::json::write(GenericSuccessResponse{.success = true}));
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, profile_req.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              profile_req.error().what());
     auto res = GenericErrorResponse{.error = profile_req.error().what()};
     send_http(socket, 400, rfl::json::write(res));
   }
@@ -256,7 +268,10 @@ void UnixSocketServer::endpoint_RemoveProfile(const HTTPRequest &req, std::share
     }
     send_http(socket, 200, rfl::json::write(GenericSuccessResponse{.success = true}));
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, profile_req.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              profile_req.error().what());
     auto res = GenericErrorResponse{.error = profile_req.error().what()};
     send_http(socket, 400, rfl::json::write(res));
   }
@@ -411,7 +426,10 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
                                     .rtsp_encrypted = new_session->rtsp_encrypted};
     send_http(socket, 200, rfl::json::write(res));
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, session.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              session.error().what());
     auto res = GenericErrorResponse{.error = session.error().what()};
     send_http(socket, 400, rfl::json::write(res));
   }
@@ -463,7 +481,10 @@ void UnixSocketServer::endpoint_StreamSessionStart(const HTTPRequest &req, std::
       send_http(socket, 404, rfl::json::write(res));
     }
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, start_req.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              start_req.error().what());
     auto res = GenericErrorResponse{.error = start_req.error().what()};
     send_http(socket, 400, rfl::json::write(res));
   }
@@ -491,7 +512,10 @@ void UnixSocketServer::endpoint_StreamSessionPause(const HTTPRequest &req, std::
       send_http(socket, 404, rfl::json::write(res));
     }
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, session.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              session.error().what());
     auto res = GenericErrorResponse{.error = session.error().what()};
     send_http(socket, 400, rfl::json::write(res));
   }
@@ -520,7 +544,10 @@ void UnixSocketServer::endpoint_StreamSessionStop(const HTTPRequest &req, std::s
       send_http(socket, 404, rfl::json::write(res));
     }
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, session.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              session.error().what());
     auto res = GenericErrorResponse{.error = session.error().what()};
     send_http(socket, 400, rfl::json::write(res));
   }
@@ -549,7 +576,10 @@ void UnixSocketServer::endpoint_StreamSessionHandleInput(const HTTPRequest &req,
       send_http(socket, 404, rfl::json::write(GenericErrorResponse{.error = "Invalid session_id"}));
     }
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, input_request.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              input_request.error().what());
     send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = input_request.error().what()}));
   }
 }
@@ -629,7 +659,10 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
       send_http(socket, 200, rfl::json::write(res));
     }
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, event.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              event.error().what());
     send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = event.error().what()}));
   }
 }
@@ -685,7 +718,10 @@ void UnixSocketServer::endpoint_LobbyJoin(const wolf::api::HTTPRequest &req, std
       send_http(socket, 200, rfl::json::write(GenericSuccessResponse{}));
     }
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, event.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              event.error().what());
     send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = event.error().what()}));
   }
 }
@@ -696,7 +732,10 @@ void UnixSocketServer::endpoint_LobbyLeave(const wolf::api::HTTPRequest &req, st
     state_->app_state->event_bus->fire_event(immer::box<events::LeaveLobbyEvent>(event.value()));
     send_http(socket, 200, rfl::json::write(GenericSuccessResponse{}));
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, event.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              event.error().what());
     send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = event.error().what()}));
   }
 }
@@ -712,7 +751,10 @@ void UnixSocketServer::endpoint_LobbyStop(const wolf::api::HTTPRequest &req, std
     state_->app_state->event_bus->fire_event(immer::box<events::StopLobbyEvent>(event.value()));
     send_http(socket, 200, rfl::json::write(GenericSuccessResponse{}));
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, event.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              event.error().what());
     send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = event.error().what()}));
   }
 }
@@ -741,7 +783,10 @@ void UnixSocketServer::endpoint_RunnerStart(const wolf::api::HTTPRequest &req, s
                             .stream_session = std::make_shared<events::StreamSession>(*session)}));
     send_http(socket, 200, rfl::json::write(GenericSuccessResponse{.success = true}));
   } else {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, event.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              event.error().what());
     auto res = GenericErrorResponse{.error = event.error().what()};
     send_http(socket, 400, rfl::json::write(res));
   }
@@ -817,7 +862,10 @@ void UnixSocketServer::endpoint_GetIcon(const HTTPRequest &req, std::shared_ptr<
       send_http(socket,
                 200,
                 {"Content-Length: " + std::to_string(icon->size()),
-                 "Content-Type: " + utils::image_mime_type(icon.value()).value_or("image/png")},
+                 "Content-Type: " + utils::image_mime_type(icon.value()).value_or("image/png"),
+                 // An SVG can carry scripts: never let a browser that reaches this run them or sniff another type
+                 "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox",
+                 "X-Content-Type-Options: nosniff"},
                 icon.value());
     } else {
       auto res = GenericErrorResponse{.error = "Icon not found"};
@@ -846,7 +894,10 @@ void UnixSocketServer::endpoint_DockerInspectImage(const HTTPRequest &req, std::
 void UnixSocketServer::endpoint_DockerPullImage(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto input_payload = rfl::json::read<DockerPullImageRequest>(req.body);
   if (!input_payload) {
-    logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, input_payload.error().what());
+    logs::log(logs::warning,
+              "[API] Invalid event: {} - {}",
+              std::string_view(req.body).substr(0, 1024),
+              input_payload.error().what());
     send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = input_payload.error().what()}));
     return;
   }

@@ -183,7 +183,7 @@ id = 'moonlight-profile-id'
 
     [[profiles.apps]]
     title = 'Test ball'
-    icon_png_path = "https://raw.githubusercontent.com/games-on-whales/wolf/refs/heads/stable/docs/images/test_ball_icon.png"
+    icon_png_path = "https://raw.githubusercontent.com/games-on-whales/wolf/cb4fa4d71d40912f4485226d19895956845da030/docs/images/test_ball_icon.png"
     start_audio_server = false
     start_virtual_compositor = false
 
