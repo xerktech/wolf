@@ -1,0 +1,124 @@
+gst-interpipe: fix a hang when a live consumer is stopped right after it starts
+
+Applies on top of gst-interpipe-teardown-race.patch (the patches apply in
+name order). Wolf ticket XERK-2130.
+
+A live GstBaseSrc going to PLAYING defers an unlock_stop to its streaming
+thread, which runs it just before the next create (pending_unlock_stop in
+gstbasesrc.c, unchanged up to GStreamer main). If the source is set to NULL
+before that thread gets there, the deferred unlock_stop can run after the
+deactivation's unlock and clear appsrc's flushing flag again. appsrc's create
+then waits forever holding the stream lock, and the state change to NULL
+blocks on that lock forever: the pipeline, its thread and the caller hang.
+
+Plain `appsrc is-live=true` has the same race, so this is GStreamer's, but
+every interpipesrc consumer (is-live=true) is exposed to it. interpipesrc now
+serializes unlock and unlock_stop, and drops an unlock_stop that finds its pad
+already in mode NONE: deactivation sets that before it unlocks, while
+activation and flush-stop set the pad active before they call unlock_stop.
+
+diff --git a/gst/interpipe/gstinterpipesrc.c b/gst/interpipe/gstinterpipesrc.c
+index 675eff8..9ef0cea 100644
+--- a/gst/interpipe/gstinterpipesrc.c
++++ b/gst/interpipe/gstinterpipesrc.c
+@@ -93,6 +93,8 @@ static gboolean gst_inter_pipe_src_listen_node (GstInterPipeSrc * src,
+     const gchar * node_name);
+ static gboolean gst_inter_pipe_src_start (GstBaseSrc * base);
+ static gboolean gst_inter_pipe_src_stop (GstBaseSrc * base);
++static gboolean gst_inter_pipe_src_unlock (GstBaseSrc * base);
++static gboolean gst_inter_pipe_src_unlock_stop (GstBaseSrc * base);
+ static gboolean gst_inter_pipe_src_event (GstBaseSrc * base, GstEvent * event);
+ static gboolean gst_inter_pipe_src_query (GstBaseSrc * base, GstQuery * query);
+ static void gst_inter_pipe_ilistener_init (GstInterPipeIListenerInterface *
+@@ -143,6 +145,9 @@ struct _GstInterPipeSrc
+    * popped by ours */
+   GMutex pending_serial_events_mutex;
+ 
++  /* Serializes unlock against unlock_stop, see gst_inter_pipe_src_unlock_stop */
++  GMutex unlock_mutex;
++
+   /* Block switch */
+   gboolean block_switch;
+ 
+@@ -230,6 +235,9 @@ gst_inter_pipe_src_class_init (GstInterPipeSrcClass * klass)
+ 
+   basesrc_class->start = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_start);
+   basesrc_class->stop = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_stop);
++  basesrc_class->unlock = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_unlock);
++  basesrc_class->unlock_stop =
++      GST_DEBUG_FUNCPTR (gst_inter_pipe_src_unlock_stop);
+   basesrc_class->event = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_event);
+   basesrc_class->query = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_query);
+   basesrc_class->create = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_create);
+@@ -244,6 +252,7 @@ gst_inter_pipe_src_init (GstInterPipeSrc * src)
+   src->listening = FALSE;
+   src->pending_serial_events = g_queue_new ();
+   g_mutex_init (&src->pending_serial_events_mutex);
++  g_mutex_init (&src->unlock_mutex);
+   src->block_switch = FALSE;
+   src->allow_renegotiation = TRUE;
+   src->first_switch = TRUE;
+@@ -380,6 +389,7 @@ gst_inter_pipe_src_finalize (GObject * object)
+   g_queue_free_full (src->pending_serial_events,
+       (GDestroyNotify) gst_event_unref);
+   g_mutex_clear (&src->pending_serial_events_mutex);
++  g_mutex_clear (&src->unlock_mutex);
+ 
+   if (src->listen_to) {
+     g_free (src->listen_to);
+@@ -452,6 +462,55 @@ gst_inter_pipe_src_stop (GstBaseSrc * base)
+   return basesrc_class->stop (base);
+ }
+ 
++static gboolean
++gst_inter_pipe_src_unlock (GstBaseSrc * base)
++{
++  GstInterPipeSrc *src;
++  gboolean ret;
++
++  src = GST_INTER_PIPE_SRC (base);
++
++  g_mutex_lock (&src->unlock_mutex);
++  ret = GST_BASE_SRC_CLASS (gst_inter_pipe_src_parent_class)->unlock (base);
++  g_mutex_unlock (&src->unlock_mutex);
++
++  return ret;
++}
++
++/* A live basesrc going to PLAYING defers an unlock_stop to its streaming
++ * thread, which runs it right before the next create. If the source is
++ * deactivated before that, the deferred unlock_stop can land after the
++ * deactivation's unlock and undo it: create then waits forever while holding
++ * the stream lock, and the state change to NULL hangs waiting for that lock.
++ * Deactivation sets the pad mode to NONE before it unlocks, so an unlock_stop
++ * that finds the pad in mode NONE is stale and is dropped. */
++static gboolean
++gst_inter_pipe_src_unlock_stop (GstBaseSrc * base)
++{
++  GstInterPipeSrc *src;
++  GstPad *srcpad;
++  gboolean deactivating;
++  gboolean ret = TRUE;
++
++  src = GST_INTER_PIPE_SRC (base);
++  srcpad = GST_BASE_SRC_PAD (base);
++
++  g_mutex_lock (&src->unlock_mutex);
++  GST_OBJECT_LOCK (srcpad);
++  deactivating = GST_PAD_MODE (srcpad) == GST_PAD_MODE_NONE;
++  GST_OBJECT_UNLOCK (srcpad);
++
++  if (deactivating)
++    GST_DEBUG_OBJECT (src, "Pad is deactivating, ignoring stale unlock stop");
++  else
++    ret =
++        GST_BASE_SRC_CLASS (gst_inter_pipe_src_parent_class)->unlock_stop
++        (base);
++  g_mutex_unlock (&src->unlock_mutex);
++
++  return ret;
++}
++
+ static gboolean
+ gst_inter_pipe_src_event (GstBaseSrc * base, GstEvent * event)
+ {
