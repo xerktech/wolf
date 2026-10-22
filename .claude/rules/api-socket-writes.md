@@ -45,9 +45,17 @@ paths:
   checks them in an encrypted `audio_session`. The audio payloader can't run without a 16-byte key (an empty
   `aes_key=` reaches it as NULL); it now errors out the stream, the API must not let one reach it.
 - `apps/add` with an id already in use is 409, checked inside the profiles update for the same reason.
-- A request (headers + body) is capped at `MAX_REQUEST_BYTES` by the read buffer's max size; a larger
-  Content-Length gets 413 before any body is read. Never make the buffer unbounded again: it read or waited
-  for any length, growing quadratically. Tests: "API refuses requests it can't read with a JSON error".
+- A request (headers + body) is capped at `MAX_REQUEST_BYTES`; a larger Content-Length gets 413 before any
+  body is read. Never make a read buffer unbounded again: it read or waited for any length, growing
+  quadratically. Tests: "API refuses requests it can't read with a JSON error".
+  - Headers alone are capped at `MAX_HEADER_BYTES` (431): every connection buffers them, so they must stay small.
+  - Bodies being read share `MAX_PENDING_BODY_BYTES` over all connections (503): a per-connection cap alone let
+    N connections hold N x 64 MiB. The body is read into a reserved string, so a bare Content-Length costs no RSS.
+  - Bytes already in the socket are read at once; a body that arrived whole never touches the budget, so idle
+    holders can't refuse normal requests.
+  - A body that needs an async read is checked and charged in full, never only what's left to read: charging the
+    rest let N connections each park a socket buffer outside the budget, and checking the rest let the counter
+    pass the limit and wrap. Tests: the 503 block of "API refuses requests it can't read with a JSON error".
 - The 3-argument `send_http` labels every non-empty body `application/json`: send other content types
   (icons, SSE) through the overload with explicit headers. The status line's reason follows the code.
 - A malformed id or a body that doesn't parse is 400, a well-formed but unknown id 404, a wrong lobby PIN 403,

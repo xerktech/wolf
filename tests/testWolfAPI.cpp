@@ -2324,10 +2324,11 @@ TEST_CASE("API refuses requests it can't read with a JSON error", "[API]") {
     boost::asio::io_context ctx;
     boost::asio::local::stream_protocol::socket client(ctx);
     client.connect(boost::asio::local::stream_protocol::endpoint(socket_path));
-    boost::asio::write(client, boost::asio::buffer(request));
+    // A refusal (431, 413) can close the socket before the whole request is written: read the reply anyway
+    boost::system::error_code write_ec, ec;
+    boost::asio::write(client, boost::asio::buffer(request), write_ec);
     std::string reply;
     std::array<char, 4096> chunk{};
-    boost::system::error_code ec;
     pollfd fd{.fd = client.native_handle(), .events = POLLIN};
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!ec && std::chrono::steady_clock::now() < deadline) {
@@ -2371,6 +2372,76 @@ TEST_CASE("API refuses requests it can't read with a JSON error", "[API]") {
   expect_json_error(raw(headers(cap - headers(0).size() + 1)),
                     "HTTP/1.0 413 Payload Too Large\r\n",
                     "Payload Too Large");
+
+  // Headers are buffered per connection before anything is known about the request: they get a small cap of their own
+  expect_json_error(raw("GET /api/v1/apps HTTP/1.0\r\nX-Filler: " + std::string(70 * 1024, 'a') + "\r\n\r\n"),
+                    "HTTP/1.0 431 Request Header Fields Too Large\r\n",
+                    "Request Header Fields Too Large");
+
+  // Bodies being read are capped over all connections (2 x 64 MiB), not only per connection: two clients that
+  // announce a body each and haven't sent all of it yet use up the budget, so a third body still to be read is refused
+  {
+    // Like raw(), but the body arrives after the headers were read: it needs the budget
+    auto split = [&](std::size_t length) {
+      boost::asio::io_context ctx;
+      boost::asio::local::stream_protocol::socket client(ctx);
+      client.connect(boost::asio::local::stream_protocol::endpoint(socket_path));
+      boost::asio::write(client, boost::asio::buffer(headers(length)));
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      boost::system::error_code write_ec, ec; // a 503 may have closed it: read the reply anyway
+      boost::asio::write(client, boost::asio::buffer(std::string(length, 'x')), write_ec);
+      std::string reply;
+      std::array<char, 4096> chunk{};
+      pollfd fd{.fd = client.native_handle(), .events = POLLIN};
+      while (!ec && poll(&fd, 1, 5000) > 0) {
+        reply.append(chunk.data(), client.read_some(boost::asio::buffer(chunk), ec));
+      }
+      return reply;
+    };
+    auto resident_bytes = []() {
+      std::ifstream statm("/proc/self/statm");
+      std::size_t size = 0, resident = 0;
+      statm >> size >> resident;
+      return resident * static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    };
+    auto rss_before = resident_bytes();
+
+    boost::asio::io_context ctx;
+    std::vector<boost::asio::local::stream_protocol::socket> holders;
+    for (int i = 0; i < 2; i++) {
+      auto &holder = holders.emplace_back(ctx);
+      holder.connect(boost::asio::local::stream_protocol::endpoint(socket_path));
+      // Part of the body arrives with the headers and is read at once: it counts too, or holders could each park
+      // a socket buffer's worth outside the budget
+      boost::asio::write(holder, boost::asio::buffer(headers(cap - 1024) + std::string(32 * 1024, 'x')));
+    }
+    // The server picks the holders' headers up asynchronously: retry until it has
+    std::string reply;
+    for (int attempt = 0; attempt < 50 && !reply.starts_with("HTTP/1.0 503"); attempt++) {
+      reply = split(4096);
+    }
+    expect_json_error(reply, "HTTP/1.0 503 Service Unavailable\r\n", "Too many large requests at once");
+    // The whole body is checked, not only what's left to read: these 2000 bytes would fit, the 34768 don't
+    expect_json_error(raw(headers(34768) + std::string(32768, 'x')),
+                      "HTTP/1.0 503 Service Unavailable\r\n",
+                      "Too many large requests at once");
+    // An announced body costs nothing until it arrives (its string is only reserved)
+    CHECK(resident_bytes() < rss_before + 32 * 1024 * 1024);
+
+    // A request that arrived whole needs nothing more read: idle holders must not block it
+    reply = raw(headers(4096) + std::string(4096, 'x'));
+    INFO(reply);
+    REQUIRE(reply.starts_with("HTTP/1.0 400 Bad Request\r\n")); // read in full: 'xxx...' isn't an app
+
+    // A client that goes away gives its share back
+    holders.clear();
+    reply.clear();
+    for (int attempt = 0; attempt < 50 && !reply.starts_with("HTTP/1.0 400"); attempt++) {
+      reply = split(4096);
+    }
+    INFO(reply);
+    REQUIRE(reply.starts_with("HTTP/1.0 400 Bad Request\r\n"));
+  }
 }
 
 TEST_CASE("API reports a config change that couldn't be saved", "[API]") {
