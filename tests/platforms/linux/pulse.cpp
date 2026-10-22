@@ -13,6 +13,7 @@
 #include <pulse/pulseaudio.h>
 #include <sessions/common.hpp>
 #include <sessions/handlers.hpp>
+#include <set>
 #include <state/config.hpp>
 #include <thread>
 #include <vector>
@@ -104,6 +105,35 @@ bool sink_exists(const std::shared_ptr<audio::Server> &server, const std::string
             delete query;
           } else if (info && info->name && query->name == info->name) {
             query->found = true;
+          }
+        },
+        query);
+    if (op) {
+      pa_operation_unref(op);
+    }
+  });
+  REQUIRE(result.wait_for(2s) == std::future_status::ready);
+  return result.get();
+}
+
+/** Record streams on the server: a running audio producer's pulsesrc is one */
+int source_outputs(const std::shared_ptr<audio::Server> &server) {
+  struct Query {
+    int count = 0;
+    std::promise<int> result;
+  };
+  auto query = new Query{};
+  auto result = query->result.get_future();
+  audio::queue_op(server, [server, query]() {
+    auto op = pa_context_get_source_output_info_list(
+        audio::context(server),
+        [](pa_context *, const pa_source_output_info *info, int eol, void *data) {
+          auto query = static_cast<Query *>(data);
+          if (eol) {
+            query->result.set_value(query->count);
+            delete query;
+          } else if (info) {
+            query->count++;
           }
         },
         query);
@@ -477,6 +507,31 @@ TEST_CASE("A lobby's audio sink goes with whoever claims its runner", "[PULSE]")
   auto stop_lobby = [&]() {
     event_bus->fire_event(immer::box<events::StopLobbyEvent>(events::StopLobbyEvent{.lobby_id = lobby_id}));
   };
+  // The lobby's producers run on detached threads that log as they end: a test that returns first (this is the last
+  // one in the binary) lets them log after main returned, into a destroyed logger (SIGSEGV/SIGABRT at exit)
+  auto runtime_dir = std::filesystem::path(utils::get_env("XDG_RUNTIME_DIR", "/tmp"));
+  auto wayland_sockets = [&]() {
+    std::set<std::string> found;
+    std::error_code ec;
+    for (const auto &entry : std::filesystem::directory_iterator(runtime_dir, ec)) {
+      if (entry.path().filename().string().starts_with("wayland-")) {
+        found.insert(entry.path().filename().string());
+      }
+    }
+    return found;
+  };
+  auto sockets_before = wayland_sockets();
+  auto wait_for_producers_to_end = [&]() {
+    bool ended = false;
+    for (int i = 0; i < 250 && !ended; i++) {
+      ended = source_outputs(audio_server->server) == 0 && wayland_sockets() == sockets_before;
+      if (!ended) {
+        std::this_thread::sleep_for(20ms);
+      }
+    }
+    CHECK(ended);
+    std::this_thread::sleep_for(300ms); // their threads only unref the pipeline and log once stopped
+  };
 
   SECTION("stopped during setup: the stop removes the sink and the runner never starts") {
     auto runner = std::make_shared<CaptureRunner>();
@@ -491,6 +546,7 @@ TEST_CASE("A lobby's audio sink goes with whoever claims its runner", "[PULSE]")
     settle(audio_server->server);
     CHECK_FALSE(runner->ran);
     CHECK_FALSE(sink_exists(audio_server->server, sink_name));
+    wait_for_producers_to_end();
   }
 
   SECTION("stopped while its runner runs: the sink stays until the runner exits") {
@@ -517,6 +573,7 @@ TEST_CASE("A lobby's audio sink goes with whoever claims its runner", "[PULSE]")
       gone = !sink_exists(audio_server->server, sink_name);
     }
     CHECK(gone);
+    wait_for_producers_to_end();
   }
 
   audio::disconnect(audio_server->server);
