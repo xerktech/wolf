@@ -22,6 +22,8 @@ paths:
     leaks the sink. Tests: `tests/testMoonlight.cpp` "/resume keeps what still runs for the stream"
     (drives `endpoints::https::resume_session`, which the HTTPS handler calls).
   - A lobby has exactly one runner, so its runner's exit still removes the lobby's sink.
+  - Until the runner starts, the lobby's stop removes it: whoever claims `Lobby::runner_claimed` first owns it.
+    Tests: `tests/platforms/linux/pulse.cpp` "A lobby's audio sink goes with whoever claims its runner".
 - At startup Wolf unloads `virtual_sink_*` null sinks left by a Wolf that crashed or was killed
   (`find_stale_sinks` in `wolf.cpp`). Another Wolf's live sinks have the same names, so:
   - only on a server Wolf owns: embedded (`WOLF_EMBED_PULSE=true`) or the PA container it started;

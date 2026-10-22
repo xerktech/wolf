@@ -8,10 +8,12 @@
 #include <fmt/core.h>
 #include <fstream>
 #include <future>
+#include <helpers/utils.hpp>
 #include <mutex>
 #include <pulse/pulseaudio.h>
 #include <sessions/common.hpp>
 #include <sessions/handlers.hpp>
+#include <set>
 #include <state/config.hpp>
 #include <thread>
 #include <vector>
@@ -103,6 +105,35 @@ bool sink_exists(const std::shared_ptr<audio::Server> &server, const std::string
             delete query;
           } else if (info && info->name && query->name == info->name) {
             query->found = true;
+          }
+        },
+        query);
+    if (op) {
+      pa_operation_unref(op);
+    }
+  });
+  REQUIRE(result.wait_for(2s) == std::future_status::ready);
+  return result.get();
+}
+
+/** Record streams on the server: a running audio producer's pulsesrc is one */
+int source_outputs(const std::shared_ptr<audio::Server> &server) {
+  struct Query {
+    int count = 0;
+    std::promise<int> result;
+  };
+  auto query = new Query{};
+  auto result = query->result.get_future();
+  audio::queue_op(server, [server, query]() {
+    auto op = pa_context_get_source_output_info_list(
+        audio::context(server),
+        [](pa_context *, const pa_source_output_info *info, int eol, void *data) {
+          auto query = static_cast<Query *>(data);
+          if (eol) {
+            query->result.set_value(query->count);
+            delete query;
+          } else if (info) {
+            query->count++;
           }
         },
         query);
@@ -415,6 +446,135 @@ TEST_CASE("A session's audio sink outlives its runners and goes with the session
   event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = 4242}));
   settle(audio_server->server);
   REQUIRE_FALSE(sink_exists(audio_server->server, sink_name));
+
+  audio::disconnect(audio_server->server);
+}
+
+/**
+ * A lobby's sink belongs to its runner once the runner starts (the runner's exit removes it), and to the lobby's stop
+ * until then. Whoever claims `Lobby::runner_claimed` first owns it: the setup before starting the runner, the stop
+ * handler before removing the sink. A stop right after the create isn't enough on its own to test the setup's claim:
+ * a real runner's own is_stopped check would hide a missing one, so these runners don't check it.
+ * Needs gst-wayland-display (waylanddisplaysrc) on GST_PLUGIN_PATH, like "Lobbies APIs".
+ */
+TEST_CASE("A lobby's audio sink goes with whoever claims its runner", "[PULSE]") {
+  PrivatePulse pulse;
+  auto audio_server = std::optional<sessions::AudioServer>(sessions::AudioServer{.server = connect(pulse)});
+
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .host = immer::box<state::Host>(
+          state::Host{.host_base_state_folder = pulse.dir.string(), .local_base_state_folder = pulse.dir.string()}),
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .lobbies = lobbies,
+      .running_sessions = running_sessions});
+  auto handlers = sessions::setup_lobbies_handlers(app_state, utils::get_env("XDG_RUNTIME_DIR", "/tmp"), audio_server);
+
+  auto lobby_id = fmt::format("{}", 4300 + getpid() % 1000);
+  auto sink_name = fmt::format("{}{}", sessions::VIRTUAL_SINK_PREFIX, lobby_id);
+  std::atomic_int stops = 0;
+  auto count_stops = event_bus->register_handler<immer::box<events::StopLobbyEvent>>(
+      [&](const immer::box<events::StopLobbyEvent> &ev) {
+        if (ev->lobby_id == lobby_id) {
+          stops++;
+        }
+      });
+  auto create_lobby = [&](std::shared_ptr<events::Runner> runner) {
+    auto create = events::CreateLobbyEvent{.id = lobby_id,
+                                           .profile_id = "test_profile",
+                                           .name = "test_lobby",
+                                           .multi_user = false,
+                                           .stop_when_everyone_leaves = false,
+                                           .video_settings = {.width = 640,
+                                                              .height = 480,
+                                                              .refresh_rate = 30,
+                                                              .wayland_render_node = "software",
+                                                              .runner_render_node = "runner_render_node",
+                                                              .video_producer_buffer_caps = "video/x-raw"},
+                                           .audio_settings = {.channel_count = 2},
+                                           .runner_state_folder = "runner_state_folder",
+                                           .runner = runner};
+    auto setup_over = create.on_setup_over.get()->get_future();
+    event_bus->fire_event(immer::box<events::CreateLobbyEvent>(create));
+    return setup_over;
+  };
+  auto stop_lobby = [&]() {
+    event_bus->fire_event(immer::box<events::StopLobbyEvent>(events::StopLobbyEvent{.lobby_id = lobby_id}));
+  };
+  // The lobby's producers run on detached threads that log as they end: a test that returns first (this is the last
+  // one in the binary) lets them log after main returned, into a destroyed logger (SIGSEGV/SIGABRT at exit)
+  auto runtime_dir = std::filesystem::path(utils::get_env("XDG_RUNTIME_DIR", "/tmp"));
+  auto wayland_sockets = [&]() {
+    std::set<std::string> found;
+    std::error_code ec;
+    for (const auto &entry : std::filesystem::directory_iterator(runtime_dir, ec)) {
+      if (entry.path().filename().string().starts_with("wayland-")) {
+        found.insert(entry.path().filename().string());
+      }
+    }
+    return found;
+  };
+  auto sockets_before = wayland_sockets();
+  auto wait_for_producers_to_end = [&]() {
+    bool ended = false;
+    for (int i = 0; i < 250 && !ended; i++) {
+      ended = source_outputs(audio_server->server) == 0 && wayland_sockets() == sockets_before;
+      if (!ended) {
+        std::this_thread::sleep_for(20ms);
+      }
+    }
+    CHECK(ended);
+    std::this_thread::sleep_for(300ms); // their threads only unref the pipeline and log once stopped
+  };
+
+  SECTION("stopped during setup: the stop removes the sink and the runner never starts") {
+    auto runner = std::make_shared<CaptureRunner>();
+    create_lobby(runner);
+    stop_lobby(); // the desktop takes far longer than this to come up
+    // The setup lost the claim once it stops the lobby a second time (for producers that came up after the first)
+    for (int i = 0; i < 1000 && stops < 2; i++) {
+      std::this_thread::sleep_for(20ms);
+    }
+    REQUIRE(stops >= 2);
+    std::this_thread::sleep_for(200ms); // a runner thread would have been started by now
+    settle(audio_server->server);
+    CHECK_FALSE(runner->ran);
+    CHECK_FALSE(sink_exists(audio_server->server, sink_name));
+    wait_for_producers_to_end();
+  }
+
+  SECTION("stopped while its runner runs: the sink stays until the runner exits") {
+    auto release_app = std::make_shared<std::promise<void>>();
+    auto runner = std::make_shared<BlockingRunner>(release_app->get_future().share());
+    // Also on a failed REQUIRE: the runner thread must not outlive the event bus
+    auto release_on_exit = std::shared_ptr<void>(nullptr, [release_app](void *) {
+      release_app->set_value();
+      std::this_thread::sleep_for(200ms);
+    });
+    REQUIRE(create_lobby(runner).wait_for(20s) == std::future_status::ready);
+    settle(audio_server->server);
+    REQUIRE(sink_exists(audio_server->server, sink_name));
+
+    stop_lobby();
+    std::this_thread::sleep_for(200ms); // the stop removes a sink on another thread
+    settle(audio_server->server);
+    CHECK(sink_exists(audio_server->server, sink_name)); // still the running app's
+
+    release_on_exit.reset(); // the runner's exit removes it
+    bool gone = false;
+    for (int i = 0; i < 50 && !gone; i++) {
+      settle(audio_server->server);
+      gone = !sink_exists(audio_server->server, sink_name);
+    }
+    CHECK(gone);
+    wait_for_producers_to_end();
+  }
 
   audio::disconnect(audio_server->server);
 }
