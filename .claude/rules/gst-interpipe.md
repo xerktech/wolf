@@ -21,5 +21,15 @@ paths:
     No test guards this: element flush events from an app thread trip TSan lock-order reports
     inside GStreamer (and can hang), so a CI test can't send them.
   - Tests: `tests/testGSTPlugin.cpp` "Stopping an interpipe consumer right after it starts ends it".
+- interpipesrc keeps its own `started` flag under the listeners lock; never key the listen-to switch on
+  `GST_BASE_SRC_IS_STARTED`. basesrc sets that after `start()` returns and clears it after `stop()` returns, so a
+  lobby switch in either gap was lost or listened on a stopped source (XERK-2159).
+  - Tests: "A listen-to set while an interpipe consumer starts or stops is kept" (calls the vfuncs directly to hold
+    each gap open).
+- The sink unregisters its node in dispose, before the parent releases its pads (teardown patch, fix 2).
+  Tests: "An interpipe producer is unregistered before its pads go" (deterministic, unlike the teardown stress test).
+- `block=true` consumers can hang a producer's `set_state(NULL)`: its streaming thread waits in the consumer's
+  appsrc push for as long as that consumer doesn't drain (e.g. sits in PAUSED). Inherent to `block=true`;
+  Wolf's default configs use `block=false`. Keep it that way.
 - A CI hang's last log line doesn't name the hung test: the interpipe tests log nothing, so the hang
   can be several tests past the last test that logged.

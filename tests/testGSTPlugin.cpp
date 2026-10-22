@@ -928,3 +928,109 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "Interpipe producer teardown waits for f
   gst_object_unref(consumer_src);
   gst_object_unref(consumer);
 }
+
+/**
+ * basesrc marks a source started only after its start() returns, and stopped only after its stop() returns.
+ * interpipesrc used that flag to decide whether a new listen-to must switch the live listener, so a lobby switch
+ * landing in either gap was lost (the consumer stayed on the old producer) or listened on a stopped source. Calling the
+ * start()/stop() vfuncs directly holds each gap open, so this is deterministic (the race itself hit ~1/1000 starts).
+ */
+TEST_CASE_METHOD(GStreamerTestsFixture,
+                 "A listen-to set while an interpipe consumer starts or stops is kept",
+                 "[GSTPlugin]") {
+  auto interpipe = gst_element_factory_find("interpipesrc");
+  REQUIRE(interpipe);
+  gst_object_unref(interpipe);
+
+  auto producer_a = gst_element_factory_make("interpipesink", "gap_prod_a");
+  auto producer_b = gst_element_factory_make("interpipesink", "gap_prod_b");
+  auto listeners = [](GstElement *producer) {
+    guint n = 0;
+    g_object_get(producer, "num-listeners", &n, nullptr);
+    return n;
+  };
+
+  auto pipeline = gst_parse_launch("interpipesrc name=gap_c listen-to=gap_prod_a ! fakesink", nullptr);
+  auto consumer = gst_bin_get_by_name(GST_BIN(pipeline), "gap_c");
+  auto vfuncs = GST_BASE_SRC_GET_CLASS(consumer);
+
+  SECTION("after start() returned, before basesrc marks it started") {
+    REQUIRE(vfuncs->start(GST_BASE_SRC(consumer)));
+    REQUIRE_FALSE(GST_BASE_SRC_IS_STARTED(consumer));
+    REQUIRE(listeners(producer_a) == 1);
+
+    g_object_set(consumer, "listen-to", "gap_prod_b", nullptr);
+    CHECK(listeners(producer_a) == 0);
+    CHECK(listeners(producer_b) == 1);
+
+    REQUIRE(vfuncs->stop(GST_BASE_SRC(consumer)));
+  }
+
+  SECTION("after stop() returned, before basesrc marks it stopped") {
+    gst_element_set_state(pipeline, GST_STATE_PAUSED);
+    REQUIRE(gst_element_get_state(pipeline, nullptr, nullptr, 5 * GST_SECOND) != GST_STATE_CHANGE_FAILURE);
+    REQUIRE(GST_BASE_SRC_IS_STARTED(consumer));
+    REQUIRE(listeners(producer_a) == 1);
+
+    REQUIRE(vfuncs->stop(GST_BASE_SRC(consumer)));
+    REQUIRE(GST_BASE_SRC_IS_STARTED(consumer));
+    g_object_set(consumer, "listen-to", "gap_prod_b", nullptr);
+    CHECK(listeners(producer_b) == 0); // a stopped source never listens again
+  }
+
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  CHECK(listeners(producer_a) == 0);
+  CHECK(listeners(producer_b) == 0);
+  gst_object_unref(consumer);
+  gst_object_unref(pipeline);
+  gst_object_unref(producer_a);
+  gst_object_unref(producer_b);
+}
+
+/**
+ * A disposed interpipesink must unregister its node before the parent dispose releases its pads (fix 2 in
+ * docker/patches/gst-interpipe-teardown-race.patch): a listener joining in between would attach to a half-torn-down
+ * sink. "Interpipe producer teardown with active consumers" only catches an unregister moved to finalize ~1 run in 4;
+ * here a probe joins from inside the pad removal itself, so the node must already be gone.
+ */
+TEST_CASE_METHOD(GStreamerTestsFixture, "An interpipe producer is unregistered before its pads go", "[GSTPlugin]") {
+  auto interpipe = gst_element_factory_find("interpipesrc");
+  REQUIRE(interpipe);
+  gst_object_unref(interpipe);
+
+  auto consumer =
+      gst_parse_launch("interpipesrc listen-to=dispose_order_prod is-live=true ! fakesink sync=false", nullptr);
+  gst_element_set_state(consumer, GST_STATE_PLAYING);
+  REQUIRE(gst_element_get_state(consumer, nullptr, nullptr, 5 * GST_SECOND) != GST_STATE_CHANGE_FAILURE);
+
+  auto producer = gst_element_factory_make("interpipesink", "dispose_order_prod");
+  guint listeners = 0;
+  g_object_get(producer, "num-listeners", &listeners, nullptr);
+  REQUIRE(listeners == 1);
+
+  struct Seen {
+    bool called = false;
+    guint before = 0, after = 0;
+  } seen;
+  g_signal_connect(producer,
+                   "pad-removed",
+                   G_CALLBACK(+[](GstElement *sink, GstPad *, Seen *seen) {
+                     auto probe = gst_element_factory_make("interpipesrc", nullptr);
+                     g_object_set(probe, "listen-to", "dispose_order_prod", nullptr);
+                     g_object_get(sink, "num-listeners", &seen->before, nullptr);
+                     // start() listens at once if the node is still registered
+                     GST_BASE_SRC_GET_CLASS(probe)->start(GST_BASE_SRC(probe));
+                     g_object_get(sink, "num-listeners", &seen->after, nullptr);
+                     GST_BASE_SRC_GET_CLASS(probe)->stop(GST_BASE_SRC(probe));
+                     gst_object_unref(probe);
+                     seen->called = true;
+                   }),
+                   &seen);
+  gst_object_unref(producer); // dispose: unregister, then release the pads
+
+  REQUIRE(seen.called);
+  CHECK(seen.after == seen.before); // the probe found no node to join
+
+  gst_element_set_state(consumer, GST_STATE_NULL);
+  gst_object_unref(consumer);
+}
