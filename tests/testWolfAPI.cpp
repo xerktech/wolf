@@ -2378,7 +2378,7 @@ TEST_CASE("API refuses requests it can't read with a JSON error", "[API]") {
                     "Request Header Fields Too Large");
 
   // Bodies being read are capped over all connections (2 x 64 MiB), not only per connection: two clients that
-  // announce a body each and haven't sent it yet use up the budget, so a third body still to be read is refused
+  // announce a body each and haven't sent all of it yet use up the budget, so a third body still to be read is refused
   {
     // Like raw(), but the body arrives after the headers were read: it needs the budget
     auto split = [&](std::size_t length) {
@@ -2410,7 +2410,9 @@ TEST_CASE("API refuses requests it can't read with a JSON error", "[API]") {
     for (int i = 0; i < 2; i++) {
       auto &holder = holders.emplace_back(ctx);
       holder.connect(boost::asio::local::stream_protocol::endpoint(socket_path));
-      boost::asio::write(holder, boost::asio::buffer(headers(cap - 1024)));
+      // Part of the body arrives with the headers and is read at once: it counts too, or holders could each park
+      // a socket buffer's worth outside the budget
+      boost::asio::write(holder, boost::asio::buffer(headers(cap - 1024) + std::string(32 * 1024, 'x')));
     }
     // The server picks the holders' headers up asynchronously: retry until it has
     std::string reply;
