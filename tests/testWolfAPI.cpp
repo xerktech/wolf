@@ -2324,10 +2324,11 @@ TEST_CASE("API refuses requests it can't read with a JSON error", "[API]") {
     boost::asio::io_context ctx;
     boost::asio::local::stream_protocol::socket client(ctx);
     client.connect(boost::asio::local::stream_protocol::endpoint(socket_path));
-    boost::asio::write(client, boost::asio::buffer(request));
+    // A refusal (431, 413) can close the socket before the whole request is written: read the reply anyway
+    boost::system::error_code write_ec, ec;
+    boost::asio::write(client, boost::asio::buffer(request), write_ec);
     std::string reply;
     std::array<char, 4096> chunk{};
-    boost::system::error_code ec;
     pollfd fd{.fd = client.native_handle(), .events = POLLIN};
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!ec && std::chrono::steady_clock::now() < deadline) {
@@ -2420,6 +2421,10 @@ TEST_CASE("API refuses requests it can't read with a JSON error", "[API]") {
       reply = split(4096);
     }
     expect_json_error(reply, "HTTP/1.0 503 Service Unavailable\r\n", "Too many large requests at once");
+    // The whole body is checked, not only what's left to read: these 2000 bytes would fit, the 34768 don't
+    expect_json_error(raw(headers(34768) + std::string(32768, 'x')),
+                      "HTTP/1.0 503 Service Unavailable\r\n",
+                      "Too many large requests at once");
     // An announced body costs nothing until it arrives (its string is only reserved)
     CHECK(resident_bytes() < rss_before + 32 * 1024 * 1024);
 
