@@ -2371,6 +2371,37 @@ TEST_CASE("API refuses requests it can't read with a JSON error", "[API]") {
   expect_json_error(raw(headers(cap - headers(0).size() + 1)),
                     "HTTP/1.0 413 Payload Too Large\r\n",
                     "Payload Too Large");
+
+  // Headers are buffered per connection before anything is known about the request: they get a small cap of their own
+  expect_json_error(raw("GET /api/v1/apps HTTP/1.0\r\nX-Filler: " + std::string(70 * 1024, 'a') + "\r\n\r\n"),
+                    "HTTP/1.0 431 Request Header Fields Too Large\r\n",
+                    "Request Header Fields Too Large");
+
+  // Bodies being read are capped over all connections (2 x 64 MiB), not only per connection: two clients that
+  // announce a body each and haven't sent it yet use up the budget, so a third body is refused before it's read
+  {
+    boost::asio::io_context ctx;
+    std::vector<boost::asio::local::stream_protocol::socket> holders;
+    for (int i = 0; i < 2; i++) {
+      auto &holder = holders.emplace_back(ctx);
+      holder.connect(boost::asio::local::stream_protocol::endpoint(socket_path));
+      boost::asio::write(holder, boost::asio::buffer(headers(cap - 1024)));
+    }
+    // The server picks the holders' headers up asynchronously: retry until it has
+    std::string reply;
+    for (int attempt = 0; attempt < 50 && !reply.starts_with("HTTP/1.0 503"); attempt++) {
+      reply = raw(headers(4096) + std::string(4096, 'x'));
+    }
+    expect_json_error(reply, "HTTP/1.0 503 Service Unavailable\r\n", "Too many large requests at once");
+
+    // A client that goes away gives its share back
+    holders.clear();
+    for (int attempt = 0; attempt < 50 && !reply.starts_with("HTTP/1.0 400"); attempt++) {
+      reply = raw(headers(4096) + std::string(4096, 'x'));
+    }
+    INFO(reply);
+    REQUIRE(reply.starts_with("HTTP/1.0 400 Bad Request\r\n")); // read in full: 'xxx...' isn't an app
+  }
 }
 
 TEST_CASE("API reports a config change that couldn't be saved", "[API]") {

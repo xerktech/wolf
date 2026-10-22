@@ -10,6 +10,11 @@ constexpr std::size_t MAX_WRITE_QUEUE_BYTES = 64 * 1024 * 1024;
 // Headers + body of one request: the buffer used to be unbounded, so a huge Content-Length was read (or waited for)
 // in full instead of being refused
 constexpr std::size_t MAX_REQUEST_BYTES = 64 * 1024 * 1024;
+// The request line and headers: each connection buffers them before anything else is known, so the cap is per
+// connection and must stay small
+constexpr std::size_t MAX_HEADER_BYTES = 64 * 1024;
+// Bodies being read, summed over every connection: MAX_REQUEST_BYTES alone let N connections hold N x 64 MiB
+constexpr std::size_t MAX_PENDING_BODY_BYTES = 2 * MAX_REQUEST_BYTES;
 
 std::string to_str(boost::asio::streambuf &streambuf, std::size_t start, std::size_t end) {
   return {buffers_begin(streambuf.data()) + start, buffers_begin(streambuf.data()) + start + end};
@@ -436,10 +441,14 @@ static std::string_view status_reason(int status_code) {
     return "Conflict";
   case 413:
     return "Payload Too Large";
+  case 431:
+    return "Request Header Fields Too Large";
   case 500:
     return "Internal Server Error";
   case 501:
     return "Not Implemented";
+  case 503:
+    return "Service Unavailable";
   default:
     return "Unknown";
   }
@@ -534,13 +543,16 @@ void UnixSocketServer::handle_request(const HTTPRequest &req, std::shared_ptr<Un
 }
 
 void UnixSocketServer::start_connection(std::shared_ptr<UnixSocket> socket) {
-  auto request_buf = std::make_shared<boost::asio::streambuf>(MAX_REQUEST_BYTES);
+  auto request_buf = std::make_shared<boost::asio::streambuf>(MAX_HEADER_BYTES);
   boost::asio::async_read_until(
       socket->socket,
       *request_buf,
       "\r\n\r\n",
       [this, socket, request_buf](const boost::system::error_code &ec, std::size_t bytes_transferred) {
-        if (ec) {
+        if (ec == boost::asio::error::not_found) { // the buffer filled up before the end of the headers
+          send_http(socket, 431, rfl::json::write(GenericErrorResponse{.error = "Request Header Fields Too Large"}));
+          return;
+        } else if (ec) {
           logs::log(logs::error, "[API] Error reading request: {}", ec.message());
           close(*socket);
           return;
@@ -578,33 +590,45 @@ void UnixSocketServer::start_connection(std::shared_ptr<UnixSocket> socket) {
             return;
           }
           auto content_length = *parsed_content_length;
-          std::size_t num_additional_bytes = request_buf->size() - bytes_transferred;
-          if (content_length > request_buf->max_size() - bytes_transferred) {
+          if (content_length > MAX_REQUEST_BYTES - bytes_transferred) {
             send_http(socket, 413, rfl::json::write(GenericErrorResponse{.error = "Payload Too Large"}));
             return;
-          } else if (content_length > num_additional_bytes) {
-            boost::asio::async_read(socket->socket,
-                                    *request_buf,
-                                    boost::asio::transfer_exactly(content_length - num_additional_bytes),
-                                    [this,
-                                     content_length,
-                                     bytes_transferred,
-                                     socket,
-                                     request_buf,
-                                     req = std::make_unique<HTTPRequest>(req)](const boost::system::error_code &ec,
-                                                                               std::size_t /*bytes_transferred*/) {
-                                      if (ec) {
-                                        logs::log(logs::error, "[API] Error reading request body: {}", ec.message());
-                                        close(*socket);
-                                        return;
-                                      }
-                                      req->body = to_str(*request_buf, bytes_transferred, content_length);
-                                      handle_request(*req, socket);
-                                    });
-          } else {
-            req.body = to_str(*request_buf, bytes_transferred, content_length);
-            handle_request(req, socket);
           }
+          // Only this (io_context) thread touches the counter. Refused before anything is allocated.
+          if (content_length > MAX_PENDING_BODY_BYTES - state_->pending_body_bytes) {
+            logs::log(logs::warning, "[API] Too many request bodies being read at once, refusing one");
+            send_http(socket, 503, rfl::json::write(GenericErrorResponse{.error = "Too many large requests at once"}));
+            return;
+          }
+          // Read straight into the body's string, which grows as bytes arrive: reserving doesn't touch the pages, so
+          // a Content-Length alone costs no memory, and nothing is copied out of a streambuf afterwards
+          auto body = std::make_shared<std::string>();
+          body->reserve(content_length);
+          auto already_read = std::min(request_buf->size() - bytes_transferred, content_length);
+          body->append(buffers_begin(request_buf->data()) + bytes_transferred,
+                       buffers_begin(request_buf->data()) + bytes_transferred + already_read);
+          if (already_read == content_length) {
+            req.body = std::move(*body);
+            handle_request(req, socket);
+            return;
+          }
+          state_->pending_body_bytes += content_length;
+          boost::asio::async_read(
+              socket->socket,
+              boost::asio::dynamic_buffer(*body, content_length),
+              boost::asio::transfer_exactly(content_length - already_read),
+              [this, content_length, socket, body, req = std::make_unique<HTTPRequest>(std::move(req))](
+                  const boost::system::error_code &ec,
+                  std::size_t /*bytes_transferred*/) {
+                state_->pending_body_bytes -= content_length; // errors included
+                if (ec) {
+                  logs::log(logs::error, "[API] Error reading request body: {}", ec.message());
+                  close(*socket);
+                  return;
+                }
+                req->body = std::move(*body);
+                handle_request(*req, socket);
+              });
         } else {
           handle_request(req, socket);
         }

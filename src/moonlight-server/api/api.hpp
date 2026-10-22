@@ -285,6 +285,8 @@ private:
     std::vector<std::shared_ptr<UnixSocket>> sockets;
     HTTPServer<std::shared_ptr<UnixSocket>> http;
     boost::asio::steady_timer sse_keepalive_timer;
+    // Bytes of request bodies still being read, over every connection (io_context thread only)
+    std::size_t pending_body_bytes = 0;
   };
 
   std::shared_ptr<UnixSocketState> state_;
