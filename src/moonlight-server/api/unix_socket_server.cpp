@@ -594,41 +594,53 @@ void UnixSocketServer::start_connection(std::shared_ptr<UnixSocket> socket) {
             send_http(socket, 413, rfl::json::write(GenericErrorResponse{.error = "Payload Too Large"}));
             return;
           }
-          // Only this (io_context) thread touches the counter. Refused before anything is allocated.
-          if (content_length > MAX_PENDING_BODY_BYTES - state_->pending_body_bytes) {
-            logs::log(logs::warning, "[API] Too many request bodies being read at once, refusing one");
-            send_http(socket, 503, rfl::json::write(GenericErrorResponse{.error = "Too many large requests at once"}));
-            return;
-          }
           // Read straight into the body's string, which grows as bytes arrive: reserving doesn't touch the pages, so
           // a Content-Length alone costs no memory, and nothing is copied out of a streambuf afterwards
           auto body = std::make_shared<std::string>();
-          body->reserve(content_length);
           auto already_read = std::min(request_buf->size() - bytes_transferred, content_length);
           body->append(buffers_begin(request_buf->data()) + bytes_transferred,
                        buffers_begin(request_buf->data()) + bytes_transferred + already_read);
+          // read_until stops at the end of the headers, often a few hundred bytes in: take what already arrived too
+          boost::system::error_code ec_available;
+          if (auto available = socket->socket.available(ec_available); !ec_available && available > 0) {
+            auto ready = std::min(available, content_length - already_read);
+            body->reserve(already_read + ready);
+            // Doesn't block: the bytes are already in the socket's buffer
+            already_read += boost::asio::read(socket->socket,
+                                              boost::asio::dynamic_buffer(*body, content_length),
+                                              boost::asio::transfer_exactly(ready),
+                                              ec_available);
+          }
           if (already_read == content_length) {
             req.body = std::move(*body);
             handle_request(req, socket);
             return;
           }
-          state_->pending_body_bytes += content_length;
-          boost::asio::async_read(
-              socket->socket,
-              boost::asio::dynamic_buffer(*body, content_length),
-              boost::asio::transfer_exactly(content_length - already_read),
-              [this, content_length, socket, body, req = std::make_unique<HTTPRequest>(std::move(req))](
-                  const boost::system::error_code &ec,
-                  std::size_t /*bytes_transferred*/) {
-                state_->pending_body_bytes -= content_length; // errors included
-                if (ec) {
-                  logs::log(logs::error, "[API] Error reading request body: {}", ec.message());
-                  close(*socket);
-                  return;
-                }
-                req->body = std::move(*body);
-                handle_request(*req, socket);
-              });
+          // Only what is still to be read counts, so idle connections holding the budget never block a request
+          // that arrived whole. Only this (io_context) thread touches the counter.
+          auto to_read = content_length - already_read;
+          if (to_read > MAX_PENDING_BODY_BYTES - state_->pending_body_bytes) {
+            logs::log(logs::warning, "[API] Too many request bodies being read at once, refusing one");
+            send_http(socket, 503, rfl::json::write(GenericErrorResponse{.error = "Too many large requests at once"}));
+            return;
+          }
+          body->reserve(content_length);
+          state_->pending_body_bytes += to_read;
+          boost::asio::async_read(socket->socket,
+                                  boost::asio::dynamic_buffer(*body, content_length),
+                                  boost::asio::transfer_exactly(to_read),
+                                  [this, to_read, socket, body, req = std::make_unique<HTTPRequest>(std::move(req))](
+                                      const boost::system::error_code &ec,
+                                      std::size_t /*bytes_transferred*/) {
+                                    state_->pending_body_bytes -= to_read; // errors included
+                                    if (ec) {
+                                      logs::log(logs::error, "[API] Error reading request body: {}", ec.message());
+                                      close(*socket);
+                                      return;
+                                    }
+                                    req->body = std::move(*body);
+                                    handle_request(*req, socket);
+                                  });
         } else {
           handle_request(req, socket);
         }
