@@ -1,0 +1,61 @@
+gst-interpipe: keep a listen-to set while a consumer starts or stops
+
+basesrc marks a source started only after start() returns and stopped only
+after stop() returns. set_property keyed the live switch on that flag, so a
+listen-to landing after start() was only stored (the consumer stayed on the
+old producer) and one landing after stop() listened on a stopped source.
+Track started under the listeners lock instead.
+
+Applies on top of gst-interpipe-unlock-stop-race.patch (the patches apply in
+name order).
+
+diff --git a/gst/interpipe/gstinterpipesrc.c b/gst/interpipe/gstinterpipesrc.c
+index 9ef0cea..534ddbd 100644
+--- a/gst/interpipe/gstinterpipesrc.c
++++ b/gst/interpipe/gstinterpipesrc.c
+@@ -139,6 +139,12 @@ struct _GstInterPipeSrc
+   /* Currently started and listening */
+   gboolean listening;
+ 
++  /* Between our start() and stop(), under the listeners lock. Not
++   * GST_BASE_SRC_IS_STARTED: basesrc sets that only after start() returns and
++   * clears it only after stop() returns, so a listen-to set in either gap was
++   * lost (after start) or listened on a stopped source (after stop) */
++  gboolean started;
++
+   /* Pending serial events queue */
+   GQueue *pending_serial_events;
+   /* pending_serial_events is pushed by the node's streaming thread and
+@@ -250,6 +256,7 @@ gst_inter_pipe_src_init (GstInterPipeSrc * src)
+ 
+   src->listen_to = NULL;
+   src->listening = FALSE;
++  src->started = FALSE;
+   src->pending_serial_events = g_queue_new ();
+   g_mutex_init (&src->pending_serial_events_mutex);
+   g_mutex_init (&src->unlock_mutex);
+@@ -285,7 +292,7 @@ gst_inter_pipe_src_set_property (GObject * object, guint prop_id,
+         GST_INFO ("Already listening to node %s", node_name);
+         g_free (node_name);
+       } else if (node_name != NULL) {
+-        if (GST_BASE_SRC_IS_STARTED (GST_BASE_SRC (src))) {
++        if (src->started) {
+           /* valid node_name, BaseSrc started */
+           if (!gst_inter_pipe_src_listen_node (src, node_name)) {
+             GST_ERROR_OBJECT (src, "Could not listen to node %s", node_name);
+@@ -431,6 +438,7 @@ gst_inter_pipe_src_start (GstBaseSrc * base)
+   }
+ 
+ start_done:
++  src->started = TRUE;
+   gst_inter_pipe_unlock_listeners ();
+   if (GST_INTER_PIPE_SRC_RESTART_TIMESTAMP == src->stream_sync)
+     gst_base_src_set_do_timestamp (base, TRUE);
+@@ -457,6 +465,7 @@ gst_inter_pipe_src_stop (GstBaseSrc * base)
+     gst_inter_pipe_leave_node (listener);
+     src->listening = FALSE;
+   }
++  src->started = FALSE;
+   gst_inter_pipe_unlock_listeners ();
+ 
+   return basesrc_class->stop (base);
