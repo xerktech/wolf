@@ -68,6 +68,8 @@ jobs:
             ${{runner.workspace}}/usr/local/lib/${{ matrix.lib_path }}/pkgconfig/
             ${{runner.workspace}}/usr/local/lib/${{ matrix.lib_path }}/gstreamer-1.0/
             ${{runner.workspace}}/usr/local/include/libgstwaylanddisplay/*
+          # Only the test job of this same run consumes it; keep it short so it doesn't eat Actions storage
+          retention-days: 3
           if-no-files-found: error
 
   # Now run the actual test suite
