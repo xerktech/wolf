@@ -1,0 +1,29 @@
+---
+paths:
+  - src/moonlight-server/sessions/lobbies.cpp
+  - src/moonlight-server/control/input_handler.cpp
+  - src/moonlight-server/runners/docker.cpp
+  - src/core/src/platforms/all/helpers/helpers/tsqueue.hpp
+  - tests/testWolfAPI.cpp
+---
+
+# Device plug/unplug ordering
+
+- A plug reaches a Docker runner through its `plugged_devices_queue`, drained every ~500ms; an unplug arrives
+  as an `UnplugDeviceEvent` handled at once. Unplugs must never run before their plug's commands, or the
+  container keeps a device nobody removes.
+  - `runners/docker.cpp` holds one mutex over the queue drain + plug commands and over the unplug handler;
+    an unplug whose plug is still queued drops it from the queue instead of running remove commands.
+- Lobby joins: the lobby relay only forwards a session's unplug once the session is in `connected_sessions`,
+  but the join queues the pads' plugs before that (so a relayed unplug can't overtake them).
+  - The join re-reads `session->joypads` after connecting and unplugs from the lobby any pad it queued that
+    has gone. Residual gap: a pad whose unplug's relay check ran before the connect but whose erase lands after
+    the re-check (microseconds: the erase follows the fire). XERK-2410 tracks a per-session lock instead.
+  - Keep control's unplug as fire-then-erase. Erase-then-fire looks like it closes that gap, but same-type
+    handlers run newest-first, so the session runner's exec runs between the erase and the relay's check: a
+    leave in that window neither snapshots the pad nor gets it relayed → ghost in the lobby (XERK-2409 QA:
+    0 → 53/200).
+  - A pad unplugged right at the connect can get both the relayed unplug and the join's; the second remove of a
+    gone node fails its exec and logs a warning.
+- Tests: `tests/testWolfAPI.cpp` "A joypad unplugged while its session joins a lobby is unplugged from the
+  lobby" (needs `/dev/uinput`, skips otherwise).

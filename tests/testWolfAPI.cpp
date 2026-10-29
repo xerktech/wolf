@@ -1897,6 +1897,72 @@ TEST_CASE("Joining a lobby while it stops doesn't leave the session in the stopp
   }
 }
 
+TEST_CASE("A joypad unplugged while its session joins a lobby is unplugged from the lobby", "[API]") {
+  using namespace std::chrono_literals;
+  auto pad = inputtino::XboxOneJoypad::create();
+  if (!pad) {
+    SKIP("Can't create a virtual joypad: " << pad.getErrorMessage());
+  }
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
+      .running_sessions = running_sessions});
+
+  events::Lobby lobby{.id = "lobby-a", .name = "lobby-a", .multi_user = false, .stop_when_everyone_leaves = false};
+  app_state->lobbies->update([&](const immer::vector<events::Lobby> &lobbies) { return lobbies.push_back(lobby); });
+  auto session = events::StreamSession{.event_bus = event_bus, .session_id = 4321};
+  session.joypads->update([&](events::JoypadList joypads) {
+    return joypads.set(0, std::make_shared<events::JoypadTypes>(std::move(*pad)));
+  });
+  running_sessions->update([&](const auto &sessions) { return sessions.push_back(session); });
+  auto lobbies_handlers = sessions::setup_lobbies_handlers(app_state, api_runtime_dir(), {});
+
+  bool unplug_raced = false;
+  int unplugged_from_lobby = 0;
+  auto observer = event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
+      [&](const immer::box<events::UnplugDeviceEvent> &ev) {
+        if (ev->session_id == lobby.id) {
+          unplugged_from_lobby++;
+        } else if (!unplug_raced) {
+          // The join is moving the pad out of the session, and hasn't added the session to the lobby yet:
+          // Moonlight unplugs the pad right now, the way control's input handler does (fire, then erase)
+          unplug_raced = true;
+          event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{
+              events::UnplugDeviceEvent{.session_id = std::to_string(session.session_id),
+                                        .udev_events = ev->udev_events,
+                                        .udev_hw_db_entries = ev->udev_hw_db_entries}});
+          session.joypads->update([](events::JoypadList joypads) { return joypads.erase(0); });
+        }
+      });
+
+  auto join = events::JoinLobbyEvent{.lobby_id = lobby.id, .moonlight_session_id = session.session_id};
+  event_bus->fire_event(immer::box<events::JoinLobbyEvent>(join));
+  REQUIRE(join.error_message.get()->get_future().get().empty());
+
+  REQUIRE(unplug_raced);
+  // The join queued the pad's plug for the lobby's runner, which must also get an unplug for it
+  REQUIRE(lobby.plugged_devices_queue->pop(0ms));
+  REQUIRE(unplugged_from_lobby == 1);
+}
+
+TEST_CASE("A device queue drops the queued elements matching a predicate", "[API]") {
+  using namespace std::chrono_literals;
+  TSQueue<int> queue;
+  for (int i : {1, 2, 3, 4}) {
+    queue.push(i);
+  }
+  REQUIRE(queue.remove_if([](int i) { return i % 2 == 0; }) == 2);
+  REQUIRE(queue.pop(0ms) == 1);
+  REQUIRE(queue.pop(0ms) == 3);
+  REQUIRE(!queue.pop(0ms));
+}
+
 TEST_CASE("Lobbies APIs", "[API]") {
   auto event_bus = std::make_shared<events::EventBusType>();
   auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();

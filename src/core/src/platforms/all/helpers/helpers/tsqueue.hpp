@@ -53,4 +53,24 @@ public:
     m_queue.pop();
     return item;
   }
+
+  /**
+   * Removes every queued element matching the predicate
+   * @return how many elements were removed
+   */
+  template <typename Pred> std::size_t remove_if(Pred pred) {
+    std::unique_lock<std::mutex> lock(m_mutex);
+    std::queue<T> kept;
+    std::size_t removed = 0;
+    while (!m_queue.empty()) {
+      if (pred(m_queue.front())) {
+        removed++;
+      } else {
+        kept.push(std::move(m_queue.front()));
+      }
+      m_queue.pop();
+    }
+    m_queue = std::move(kept);
+    return removed;
+  }
 };
