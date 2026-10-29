@@ -166,8 +166,7 @@ jobs:
             timeout: 60
             test_docker: ON
             test_nvidia: OFF
-            # Off until XERK-2412: inputtino's keyboard/uhid threads (and Wolf's joypad feedback) race; ~40 reports
-            test_virtual_input: OFF
+            test_virtual_input: ON
             test_exceptions: ON
             name: TSan - g++ - STD 20 - Shared false
 

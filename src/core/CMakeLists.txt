@@ -52,7 +52,11 @@ if (UNIX AND NOT APPLE)
         FetchContent_Declare(
                 inputtino
                 GIT_REPOSITORY https://github.com/games-on-whales/inputtino.git
-                GIT_TAG fd136cf)
+                GIT_TAG fd136cf
+                # Thread-safety fixes not (yet) upstream: see patches/inputtino-thread-safety.patch
+                # The reverse check makes the patch step a no-op when it re-runs on an already patched tree.
+                PATCH_COMMAND sh -c "git apply --reverse --check $1 2>/dev/null || git apply $1" --
+                              ${CMAKE_CURRENT_SOURCE_DIR}/patches/inputtino-thread-safety.patch)
         FetchContent_MakeAvailable(inputtino)
     endif ()
 
