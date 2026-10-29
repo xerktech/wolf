@@ -276,37 +276,19 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           leave_lobby(app_state->event_bus, *current_lobby, *session);
         }
 
-        // Joypads the stream took over from another lobby leave that lobby's app; from now on they all follow the
-        // session (in this lobby) like its other joypads
-        std::vector<events::UnplugDeviceEvent> left_behind;
-        {
-          std::lock_guard kept_lock(session->kept_joypads->mutex);
-          events::JoypadList session_pads = session->joypads->load();
-          for (auto [joypad_nr, kept_in] : session->kept_joypads->plugged_into) {
-            auto joypad = session_pads.find(joypad_nr);
-            if (joypad && kept_in != lobby->id) {
-              events::UnplugDeviceEvent unplug_ev{.session_id = kept_in};
-              std::visit(
-                  [&unplug_ev](auto &pad) {
-                    unplug_ev.udev_events = pad.get_udev_events();
-                    unplug_ev.udev_hw_db_entries = pad.get_udev_hw_db_entries();
-                  },
-                  **joypad);
-              left_behind.push_back(unplug_ev);
-            }
-          }
-          session->kept_joypads->plugged_into.clear();
-        }
-        for (const auto &unplug_ev : left_behind) {
-          app_state->event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{unplug_ev});
-        }
-
         // Migrate joypads BEFORE adding the session to connected_sessions, or the relayed unplug races the queued plug
         events::JoypadList joypads = session->joypads->load();
         // Joypads the lobby kept for this session: those its stream took over (sessions/add) are in `joypads`, plugged
         // into the lobby all along; any other is unplugged now
         release_parked_joypads(app_state->event_bus, *lobby, session->session_id, joypads);
-        for (auto [_joypad_nr, joypad] : joypads) {
+        // The ones its stream took over are in a lobby's app, not in the stream's runner
+        std::shared_ptr<const events::TakenOverJoypads> taken_over = session->taken_over_joypads->exchange(nullptr);
+        for (auto [joypad_nr, joypad] : joypads) {
+          auto taken = taken_over ? taken_over->joypads.find(joypad_nr) : nullptr;
+          bool is_taken_over = taken && *taken == joypad;
+          if (is_taken_over && taken_over->lobby_id == lobby->id) {
+            continue; // already plugged into this lobby's app
+          }
           events::PlugDeviceEvent plug_ev{.session_id = lobby->id};
           std::visit(
               [&plug_ev](auto &pad) {
@@ -314,11 +296,11 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                 plug_ev.udev_hw_db_entries = pad.get_udev_hw_db_entries();
               },
               *joypad);
-          // Unplug it from the current session's runner
-          app_state->event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{
-              events::UnplugDeviceEvent{.session_id = std::to_string(session->session_id),
-                                        .udev_events = plug_ev.udev_events,
-                                        .udev_hw_db_entries = plug_ev.udev_hw_db_entries}});
+          // Unplug it from where it is: the current session's runner, or the app of the lobby it was taken over from
+          app_state->event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{events::UnplugDeviceEvent{
+              .session_id = is_taken_over ? taken_over->lobby_id : std::to_string(session->session_id),
+              .udev_events = plug_ev.udev_events,
+              .udev_hw_db_entries = plug_ev.udev_hw_db_entries}});
 
           // Add it to the lobby runner's devices queue, addressed to the lobby id
           // (same routing the PlugDeviceEvent relay performs for connected sessions)
@@ -480,6 +462,10 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
   // When a client presses the WolfUI special combo, we get the user out of the lobby (and back to WolfUI)
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::ClientWolfUIComboEvent>>(
       [=](const immer::box<events::ClientWolfUIComboEvent> &event) {
+        if (!app_state->host->wolf_ui_combo) {
+          logs::log(logs::debug, "Ignoring the WolfUI combo for session {}: no WolfUI", event->session_id);
+          return;
+        }
         logs::log(logs::info, "Detected WolfUI combo for session {}", event->session_id);
         on_moonlight_session_over(event->session_id, false);
       }));

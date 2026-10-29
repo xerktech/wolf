@@ -519,20 +519,23 @@ struct ParkedJoypads {
 };
 
 /**
+ * The joypads a stream took over from a lobby's keep (sessions/add), still plugged into that lobby's app
+ */
+struct TakenOverJoypads {
+  std::string lobby_id;
+  JoypadList joypads;
+};
+
+/**
  * WOLF_LOBBY_KEEPS_JOYPADS: the joypads a stream took over from a lobby (sessions/add), by controller number.
  * A CONTROLLER_ARRIVAL or the pad's first input claims one; those still unclaimed a while after the client connects
  * are unplugged (control::release_unclaimed_joypads).
  *
- * One mutex over both sets and the session's `joypads` they refer to: a claim, a release and the lobby keeping the
+ * One mutex over the set and the session's `joypads` they refer to: a claim, a release and the lobby keeping the
  * pads again each read and change them together. Never fire an event while holding it (lobby handlers take it).
  */
 struct KeptJoypads {
   std::mutex mutex;
-  /**
-   * Those still plugged into the app of the lobby that kept them (its id) instead of following the session's own
-   * device routing: until the session joins a lobby, which moves them.
-   */
-  std::map<int, std::string> plugged_into;
   /** Those the client hasn't claimed yet */
   std::set<int> unclaimed;
 };
@@ -627,6 +630,13 @@ struct StreamSession {
   std::shared_ptr<immer::atom<ControlFeedback>> control_feedback = std::make_shared<immer::atom<ControlFeedback>>();
 
   std::shared_ptr<KeptJoypads> kept_joypads = std::make_shared<KeptJoypads>();
+
+  /**
+   * WOLF_LOBBY_KEEPS_JOYPADS: set by sessions/add when it takes over a lobby's kept joypads, taken (cleared) by the
+   * stream's next lobby join, which must not move them out of an app that has them already.
+   */
+  std::shared_ptr<immer::atom<std::shared_ptr<const TakenOverJoypads>>> taken_over_joypads =
+      std::make_shared<immer::atom<std::shared_ptr<const TakenOverJoypads>>>();
 
   /**
    * Bitmask (KEYBOARD_MODIFIERS) of the modifier keys the client is currently physically holding.

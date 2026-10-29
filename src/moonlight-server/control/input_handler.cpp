@@ -639,8 +639,8 @@ void pen(const PEN_PACKET &pkt, events::StreamSession &session) {
 
 /**
  * Takes joypad `controller_number` out of the session (the device goes away with the last reference), and returns
- * the event that unplugs it from where it is plugged in: the lobby that kept it while it still sits there
- * (KeptJoypads::plugged_into), else the session, which a lobby it joined relays. Nothing if it's already gone.
+ * the event that unplugs it from where it is plugged in: the lobby it was taken over from while it still sits there
+ * (StreamSession::taken_over_joypads), else the session, which a lobby it joined relays. Nothing if it's gone.
  * The caller holds `session.kept_joypads->mutex`, and fires the event once it has released it.
  */
 static std::optional<events::UnplugDeviceEvent> take_joypad(events::StreamSession &session, int controller_number) {
@@ -649,18 +649,18 @@ static std::optional<events::UnplugDeviceEvent> take_joypad(events::StreamSessio
   if (!joypad) {
     return {};
   }
-  auto &kept = *session.kept_joypads;
-  auto kept_in = kept.plugged_into.find(controller_number);
-  events::UnplugDeviceEvent unplug_ev{
-      .session_id = kept_in != kept.plugged_into.end() ? kept_in->second : std::to_string(session.session_id)};
+  // Until the stream joins a lobby (which takes taken_over_joypads), a pad it took over sits in that lobby's app
+  std::shared_ptr<const events::TakenOverJoypads> taken_over = session.taken_over_joypads->load();
+  auto taken = taken_over ? taken_over->joypads.find(controller_number) : nullptr;
+  events::UnplugDeviceEvent unplug_ev{.session_id = taken && *taken == *joypad ? taken_over->lobby_id
+                                                                               : std::to_string(session.session_id)};
   std::visit(
       [&unplug_ev](auto &pad) {
         unplug_ev.udev_events = pad.get_udev_events();
         unplug_ev.udev_hw_db_entries = pad.get_udev_hw_db_entries();
       },
       **joypad);
-  kept.plugged_into.erase(controller_number);
-  kept.unclaimed.erase(controller_number);
+  session.kept_joypads->unclaimed.erase(controller_number);
   session.joypads->update([&](events::JoypadList joypads) { return joypads.erase(controller_number); });
   return unplug_ev;
 }
