@@ -107,6 +107,11 @@ state::Host get_host_config(std::string_view pkey_filename, std::string_view cer
     logs::log(logs::info, "Encrypted RTSP is required: refusing Moonlight clients that don't support it");
   }
 
+  bool lobby_keeps_joypads = utils::get_env("WOLF_LOBBY_KEEPS_JOYPADS", "FALSE") == "TRUE"s;
+  if (lobby_keeps_joypads) {
+    logs::log(logs::info, "A stream ending in a lobby keeps its joypads plugged into the lobby for its next stream");
+  }
+
   docker::DockerAPI docker_api(utils::get_env("WOLF_DOCKER_SOCKET", "/var/run/docker.sock"));
   if (auto container = introspect::get_current_container(docker_api)) {
     host_base_state_folder =
@@ -127,7 +132,9 @@ state::Host get_host_config(std::string_view pkey_filename, std::string_view cer
           host_base_state_folder,
           local_base_state_folder,
           host_xdg_runtime_dir,
-          rtsp_require_encryption};
+          rtsp_require_encryption,
+          lobby_keeps_joypads,
+          state::http_servers_enabled()};
 }
 
 /**

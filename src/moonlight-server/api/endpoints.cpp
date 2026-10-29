@@ -405,6 +405,19 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
     new_session->rtsp_fake_ip = ss.rtsp_fake_ip;
     new_session->rtsp_encrypted = rtsp_encrypted;
 
+    // WOLF_LOBBY_KEEPS_JOYPADS: take over the joypads a lobby kept from this session's last stream, still plugged into
+    // its app, so the app never sees them replaced (controller_arrival skips a controller already present). Their
+    // callbacks send feedback through their own control_feedback, which this stream's ENet connect then points at it.
+    auto parked = state_->app_state->lobbies
+                      ? state::find_parked_joypads(state_->app_state->lobbies->load(), new_session->session_id)
+                      : std::nullopt;
+    if (parked) {
+      new_session->joypads->store(parked->second->joypads);
+      new_session->control_feedback = parked->second->control_feedback;
+      new_session->taken_over_joypads->store(std::make_shared<const events::TakenOverJoypads>(
+          events::TakenOverJoypads{.lobby_id = parked->first.id, .joypads = parked->second->joypads}));
+    }
+
     // Every session event is keyed by session_id: a second session under the same one would be unreachable.
     // Checked inside the update, so that concurrent adds for one client can't all pass the check.
     bool already_running = false;
@@ -418,6 +431,18 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
       auto res = GenericErrorResponse{.error = "Client already has a running session, stop it first"};
       send_http(socket, 409, rfl::json::write(res));
       return;
+    }
+    if (parked) {
+      // Unless a later stream end parked others meanwhile
+      parked->first.parked_joypads->update([&](const auto &all) {
+        auto current = all.find(new_session->session_id);
+        return current && *current == parked->second ? all.erase(new_session->session_id) : all;
+      });
+      logs::log(logs::info,
+                "[API] Session {} takes over {} joypad(s) kept by lobby {}",
+                new_session->session_id,
+                parked->second->joypads.size(),
+                parked->first.id);
     }
     state_->app_state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
 
