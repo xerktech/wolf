@@ -17,7 +17,6 @@
 #include <immer/box.hpp>
 #include <immer/map.hpp>
 #include <immer/vector.hpp>
-#include <map>
 #include <moonlight/control.hpp>
 #include <moonlight/data-structures.hpp>
 #include <mutex>
