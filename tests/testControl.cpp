@@ -19,6 +19,7 @@ using Catch::Matchers::Equals;
 #include <state/sessions.hpp>
 #include <streaming/streaming.hpp>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 using namespace moonlight::control;
 using namespace std::chrono_literals;
@@ -547,6 +548,83 @@ TEST_CASE("control: joypad feedback reaches the resumed stream's client", "[ENET
   resumed_client.disconnect();
   resumed_client.service(200ms);
   REQUIRE_FALSE(resumed.control_feedback->load()->send);
+}
+
+/*
+ * A /resume (or a lobby that kept its joypads) carries a PS pad over to the new stream, so its client's
+ * CONTROLLER_ARRIVAL finds the pad already there: it must still be asked for the motion data it advertises
+ * (XERK-2401). Creates a real DualSense, so it needs write access to /dev/uhid.
+ */
+TEST_CASE("control: a resumed stream's client is asked for its carried-over pad's motion", "[ENET][UHID]") {
+  if (access("/dev/uhid", W_OK) != 0) {
+    SKIP("needs write access to /dev/uhid");
+  }
+  using wolf::core::events::StreamSession;
+  constexpr int port = 47994;
+  const std::string old_key = "EDF04A215C4FBEA20934120C8480D855", new_key = "00112233445566778899AABBCCDDEEFF";
+  auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
+  auto make_session = [&](std::uint32_t enet_secret, const std::string &aes_key) {
+    StreamSession session{.event_bus = event_bus, .app = std::make_shared<wolf::core::events::App>()};
+    session.session_id = 42;
+    session.enet_secret_payload = enet_secret;
+    session.aes_key = aes_key;
+    session.ip = "10.255.255.1"; // never matches loopback, keep the IP fallback out of the way
+    return session;
+  };
+  auto send_arrival = [](TestENetClient &client, const std::string &key, std::uint32_t seq) {
+    auto pkt = pkts::CONTROLLER_ARRIVAL_PACKET{.controller_number = 0,
+                                               .controller_type = pkts::PS,
+                                               .capabilities = pkts::ANALOG_TRIGGERS | pkts::RUMBLE |
+                                                               pkts::ACCELEROMETER | pkts::GYRO};
+    pkt.packet_type = pkts::INPUT_DATA;
+    pkt.type = pkts::CONTROLLER_ARRIVAL;
+    client.send_encrypted(key, seq, {(char *)&pkt, sizeof(pkt)});
+  };
+  // The motion types (ACCELERATION, GYROSCOPE) Wolf asked the client for
+  auto motion_requests = [](const TestENetClient &client, const std::string &key) {
+    std::vector<int> types;
+    for (const auto &packet : client.received_packets) {
+      auto plaintext = decrypt_packet(*(ControlEncryptedPacket *)packet.data(),
+                                      key,
+                                      ControlEncryption::V1,
+                                      ControlPacketOrigin::HOST);
+      auto motion = (ControlMotionEventPacket *)plaintext.data();
+      if (plaintext.size() == sizeof(ControlMotionEventPacket) && motion->header.type == pkts::MOTION_EVENT) {
+        types.push_back(motion->type);
+      }
+    }
+    return types;
+  };
+
+  auto first = make_session(1, old_key);
+  state::SessionsAtoms running_sessions =
+      std::make_shared<immer::atom<immer::vector<StreamSession>>>(immer::vector{first});
+
+  REQUIRE(control::init());
+  std::thread([=] { control::run_control(port, running_sessions, event_bus, 20, 10ms, "127.0.0.1"); }).detach();
+  std::this_thread::sleep_for(200ms);
+
+  TestENetClient first_client(port, 1);
+  first_client.service(100ms);
+  // A first authenticated packet fixes the mode, so that what Wolf sends goes out once (not in both modes)
+  first_client.send_idr(old_key, 0, ControlEncryption::V1);
+  send_arrival(first_client, old_key, 1);
+  first_client.service(500ms);
+  REQUIRE(first.joypads->load()->size() == 1);
+  REQUIRE(motion_requests(first_client, old_key) == std::vector<int>{pkts::ACCELERATION, pkts::GYROSCOPE});
+
+  // /resume carries the joypad over to a new stream instance with a new key and, once it connects, a new peer
+  auto resumed = make_session(2, new_key);
+  resumed.joypads = first.joypads;
+  resumed.control_feedback = first.control_feedback;
+  running_sessions->store(immer::vector{resumed});
+  TestENetClient resumed_client(port, 2);
+  resumed_client.service(100ms);
+  resumed_client.send_idr(new_key, 0, ControlEncryption::V1);
+  send_arrival(resumed_client, new_key, 1);
+  resumed_client.service(500ms);
+  REQUIRE(resumed.joypads->load()->size() == 1); // the pad was taken over, not recreated
+  REQUIRE(motion_requests(resumed_client, new_key) == std::vector<int>{pkts::ACCELERATION, pkts::GYROSCOPE});
 }
 
 /*
