@@ -1,0 +1,592 @@
+diff --git a/include/inputtino/input.hpp b/include/inputtino/input.hpp
+index 10a1ffc..0155457 100644
+--- a/include/inputtino/input.hpp
++++ b/include/inputtino/input.hpp
+@@ -452,7 +452,6 @@ protected:
+   std::shared_ptr<PS5JoypadState> _state;
+ 
+ private:
+-  std::thread _send_input_thread;
+   PS5Joypad(uint16_t vendor_id);
+ };
+ } // namespace inputtino
+diff --git a/src/uhid/include/uhid/protected_types.hpp b/src/uhid/include/uhid/protected_types.hpp
+index effe6d5..cf66b02 100644
+--- a/src/uhid/include/uhid/protected_types.hpp
++++ b/src/uhid/include/uhid/protected_types.hpp
+@@ -1,7 +1,10 @@
+ #pragma once
++#include <atomic>
+ #include <functional>
+ #include <inputtino/input.hpp>
++#include <mutex>
+ #include <optional>
++#include <thread>
+ #include <uhid/ps5.hpp>
+ #include <uhid/uhid.hpp>
+ 
+@@ -21,16 +24,21 @@ struct PS5JoypadState {
+   unsigned char mac_address[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+   uint16_t vendor_id;
+ 
++  /* Guards current_state and last_touch_id: written by the caller, sent by send_input_thread */
++  std::mutex state_mtx;
+   uhid::dualsense_input_report current_state = {};
+   uint8_t last_touch_id = 0;
+ 
++  /* Guards the callbacks: set by the caller, invoked from the uhid thread */
++  std::mutex callbacks_mtx;
+   std::optional<std::function<void(int, int)>> on_rumble = std::nullopt;
+   std::optional<std::function<void(int, int, int)>> on_led = std::nullopt;
+   std::optional<std::function<void(const PS5Joypad::TriggerEffect &)>> on_trigger_effect = std::nullopt;
+   uint32_t last_left_trigger_event = 0;
+   uint32_t last_right_trigger_event = 0;
+ 
+-  bool stop_repeat_thread = false;
++  std::thread send_input_thread;
++  std::atomic<bool> stop_repeat_thread = false;
+   bool is_bluetooth = true;
+ };
+ } // namespace inputtino
+diff --git a/src/uhid/include/uhid/uhid.hpp b/src/uhid/include/uhid/uhid.hpp
+index 009b767..acc660e 100644
+--- a/src/uhid/include/uhid/uhid.hpp
++++ b/src/uhid/include/uhid/uhid.hpp
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <array>
++#include <atomic>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <functional>
+@@ -13,6 +15,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <string>
++#include <sys/eventfd.h>
+ #include <termios.h>
+ #include <thread>
+ #include <unistd.h>
+@@ -21,8 +24,10 @@
+ namespace uhid {
+ struct ThreadState {
+   int fd;
++  /* Written on stop to wake up the events thread from poll() */
++  int stop_fd = -1;
+   std::function<void(const uhid_event &ev, int fd)> on_event;
+-  bool stop_repeat_thread = false;
++  std::atomic<bool> stop_repeat_thread = false;
+ };
+ 
+ struct DeviceDefinition {
+@@ -74,23 +79,34 @@ public:
+   }
+ 
+   inline void stop_thread() {
++    if (!state) {
++      return;
++    }
+     state->stop_repeat_thread = true;
+-    if (ev_thread->joinable()) {
+-      ev_thread->join(); // let's wait for the thread to finish
++    if (state->stop_fd >= 0) {
++      eventfd_write(state->stop_fd, 1);
++    }
++    if (ev_thread && ev_thread->joinable()) {
++      if (ev_thread->get_id() == std::this_thread::get_id()) {
++        ev_thread->detach(); // Called from on_event: we can't join ourselves
++      } else {
++        ev_thread->join(); // let's wait for the thread to finish
++      }
+     }
+   }
+ 
+   ~Device() {
+     if (state) {
++      // Stop the thread first, so that it doesn't poll() a closed (or reused) fd
++      stop_thread();
++
+       struct uhid_event ev{};
+       ev.type = UHID_DESTROY;
+       uhid_write(state->fd, &ev);
+ 
+-      close(state->fd); // This should also close the thread by causing a POLLHUP
+-
+-      state->stop_repeat_thread = true;
+-      if (ev_thread->joinable()) {
+-        ev_thread->join(); // let's wait for the thread to finish
++      close(state->fd);
++      if (state->stop_fd >= 0) {
++        close(state->stop_fd);
+       }
+     }
+   }
+@@ -125,9 +141,11 @@ inputtino::Result<Device> Device::create(const DeviceDefinition &definition,
+   if (res) {
+     auto state = std::make_shared<ThreadState>();
+     state->fd = fd;
++    state->stop_fd = eventfd(0, EFD_CLOEXEC);
+     state->on_event = on_event;
+     auto thread = std::make_shared<std::thread>([state]() {
+-      std::array<pollfd, 1> pfds = {pollfd{.fd = state->fd, .events = POLLIN}};
++      std::array<pollfd, 2> pfds = {pollfd{.fd = state->fd, .events = POLLIN},
++                                    pollfd{.fd = state->stop_fd, .events = POLLIN}};
+       int poll_rs = 0;
+ 
+       while (!state->stop_repeat_thread) {
+@@ -157,7 +175,6 @@ inputtino::Result<Device> Device::create(const DeviceDefinition &definition,
+         }
+       }
+     });
+-    thread->detach();
+     return inputtino::Result<Device>({std::move(thread), std::move(state)});
+   } else {
+     close(fd);
+diff --git a/src/uhid/joypad_ps5.cpp b/src/uhid/joypad_ps5.cpp
+index 96a5a92..8b8993d 100644
+--- a/src/uhid/joypad_ps5.cpp
++++ b/src/uhid/joypad_ps5.cpp
+@@ -20,6 +20,9 @@ static uint32_t sign_crc32(uint32_t seed, const unsigned char *buffer, size_t le
+   return crc;
+ }
+ 
++/**
++ * Sends the current_state to the device; the caller must hold state.state_mtx
++ */
+ static void send_report(PS5JoypadState &state) {
+   { // setup timestamp and increase seq_number
+     state.current_state.seq_number++;
+@@ -155,16 +158,26 @@ static void on_uhid_event(std::shared_ptr<PS5JoypadState> state, uhid_event ev,
+      * The PS5 joypad seems to report values in the range 0-255,
+      * we'll turn those into 0-0xFFFF
+      */
++    decltype(state->on_rumble) on_rumble;
++    decltype(state->on_trigger_effect) on_trigger_effect;
++    decltype(state->on_led) on_led;
++    {
++      std::lock_guard lock(state->callbacks_mtx);
++      on_rumble = state->on_rumble;
++      on_trigger_effect = state->on_trigger_effect;
++      on_led = state->on_led;
++    }
++
+     if (report.valid_flag0 & uhid::MOTOR_OR_COMPATIBLE_VIBRATION || report.valid_flag2 & uhid::COMPATIBLE_VIBRATION) {
+       auto left = (report.motor_left / 255.0f) * 0xFFFF;
+       auto right = (report.motor_right / 255.0f) * 0xFFFF;
+-      if (state->on_rumble) {
+-        (*state->on_rumble)(left, right);
++      if (on_rumble) {
++        (*on_rumble)(left, right);
+       }
+     } else if (report.valid_flag0 == 0 && report.valid_flag1 == 0 && report.valid_flag2 == 0) {
+       // Seems to be a special stop rumble event, let's propagate it
+-      if (state->on_rumble) {
+-        (*state->on_rumble)(0, 0);
++      if (on_rumble) {
++        (*on_rumble)(0, 0);
+       }
+     }
+ 
+@@ -173,7 +186,7 @@ static void on_uhid_event(std::shared_ptr<PS5JoypadState> state, uhid_event ev,
+      */
+     bool right_trigger = report.valid_flag0 & uhid::RIGHT_TRIGGER_EFFECT;
+     bool left_trigger = report.valid_flag0 & uhid::LEFT_TRIGGER_EFFECT;
+-    if ((right_trigger || left_trigger) && state->on_trigger_effect) {
++    if ((right_trigger || left_trigger) && on_trigger_effect) {
+       auto left_array_start = std::begin(report.left_trigger_effect);
+       auto left_array_end = std::end(report.left_trigger_effect);
+       auto right_array_start = std::begin(report.right_trigger_effect);
+@@ -197,7 +210,7 @@ static void on_uhid_event(std::shared_ptr<PS5JoypadState> state, uhid_event ev,
+                                            .type_right = report.right_trigger_effect_type};
+         std::copy(left_array_start, left_array_end, std::begin(effect.left));
+         std::copy(right_array_start, right_array_end, std::begin(effect.right));
+-        (*state->on_trigger_effect)(effect);
++        (*on_trigger_effect)(effect);
+       }
+     }
+ 
+@@ -205,9 +218,9 @@ static void on_uhid_event(std::shared_ptr<PS5JoypadState> state, uhid_event ev,
+      * LED
+      */
+     if (report.valid_flag1 & uhid::LIGHTBAR_ENABLE) {
+-      if (state->on_led) {
++      if (on_led) {
+         // TODO: should we blend brightness?
+-        (*state->on_led)(report.lightbar_red, report.lightbar_green, report.lightbar_blue);
++        (*on_led)(report.lightbar_red, report.lightbar_green, report.lightbar_blue);
+       }
+     }
+   }
+@@ -238,8 +251,8 @@ PS5Joypad::PS5Joypad(uint16_t vendor_id) : _state(std::make_shared<PS5JoypadStat
+ PS5Joypad::~PS5Joypad() {
+   if (this->_state && this->_state->dev) {
+     this->_state->stop_repeat_thread = true;
+-    if (this->_send_input_thread.joinable()) {
+-      this->_send_input_thread.join();
++    if (this->_state->send_input_thread.joinable()) {
++      this->_state->send_input_thread.join();
+     }
+     this->_state->dev->stop_thread();
+     this->_state->dev.reset(); // Will trigger ~Device and ultimately destroy the device
+@@ -274,20 +287,23 @@ Result<PS5Joypad> PS5Joypad::create(const DeviceDefinition &device) {
+     def.uniq = joypad.get_mac_address();
+   }
+ 
++  // Set before creating the device: the uhid thread reads it as soon as it starts
++  joypad._state->is_bluetooth = use_bluetooth;
+   auto dev =
+       uhid::Device::create(def, [state = joypad._state](uhid_event ev, int fd) { on_uhid_event(state, ev, fd); });
+   if (dev) {
+-    joypad._state->is_bluetooth = use_bluetooth;
+     joypad._state->dev = std::make_shared<uhid::Device>(std::move(*dev));
+ 
+     // Readers will expect frequent events event if the state hasn't changed
+-    joypad._send_input_thread = std::thread([state = joypad._state]() {
++    joypad._state->send_input_thread = std::thread([state = joypad._state]() {
+       while (!state->stop_repeat_thread) {
+-        send_report(*state);
++        {
++          std::lock_guard lock(state->state_mtx);
++          send_report(*state);
++        }
+         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+       }
+     });
+-    joypad._send_input_thread.detach();
+ 
+     return joypad;
+   }
+@@ -383,6 +399,7 @@ std::vector<std::string> PS5Joypad::get_nodes() const {
+ }
+ 
+ void PS5Joypad::set_pressed_buttons(unsigned int pressed) {
++  std::lock_guard lock(this->_state->state_mtx);
+   { // First reset everything to non-pressed
+     this->_state->current_state.buttons[0] = 0;
+     // Don't reset L2 and R2, these are handled in set_triggers
+@@ -459,6 +476,7 @@ void PS5Joypad::set_pressed_buttons(unsigned int pressed) {
+   send_report(*this->_state);
+ }
+ void PS5Joypad::set_triggers(int16_t left, int16_t right) {
++  std::lock_guard lock(this->_state->state_mtx);
+   this->_state->current_state.z = scale_value(left, 0, 255, uhid::PS5_AXIS_MIN, uhid::PS5_AXIS_MAX);
+   this->_state->current_state.rz = scale_value(right, 0, 255, uhid::PS5_AXIS_MIN, uhid::PS5_AXIS_MAX);
+ 
+@@ -475,6 +493,7 @@ void PS5Joypad::set_triggers(int16_t left, int16_t right) {
+   send_report(*this->_state);
+ }
+ void PS5Joypad::set_stick(Joypad::STICK_POSITION stick_type, short x, short y) {
++  std::lock_guard lock(this->_state->state_mtx);
+   switch (stick_type) {
+   case RS: {
+     this->_state->current_state.rx = scale_value(x, -32768, 32767, uhid::PS5_AXIS_MIN, uhid::PS5_AXIS_MAX);
+@@ -491,6 +510,7 @@ void PS5Joypad::set_stick(Joypad::STICK_POSITION stick_type, short x, short y) {
+   }
+ }
+ void PS5Joypad::set_on_rumble(const std::function<void(int, int)> &callback) {
++  std::lock_guard lock(this->_state->callbacks_mtx);
+   this->_state->on_rumble = callback;
+ }
+ 
+@@ -503,6 +523,7 @@ static __le16 to_le_signed(float original, float value) {
+ }
+ 
+ void PS5Joypad::set_motion(PS5Joypad::MOTION_TYPE type, float x, float y, float z) {
++  std::lock_guard lock(this->_state->state_mtx);
+   switch (type) {
+   case ACCELERATION: {
+     this->_state->current_state.accel[0] = to_le_signed(x, (x * uhid::SDL_STANDARD_GRAVITY_CONST * 100));
+@@ -524,6 +545,7 @@ void PS5Joypad::set_motion(PS5Joypad::MOTION_TYPE type, float x, float y, float
+ }
+ 
+ void PS5Joypad::set_battery(PS5Joypad::BATTERY_STATE state, int percentage) {
++  std::lock_guard lock(this->_state->state_mtx);
+   /*
+    * Each unit of battery data corresponds to 10%
+    * 0 = 0-9%, 1 = 10-19%, .. and 10 = 100%
+@@ -534,14 +556,17 @@ void PS5Joypad::set_battery(PS5Joypad::BATTERY_STATE state, int percentage) {
+ }
+ 
+ void PS5Joypad::set_on_led(const std::function<void(int, int, int)> &callback) {
++  std::lock_guard lock(this->_state->callbacks_mtx);
+   this->_state->on_led = callback;
+ }
+ 
+ void PS5Joypad::set_on_trigger_effect(const std::function<void(const TriggerEffect &)> &callback) {
++  std::lock_guard lock(this->_state->callbacks_mtx);
+   this->_state->on_trigger_effect = callback;
+ }
+ 
+ void PS5Joypad::place_finger(int finger_nr, uint16_t x, uint16_t y) {
++  std::lock_guard lock(this->_state->state_mtx);
+   if (finger_nr <= 1) {
+     // If this finger was previously unpressed, we should increase the touch id
+     if (this->_state->current_state.points[finger_nr].contact == 1) {
+@@ -560,6 +585,7 @@ void PS5Joypad::place_finger(int finger_nr, uint16_t x, uint16_t y) {
+ }
+ 
+ void PS5Joypad::release_finger(int finger_nr) {
++  std::lock_guard lock(this->_state->state_mtx);
+   if (finger_nr <= 1) {
+     // if it goes above 0x7F we should reset it to 0
+     if (this->_state->last_touch_id >= 0x7E) {
+diff --git a/src/uinput/include/inputtino/protected_types.hpp b/src/uinput/include/inputtino/protected_types.hpp
+index 911fb03..5f85855 100644
+--- a/src/uinput/include/inputtino/protected_types.hpp
++++ b/src/uinput/include/inputtino/protected_types.hpp
+@@ -1,10 +1,14 @@
+ #pragma once
+ 
++#include <atomic>
++#include <condition_variable>
+ #include <cstring>
+ #include <inputtino/input.hpp>
+ #include <iostream>
+ #include <libevdev/libevdev-uinput.h>
+ #include <libevdev/libevdev.h>
++#include <mutex>
++#include <sys/eventfd.h>
+ #include <thread>
+ #include <unistd.h>
+ 
+@@ -18,7 +22,7 @@ using libevdev_event_ptr = std::shared_ptr<input_event>;
+  */
+ static std::vector<libevdev_event_ptr> fetch_events(int uinput_fd, int max_events = 50) {
+   std::vector<libevdev_event_ptr> events = {};
+-  struct input_event ev {};
++  struct input_event ev{};
+   int ret, read_events = 0;
+   while (read_events < max_events && (ret = read(uinput_fd, &ev, sizeof(ev))) == sizeof(ev)) {
+     events.push_back(std::make_shared<input_event>(ev));
+@@ -42,19 +46,48 @@ struct BaseJoypadState {
+   libevdev_uinput_ptr joy = nullptr;
+   int currently_pressed_btns = 0;
+ 
+-  bool stop_listening_events = false;
++  std::atomic<bool> stop_listening_events = false;
++  /* Written on stop to wake up the events thread from poll() */
++  int stop_events_fd = -1;
+   std::thread events_thread;
+ 
++  /* on_rumble is set from the caller's thread and invoked from events_thread */
++  std::mutex on_rumble_mtx;
+   std::optional<std::function<void(int low_freq, int high_freq)>> on_rumble = std::nullopt;
+ };
+ 
++/**
++ * Stops the events thread (if any) and waits for it to finish.
++ */
++static void stop_events_thread(BaseJoypadState &state) {
++  state.stop_listening_events = true;
++  if (state.stop_events_fd >= 0) {
++    eventfd_write(state.stop_events_fd, 1);
++  }
++  if (state.events_thread.joinable()) {
++    if (state.events_thread.get_id() == std::this_thread::get_id()) {
++      state.events_thread.detach(); // Called from a callback: we can't join ourselves
++    } else {
++      state.events_thread.join();
++    }
++  }
++  if (state.stop_events_fd >= 0) {
++    close(state.stop_events_fd);
++    state.stop_events_fd = -1;
++  }
++}
++
+ struct XboxOneJoypadState : BaseJoypadState {};
+ struct SwitchJoypadState : BaseJoypadState {};
+ 
+ struct KeyboardState {
+   std::thread repeat_press_t;
+-  bool stop_repeat_thread = false;
+   libevdev_uinput_ptr kb = nullptr;
++
++  /* Guards stop_repeat_thread and cur_press_keys, shared with repeat_press_t */
++  std::mutex mtx;
++  std::condition_variable stop_cv;
++  bool stop_repeat_thread = false;
+   std::vector<short> cur_press_keys = {};
+ };
+ 
+diff --git a/src/uinput/joypad_nintendo.cpp b/src/uinput/joypad_nintendo.cpp
+index ad50edf..3563159 100644
+--- a/src/uinput/joypad_nintendo.cpp
++++ b/src/uinput/joypad_nintendo.cpp
+@@ -83,10 +83,7 @@ SwitchJoypad::SwitchJoypad() : _state(std::make_shared<SwitchJoypadState>()) {}
+ 
+ SwitchJoypad::~SwitchJoypad() {
+   if (_state) {
+-    _state->stop_listening_events = true;
+-    if (_state->joy.get() != nullptr && _state->events_thread.joinable()) {
+-      _state->events_thread.join();
+-    }
++    stop_events_thread(*_state);
+   }
+ }
+ 
+@@ -99,9 +96,8 @@ Result<SwitchJoypad> SwitchJoypad::create(const DeviceDefinition &device) {
+   SwitchJoypad joypad;
+   joypad._state->joy = std::move(*joy_el);
+ 
+-  auto event_thread = std::thread(event_listener, joypad._state);
+-  joypad._state->events_thread = std::move(event_thread);
+-  joypad._state->events_thread.detach();
++  joypad._state->stop_events_fd = eventfd(0, EFD_CLOEXEC);
++  joypad._state->events_thread = std::thread(event_listener, joypad._state);
+ 
+   return joypad;
+ }
+@@ -185,6 +181,7 @@ void SwitchJoypad::set_triggers(int16_t left, int16_t right) {
+ }
+ 
+ void SwitchJoypad::set_on_rumble(const std::function<void(int, int)> &callback) {
++  std::lock_guard lock(this->_state->on_rumble_mtx);
+   this->_state->on_rumble = callback;
+ }
+ } // namespace inputtino
+diff --git a/src/uinput/joypad_utils.hpp b/src/uinput/joypad_utils.hpp
+index 6822641..2983e4e 100644
+--- a/src/uinput/joypad_utils.hpp
++++ b/src/uinput/joypad_utils.hpp
+@@ -148,7 +148,11 @@ static ActiveRumbleEffect create_rumble_effect(const ff_effect &effect) {
+  *   You can test the virtual devices that we create by simply using the utility `fftest`
+  */
+ static void event_listener(const std::shared_ptr<BaseJoypadState> &state) {
+-  std::this_thread::sleep_for(100ms); // We have to sleep in order to be able to read from the newly created device
++  // We have to sleep in order to be able to read from the newly created device
++  pollfd stop_pfd = {.fd = state->stop_events_fd, .events = POLLIN};
++  if (poll(&stop_pfd, 1, 100) > 0 || state->stop_listening_events) {
++    return;
++  }
+ 
+   auto uinput_fd = libevdev_uinput_get_fd(state->joy.get());
+   if (uinput_fd < 0) {
+@@ -167,7 +171,8 @@ static void event_listener(const std::shared_ptr<BaseJoypadState> &state) {
+   /* This can only be set globally when receiving FF_GAIN */
+   unsigned int current_gain = MAX_GAIN;
+ 
+-  std::array<pollfd, 1> pfds = {pollfd{.fd = uinput_fd, .events = POLLIN}};
++  std::array<pollfd, 2> pfds = {pollfd{.fd = uinput_fd, .events = POLLIN},
++                                pollfd{.fd = state->stop_events_fd, .events = POLLIN}};
+   int poll_rs = 0;
+ 
+   while (!state->stop_listening_events) {
+@@ -235,7 +240,12 @@ static void event_listener(const std::shared_ptr<BaseJoypadState> &state) {
+       prev_rumble.first = current_rumble.first;
+       prev_rumble.second = current_rumble.second;
+ 
+-      if (auto callback = state->on_rumble) {
++      std::optional<std::function<void(int, int)>> callback;
++      {
++        std::lock_guard lock(state->on_rumble_mtx);
++        callback = state->on_rumble;
++      }
++      if (callback) {
+         callback.value()(static_cast<int>((current_rumble.second * current_gain / MAX_GAIN)),
+                          static_cast<int>((current_rumble.first * current_gain / MAX_GAIN)));
+       }
+diff --git a/src/uinput/joypad_xbox.cpp b/src/uinput/joypad_xbox.cpp
+index 7f26249..0492ad3 100644
+--- a/src/uinput/joypad_xbox.cpp
++++ b/src/uinput/joypad_xbox.cpp
+@@ -80,10 +80,7 @@ XboxOneJoypad::XboxOneJoypad() : _state(std::make_shared<XboxOneJoypadState>())
+ 
+ XboxOneJoypad::~XboxOneJoypad() {
+   if (_state) {
+-    _state->stop_listening_events = true;
+-    if (_state->joy.get() != nullptr && _state->events_thread.joinable()) {
+-      _state->events_thread.join();
+-    }
++    stop_events_thread(*_state);
+   }
+ }
+ 
+@@ -96,9 +93,8 @@ Result<XboxOneJoypad> XboxOneJoypad::create(const DeviceDefinition &device) {
+   XboxOneJoypad joypad;
+   joypad._state->joy = std::move(*joy_el);
+ 
+-  auto event_thread = std::thread(event_listener, joypad._state);
+-  joypad._state->events_thread = std::move(event_thread);
+-  joypad._state->events_thread.detach();
++  joypad._state->stop_events_fd = eventfd(0, EFD_CLOEXEC);
++  joypad._state->events_thread = std::thread(event_listener, joypad._state);
+   return joypad;
+ }
+ 
+@@ -184,6 +180,7 @@ void XboxOneJoypad::set_triggers(int16_t left, int16_t right) {
+ }
+ 
+ void XboxOneJoypad::set_on_rumble(const std::function<void(int, int)> &callback) {
++  std::lock_guard lock(this->_state->on_rumble_mtx);
+   this->_state->on_rumble = callback;
+ }
+ 
+diff --git a/src/uinput/keyboard.cpp b/src/uinput/keyboard.cpp
+index f0ec283..388d130 100644
+--- a/src/uinput/keyboard.cpp
++++ b/src/uinput/keyboard.cpp
+@@ -2,8 +2,8 @@
+ 
+ #include <algorithm>
+ #include <cstring>
+-#include <inputtino/protected_types.hpp>
+ #include <inputtino/keyboard.hpp>
++#include <inputtino/protected_types.hpp>
+ #include <thread>
+ 
+ namespace inputtino {
+@@ -63,7 +63,11 @@ Keyboard::Keyboard() : _state(std::make_shared<KeyboardState>()) {}
+ 
+ Keyboard::~Keyboard() {
+   if (_state) {
+-    _state->stop_repeat_thread = true;
++    {
++      std::lock_guard lock(_state->mtx);
++      _state->stop_repeat_thread = true;
++    }
++    _state->stop_cv.notify_all();
+     if (_state->repeat_press_t.joinable()) {
+       _state->repeat_press_t.join();
+     }
+@@ -75,9 +79,11 @@ Result<Keyboard> Keyboard::create(const DeviceDefinition &device, int millis_rep
+   if (kb_el) {
+     Keyboard kb;
+     kb._state->kb = std::move(*kb_el);
+-    auto repeat_thread = std::thread([state = kb._state, millis_repress_key]() {
+-      while (!state->stop_repeat_thread) {
+-        std::this_thread::sleep_for(std::chrono::milliseconds(millis_repress_key));
++    kb._state->repeat_press_t = std::thread([state = kb._state, millis_repress_key]() {
++      std::unique_lock lock(state->mtx);
++      while (!state->stop_cv.wait_for(lock, std::chrono::milliseconds(millis_repress_key), [&state] {
++        return state->stop_repeat_thread;
++      })) {
+         for (auto key : state->cur_press_keys) {
+           if (auto keyboard = state->kb.get()) {
+             press_btn(keyboard, key);
+@@ -85,8 +91,6 @@ Result<Keyboard> Keyboard::create(const DeviceDefinition &device, int millis_rep
+         }
+       }
+     });
+-    kb._state->repeat_press_t = std::move(repeat_thread);
+-    kb._state->repeat_press_t.detach();
+     return kb;
+   } else {
+     return Error(kb_el.getErrorMessage());
+@@ -95,6 +99,7 @@ Result<Keyboard> Keyboard::create(const DeviceDefinition &device, int millis_rep
+ 
+ void Keyboard::press(short key_code) {
+   if (auto keyboard = _state->kb.get()) {
++    std::lock_guard lock(_state->mtx);
+     if (auto key = press_btn(keyboard, key_code)) {
+       _state->cur_press_keys.push_back(key_code);
+     }
+@@ -106,6 +111,7 @@ void Keyboard::release(short key_code) {
+   if (search_key != keyboard::key_mappings.end()) {
+     if (auto keyboard = _state->kb.get()) {
+       auto mapped_key = search_key->second;
++      std::lock_guard lock(_state->mtx);
+       this->_state->cur_press_keys.erase(
+           std::remove(this->_state->cur_press_keys.begin(), this->_state->cur_press_keys.end(), key_code),
+           this->_state->cur_press_keys.end());
