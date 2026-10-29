@@ -8,6 +8,7 @@
 #include <immer/box.hpp>
 #include <platforms/input.hpp>
 #include <string>
+#include <thread>
 
 namespace control {
 
@@ -637,40 +638,31 @@ void pen(const PEN_PACKET &pkt, events::StreamSession &session) {
 }
 
 /**
- * Unplugs joypad `controller_number` from where it is plugged in (`plugged_into`: a session or lobby id) and drops it
- * from the session; the device goes away with the last reference.
+ * Takes joypad `controller_number` out of the session (the device goes away with the last reference), and returns
+ * the event that unplugs it from where it is plugged in: the lobby that kept it while it still sits there
+ * (KeptJoypads::plugged_into), else the session, which a lobby it joined relays. Nothing if it's already gone.
+ * The caller holds `session.kept_joypads->mutex`, and fires the event once it has released it.
  */
-static void unplug_joypad(events::StreamSession &session,
-                          int controller_number,
-                          const events::JoypadTypes &joypad,
-                          const std::string &plugged_into) {
-  events::UnplugDeviceEvent unplug_ev{.session_id = plugged_into};
+static std::optional<events::UnplugDeviceEvent> take_joypad(events::StreamSession &session, int controller_number) {
+  events::JoypadList joypads = session.joypads->load();
+  auto joypad = joypads.find(controller_number);
+  if (!joypad) {
+    return {};
+  }
+  auto &kept = *session.kept_joypads;
+  auto kept_in = kept.plugged_into.find(controller_number);
+  events::UnplugDeviceEvent unplug_ev{
+      .session_id = kept_in != kept.plugged_into.end() ? kept_in->second : std::to_string(session.session_id)};
   std::visit(
       [&unplug_ev](auto &pad) {
         unplug_ev.udev_events = pad.get_udev_events();
         unplug_ev.udev_hw_db_entries = pad.get_udev_hw_db_entries();
       },
-      joypad);
-  session.event_bus->fire_event(immer::box<events::UnplugDeviceEvent>(unplug_ev));
+      **joypad);
+  kept.plugged_into.erase(controller_number);
+  kept.unclaimed.erase(controller_number);
   session.joypads->update([&](events::JoypadList joypads) { return joypads.erase(controller_number); });
-}
-
-/**
- * The client claims joypad `controller_number` (it sent its arrival or input): if it was one the stream took over from
- * a lobby (StreamSession::unclaimed_joypads), returns the id of the lobby it's plugged into, and it is no longer
- * unclaimed.
- */
-static std::optional<std::string> claim_joypad(events::StreamSession &session, int controller_number) {
-  if (session.unclaimed_joypads->load()->empty()) { // the usual case, on every joypad input
-    return {};
-  }
-  std::optional<std::string> lobby_id;
-  session.unclaimed_joypads->update([&](const immer::map<int, std::string> &unclaimed) {
-    auto found = unclaimed.find(controller_number);
-    lobby_id = found ? std::optional<std::string>{*found} : std::nullopt;
-    return found ? unclaimed.erase(controller_number) : unclaimed;
-  });
-  return lobby_id;
+  return unplug_ev;
 }
 
 static bool is_joypad_type(const events::JoypadTypes &joypad, wolf::config::ControllerType type) {
@@ -687,23 +679,36 @@ static bool is_joypad_type(const events::JoypadTypes &joypad, wolf::config::Cont
 void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
                         events::StreamSession &session,
                         immer::box<std::shared_ptr<ENetPeer>> connected_client) {
-  auto joypads = session.joypads->load();
-  auto kept_in_lobby = claim_joypad(session, pkt.controller_number);
-  if (auto joypad = joypads->find(pkt.controller_number)) {
-    auto requested =
-        joypad_type(session, pkt.controller_number, (CONTROLLER_TYPE)pkt.controller_type, pkt.capabilities);
-    if (!kept_in_lobby || is_joypad_type(**joypad, requested)) {
-      logs::log(logs::debug,
-                "[INPUT] Received CONTROLLER_ARRIVAL for controller {} which is already present; skipping...",
-                pkt.controller_number);
-      return;
+  bool present;
+  std::optional<events::UnplugDeviceEvent> replaced;
+  {
+    std::lock_guard lock(session.kept_joypads->mutex);
+    events::JoypadList joypads = session.joypads->load();
+    auto joypad = joypads.find(pkt.controller_number);
+    // The client claims it: if the stream took it over from a lobby, it's no longer unclaimed
+    bool kept = session.kept_joypads->unclaimed.erase(pkt.controller_number) > 0;
+    present = joypad != nullptr;
+    if (present && kept &&
+        !is_joypad_type(
+            **joypad,
+            joypad_type(session, pkt.controller_number, (CONTROLLER_TYPE)pkt.controller_type, pkt.capabilities))) {
+      // A pad kept from the session's last stream, but this client brings another kind of controller in its place
+      replaced = take_joypad(session, pkt.controller_number);
+      present = false;
     }
-    // A pad kept from the session's last stream, but this client brings another kind of controller in its place
+  }
+  if (replaced) {
     logs::log(logs::info,
               "[INPUT] Controller {} of session {} arrives as another type than the joypad kept for it; replacing it",
               pkt.controller_number,
               session.session_id);
-    unplug_joypad(session, pkt.controller_number, **joypad, *kept_in_lobby);
+    session.event_bus->fire_event(immer::box<events::UnplugDeviceEvent>(*replaced));
+  }
+  if (present) {
+    logs::log(logs::debug,
+              "[INPUT] Received CONTROLLER_ARRIVAL for controller {} which is already present; skipping...",
+              pkt.controller_number);
+    return;
   }
   create_new_joypad(session,
                     connected_client,
@@ -713,18 +718,43 @@ void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
 }
 
 void release_unclaimed_joypads(events::StreamSession &session) {
-  immer::map<int, std::string> unclaimed = session.unclaimed_joypads->exchange({}).get();
-  auto joypads = session.joypads->load();
-  for (auto [joypad_nr, lobby_id] : unclaimed) {
-    if (auto joypad = joypads->find(joypad_nr)) {
-      logs::log(logs::info,
-                "[INPUT] Session {} didn't claim the joypad {} kept for it; unplugging it from lobby {}",
-                session.session_id,
-                joypad_nr,
-                lobby_id);
-      unplug_joypad(session, joypad_nr, **joypad, lobby_id);
+  std::vector<events::UnplugDeviceEvent> unplugs;
+  {
+    std::lock_guard lock(session.kept_joypads->mutex);
+    auto unclaimed = session.kept_joypads->unclaimed; // take_joypad erases from it
+    for (int joypad_nr : unclaimed) {
+      if (auto unplug_ev = take_joypad(session, joypad_nr)) {
+        logs::log(logs::info,
+                  "[INPUT] Session {} didn't claim the joypad {} kept for it; unplugging it from {}",
+                  session.session_id,
+                  joypad_nr,
+                  unplug_ev->session_id);
+        unplugs.push_back(*unplug_ev);
+      }
+    }
+    session.kept_joypads->unclaimed.clear();
+  }
+  for (const auto &unplug_ev : unplugs) {
+    session.event_bus->fire_event(immer::box<events::UnplugDeviceEvent>(unplug_ev));
+  }
+}
+
+void release_unclaimed_joypads_after(const state::SessionsAtoms &running_sessions,
+                                     const events::StreamSession &session,
+                                     std::chrono::milliseconds timeout) {
+  {
+    std::lock_guard lock(session.kept_joypads->mutex);
+    if (session.kept_joypads->unclaimed.empty()) {
+      return;
     }
   }
+  std::thread([running_sessions, session, timeout]() mutable {
+    std::this_thread::sleep_for(timeout);
+    // Not for a stream that a /resume replaced or that was stopped meanwhile
+    if (state::is_running_instance(running_sessions->load(), session)) {
+      release_unclaimed_joypads(session);
+    }
+  }).detach();
 }
 
 void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
@@ -734,17 +764,20 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
   std::shared_ptr<events::JoypadTypes> selected_pad;
   if (auto joypad = joypads->find(pkt.controller_number)) {
     selected_pad = std::move(*joypad);
-    // Old Moonlight sends no CONTROLLER_ARRIVAL: a kept pad's first input claims it
-    auto kept_in_lobby = claim_joypad(session, pkt.controller_number);
-
-    // Check if Moonlight is sending the final packet for this pad
-    if (!(pkt.active_gamepad_mask & (1 << pkt.controller_number))) {
-      logs::log(logs::debug, "Removing joypad {}", pkt.controller_number);
+    std::optional<events::UnplugDeviceEvent> removed;
+    {
+      std::lock_guard lock(session.kept_joypads->mutex);
+      // Old Moonlight sends no CONTROLLER_ARRIVAL: a kept pad's first input claims it
+      session.kept_joypads->unclaimed.erase(pkt.controller_number);
+      // Check if Moonlight is sending the final packet for this pad
+      if (!(pkt.active_gamepad_mask & (1 << pkt.controller_number))) {
+        logs::log(logs::debug, "Removing joypad {}", pkt.controller_number);
+        removed = take_joypad(session, pkt.controller_number);
+      }
+    }
+    if (removed) {
       // Send the event downstream, Docker will pick it up and remove the device
-      unplug_joypad(session,
-                    pkt.controller_number,
-                    *selected_pad,
-                    kept_in_lobby ? *kept_in_lobby : std::to_string(session.session_id));
+      session.event_bus->fire_event(immer::box<events::UnplugDeviceEvent>(*removed));
     }
   } else {
     // Old Moonlight doesn't support CONTROLLER_ARRIVAL, we create a default pad when it's first mentioned

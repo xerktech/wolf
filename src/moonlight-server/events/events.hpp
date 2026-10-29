@@ -17,11 +17,13 @@
 #include <immer/box.hpp>
 #include <immer/map.hpp>
 #include <immer/vector.hpp>
+#include <map>
 #include <moonlight/control.hpp>
 #include <moonlight/data-structures.hpp>
 #include <mutex>
 #include <rfl.hpp>
 #include <rfl/json.hpp>
+#include <set>
 #include <state/serialised_config.hpp>
 #include <string_view>
 
@@ -516,6 +518,25 @@ struct ParkedJoypads {
   std::shared_ptr<immer::atom<ControlFeedback>> control_feedback;
 };
 
+/**
+ * WOLF_LOBBY_KEEPS_JOYPADS: the joypads a stream took over from a lobby (sessions/add), by controller number.
+ * A CONTROLLER_ARRIVAL or the pad's first input claims one; those still unclaimed a while after the client connects
+ * are unplugged (control::release_unclaimed_joypads).
+ *
+ * One mutex over both sets and the session's `joypads` they refer to: a claim, a release and the lobby keeping the
+ * pads again each read and change them together. Never fire an event while holding it (lobby handlers take it).
+ */
+struct KeptJoypads {
+  std::mutex mutex;
+  /**
+   * Those still plugged into the app of the lobby that kept them (its id) instead of following the session's own
+   * device routing: until the session joins a lobby, which moves them.
+   */
+  std::map<int, std::string> plugged_into;
+  /** Those the client hasn't claimed yet */
+  std::set<int> unclaimed;
+};
+
 struct StreamSession {
   moonlight::DisplayMode display_mode;
   int audio_channel_count;
@@ -605,13 +626,7 @@ struct StreamSession {
    */
   std::shared_ptr<immer::atom<ControlFeedback>> control_feedback = std::make_shared<immer::atom<ControlFeedback>>();
 
-  /**
-   * WOLF_LOBBY_KEEPS_JOYPADS: the joypads this stream took over from a lobby (sessions/add) that its client hasn't
-   * claimed yet, by controller number, with the id of the lobby whose app they are plugged into. A CONTROLLER_ARRIVAL
-   * or the pad's first input claims one; those still unclaimed a while after the client connects are unplugged.
-   */
-  std::shared_ptr<immer::atom<immer::map<int, std::string>>> unclaimed_joypads =
-      std::make_shared<immer::atom<immer::map<int, std::string>>>();
+  std::shared_ptr<KeptJoypads> kept_joypads = std::make_shared<KeptJoypads>();
 
   /**
    * Bitmask (KEYBOARD_MODIFIERS) of the modifier keys the client is currently physically holding.

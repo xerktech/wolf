@@ -1,9 +1,11 @@
 #include "storm.hpp"
+#include <algorithm>
 #include <api/api.hpp>
 #include <array>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
+#include <control/input_handler.hpp>
 #include <core/docker.hpp>
 #include <cstdlib>
 #include <curl/curl.h>
@@ -2693,9 +2695,8 @@ TEST_CASE("Lobbies: a stream that ends in a lobby leaves its joypads plugged in 
     REQUIRE(*taken_over == pad.lock());
     REQUIRE(stream->control_feedback == feedback); // its rumble reaches the new stream's client
     // Until the client claims it: then it's control's to unplug from the lobby's app (release_unclaimed_joypads)
-    auto unclaimed = stream->unclaimed_joypads->load();
-    REQUIRE(unclaimed->size() == 1);
-    REQUIRE(unclaimed->at(0) == lobby_id);
+    REQUIRE(stream->kept_joypads->unclaimed == std::set<int>{0});
+    REQUIRE(stream->kept_joypads->plugged_into == std::map<int, std::string>{{0, lobby_id}});
   }
   REQUIRE(parked() == 0);
 
@@ -2705,9 +2706,13 @@ TEST_CASE("Lobbies: a stream that ends in a lobby leaves its joypads plugged in 
   REQUIRE(join.error_message.get()->get_future().get().empty());
   REQUIRE(plugged.empty());
   REQUIRE(unplugged == std::vector<std::string>{std::to_string(session_id)});
+  auto kept = state::get_session_by_id(running_sessions->load(), session_id)->kept_joypads;
+  REQUIRE(kept->plugged_into.empty()); // in its lobby: it follows the session from now on
+  REQUIRE(kept->unclaimed == std::set<int>{0});
 
   // Ended again, then the lobby stops: its app hears the joypad unplugged
   event_bus->fire_event(immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = session_id}));
+  REQUIRE(kept->unclaimed.empty()); // kept again: the ended stream's control releases nothing
   running_sessions->store(immer::vector<events::StreamSession>{});
   REQUIRE(parked() == 1);
   unplugged.clear();
@@ -2757,6 +2762,54 @@ TEST_CASE("Lobbies: a stream that doesn't take over the kept joypads unplugs the
   REQUIRE(join.error_message.get()->get_future().get().empty());
   REQUIRE(unplugged == std::vector<std::string>{lobby_id});
   REQUIRE(lobby.parked_joypads->load()->empty());
+}
+
+TEST_CASE("Lobbies: a kept joypad leaves the lobby that kept it when its stream joins another one", "[API]") {
+  auto created = inputtino::XboxOneJoypad::create();
+  if (!created) {
+    SKIP("Creating a joypad needs /dev/uinput: " << created.getErrorMessage());
+  }
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .host = immer::box<state::Host>(state::Host{.lobby_keeps_joypads = true}),
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
+      .running_sessions = running_sessions});
+  constexpr std::size_t session_id = 4322;
+  for (auto id : {"kept-in", "joined"}) {
+    events::Lobby lobby{.id = id, .name = id, .multi_user = false, .stop_when_everyone_leaves = false};
+    app_state->lobbies->update([&](const immer::vector<events::Lobby> &lobbies) { return lobbies.push_back(lobby); });
+  }
+  // The stream took over a joypad that lobby "kept-in" kept for it (sessions/add), still plugged into its app
+  auto stream = events::StreamSession{.event_bus = event_bus, .session_id = session_id};
+  stream.joypads->store(
+      events::JoypadList{}.set(0, std::make_shared<events::JoypadTypes>(input::XboxOneJoypad(std::move(*created)))));
+  stream.kept_joypads->plugged_into[0] = "kept-in";
+  stream.kept_joypads->unclaimed.insert(0);
+  running_sessions->update([&](const auto &sessions) { return sessions.push_back(stream); });
+  auto lobbies_handlers = sessions::setup_lobbies_handlers(app_state, api_runtime_dir(), {});
+
+  std::vector<std::string> unplugged;
+  auto unplug_observer = event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
+      [&](const immer::box<events::UnplugDeviceEvent> &ev) { unplugged.push_back(ev->session_id); });
+  auto join = events::JoinLobbyEvent{.lobby_id = "joined", .moonlight_session_id = session_id};
+  event_bus->fire_event(immer::box<events::JoinLobbyEvent>(join));
+  REQUIRE(join.error_message.get()->get_future().get().empty());
+  // Out of the app that had it, (on its way) into the joined one
+  REQUIRE(unplugged == std::vector<std::string>{"kept-in", std::to_string(session_id)});
+  REQUIRE(stream.kept_joypads->plugged_into.empty());
+
+  // The client never claims it: its unplug follows the session into the lobby it joined
+  unplugged.clear();
+  control::release_unclaimed_joypads(stream);
+  std::sort(unplugged.begin(), unplugged.end()); // the lobby relays it from inside the session's event
+  REQUIRE(unplugged == std::vector<std::string>{std::to_string(session_id), "joined"});
+  REQUIRE(stream.joypads->load()->empty());
 }
 
 TEST_CASE("Lobbies: the WolfUI combo leaves a stream's joypads with it", "[API]") {

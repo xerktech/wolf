@@ -7,7 +7,6 @@
 #include <state/sessions.hpp>
 #include <stdexcept>
 #include <sys/socket.h>
-#include <thread>
 
 namespace control {
 
@@ -319,14 +318,7 @@ void run_control(int port,
                   encrypt_and_send(plaintext, aes_key, control_stream, immer::box<std::shared_ptr<ENetPeer>>{peer});
                 }});
             // Joypads kept from its last stream that the client doesn't claim by then: it brought fewer this time
-            if (!client_session->unclaimed_joypads->load()->empty()) {
-              std::thread([running_sessions, session = *client_session]() mutable {
-                std::this_thread::sleep_for(unclaimed_joypads_timeout);
-                if (state::is_running_instance(running_sessions->load(), session)) {
-                  release_unclaimed_joypads(session);
-                }
-              }).detach();
-            }
+            release_unclaimed_joypads_after(running_sessions, *client_session, unclaimed_joypads_timeout);
           }
           event_bus->fire_event(
               immer::box<ResumeStreamEvent>(ResumeStreamEvent{.session_id = client_session->session_id}));

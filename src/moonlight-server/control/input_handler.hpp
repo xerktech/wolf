@@ -4,6 +4,7 @@
 #include <control/control.hpp>
 #include <events/events.hpp>
 #include <moonlight/control.hpp>
+#include <state/data-structures.hpp>
 
 namespace control {
 
@@ -47,7 +48,7 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
 
 /**
  * How long after its client connects a stream waits for the client to claim the joypads it took over from a lobby
- * (StreamSession::unclaimed_joypads) before release_unclaimed_joypads.
+ * (StreamSession::kept_joypads) before release_unclaimed_joypads.
  */
 constexpr std::chrono::seconds unclaimed_joypads_timeout{10};
 
@@ -56,6 +57,14 @@ constexpr std::chrono::seconds unclaimed_joypads_timeout{10};
  * the pad's input): the client brought fewer or other controllers this time.
  */
 void release_unclaimed_joypads(events::StreamSession &session);
+
+/**
+ * Unless the stream has no unclaimed joypads: after `timeout`, on another thread, release_unclaimed_joypads if
+ * `session` is still the running instance of its session.
+ */
+void release_unclaimed_joypads_after(const state::SessionsAtoms &running_sessions,
+                                     const events::StreamSession &session,
+                                     std::chrono::milliseconds timeout);
 
 void controller_touch(const CONTROLLER_TOUCH_PACKET &pkt, events::StreamSession &session);
 
