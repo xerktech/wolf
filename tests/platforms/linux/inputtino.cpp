@@ -73,7 +73,7 @@ TEST_CASE("uinput - keyboard WolfUI combo", "[UINPUT]") {
   press_w.type = pkts::KEY_PRESS;
   press_w.modifiers = static_cast<char>(pkts::KEYBOARD_MODIFIERS::CTRL | pkts::KEYBOARD_MODIFIERS::ALT |
                                         pkts::KEYBOARD_MODIFIERS::SHIFT);
-  control::handle_input(session, {}, &press_w);
+  control::handle_input(session, {}, &press_w, sizeof(press_w));
   auto events = fetch_events_debug(keyboard_dev);
 
   bool w_pressed = std::any_of(events.begin(), events.end(), [](const auto &ev) {
@@ -409,7 +409,7 @@ TEST_CASE("uinput - joypad WolfUI combo", "[UINPUT]") {
       .controller_number = 1,
       .button_flags = static_cast<short>(pkts::START | pkts::DPAD_UP | pkts::RIGHT_BUTTON)};
   c_pkt.type = pkts::CONTROLLER_MULTI;
-  control::handle_input(session, {}, &c_pkt);
+  control::handle_input(session, {}, &c_pkt, sizeof(c_pkt));
 
   REQUIRE(combo_events == (wolf_ui_combo ? 1 : 0));
 }
