@@ -17,6 +17,39 @@ using namespace wolf::core;
 using namespace std::string_literals;
 using namespace moonlight::control;
 
+/**
+ * Ask the client to start sending the motion sensor data its controller advertises in `capabilities`.
+ * Only a PS joypad can forward motion, so callers send this for PS pads alone.
+ */
+void request_motion_events(const events::StreamSession &session,
+                           immer::box<std::shared_ptr<ENetPeer>> connected_client,
+                           int controller_number,
+                           uint8_t capabilities) {
+  if (capabilities & ACCELEROMETER) {
+    // Request acceleromenter events from the client at 100 Hz
+    logs::log(logs::info, "Requesting accelerometer events for controller {}", controller_number);
+    auto accelerometer_pkt = ControlMotionEventPacket{
+        .header{.type = MOTION_EVENT, .length = sizeof(ControlMotionEventPacket) - sizeof(ControlPacket)},
+        .controller_number = static_cast<uint16_t>(controller_number),
+        .reportrate = 100,
+        .type = ACCELERATION};
+    std::string plaintext = {(char *)&accelerometer_pkt, sizeof(accelerometer_pkt)};
+    encrypt_and_send(plaintext, session.aes_key, session.control_stream, connected_client);
+  }
+
+  if (capabilities & GYRO) {
+    // Request gyroscope events from the client at 100 Hz
+    logs::log(logs::info, "Requesting gyroscope events for controller {}", controller_number);
+    auto gyro_pkt = ControlMotionEventPacket{
+        .header{.type = MOTION_EVENT, .length = sizeof(ControlMotionEventPacket) - sizeof(ControlPacket)},
+        .controller_number = static_cast<uint16_t>(controller_number),
+        .reportrate = 100,
+        .type = GYROSCOPE};
+    std::string plaintext = {(char *)&gyro_pkt, sizeof(gyro_pkt)};
+    encrypt_and_send(plaintext, session.aes_key, session.control_stream, connected_client);
+  }
+}
+
 std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSession &session,
                                                        immer::box<std::shared_ptr<ENetPeer>> connected_client,
                                                        int controller_number,
@@ -173,28 +206,8 @@ std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSessi
     break;
   }
 
-  if (capabilities & ACCELEROMETER && final_type == wolf::config::ControllerType::PS) {
-    // Request acceleromenter events from the client at 100 Hz
-    logs::log(logs::info, "Requesting accelerometer events for controller {}", controller_number);
-    auto accelerometer_pkt = ControlMotionEventPacket{
-        .header{.type = MOTION_EVENT, .length = sizeof(ControlMotionEventPacket) - sizeof(ControlPacket)},
-        .controller_number = static_cast<uint16_t>(controller_number),
-        .reportrate = 100,
-        .type = ACCELERATION};
-    std::string plaintext = {(char *)&accelerometer_pkt, sizeof(accelerometer_pkt)};
-    encrypt_and_send(plaintext, session.aes_key, session.control_stream, connected_client);
-  }
-
-  if (capabilities & GYRO && final_type == wolf::config::ControllerType::PS) {
-    // Request gyroscope events from the client at 100 Hz
-    logs::log(logs::info, "Requesting gyroscope events for controller {}", controller_number);
-    auto gyro_pkt = ControlMotionEventPacket{
-        .header{.type = MOTION_EVENT, .length = sizeof(ControlMotionEventPacket) - sizeof(ControlPacket)},
-        .controller_number = static_cast<uint16_t>(controller_number),
-        .reportrate = 100,
-        .type = GYROSCOPE};
-    std::string plaintext = {(char *)&gyro_pkt, sizeof(gyro_pkt)};
-    encrypt_and_send(plaintext, session.aes_key, session.control_stream, connected_client);
+  if (final_type == wolf::config::ControllerType::PS) {
+    request_motion_events(session, connected_client, controller_number, capabilities);
   }
 
   session.joypads->update([&](events::JoypadList joypads) {
@@ -422,7 +435,7 @@ void keyboard_key(const KEYBOARD_PACKET &pkt, events::StreamSession &session) {
       wolf_ui_combo_pressed++;
 
     // CTRL + ALT + SHIFT + W
-    const bool wolf_ui_combo = (wolf_ui_combo_pressed == 3 && moonlight_key == 0x57);
+    const bool wolf_ui_combo = session.wolf_ui_combo && wolf_ui_combo_pressed == 3 && moonlight_key == 0x57;
     if (wolf_ui_combo) {
       // Ensure modifiers are released before we return to overlay
       std::visit(
@@ -628,11 +641,16 @@ void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
                         events::StreamSession &session,
                         immer::box<std::shared_ptr<ENetPeer>> connected_client) {
   auto joypads = session.joypads->load();
-  if (joypads->find(pkt.controller_number)) {
+  if (auto joypad = joypads->find(pkt.controller_number)) {
     // TODO: should we replace it instead?
     logs::log(logs::debug,
               "[INPUT] Received CONTROLLER_ARRIVAL for controller {} which is already present; skipping...",
               pkt.controller_number);
+    // The pad may have been carried over from an earlier stream (a resumed session, or a lobby that kept its
+    // joypads); this client still has to be asked for the motion data it advertises, or none will arrive.
+    if (std::holds_alternative<PS5Joypad>(**joypad)) {
+      request_motion_events(session, connected_client, pkt.controller_number, pkt.capabilities);
+    }
   } else {
     create_new_joypad(session,
                       connected_client,
@@ -677,8 +695,8 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
           std::uint32_t bf2 = pkt.buttonFlags2;
           auto pressed_buttons = bf | (bf2 << 16);
           // Check for our special WOLF-UI combo (START + UP + RB)
-          if (pressed_buttons & inputtino::Joypad::START && pressed_buttons & inputtino::Joypad::DPAD_UP &&
-              pressed_buttons & inputtino::Joypad::RIGHT_BUTTON) {
+          if (session.wolf_ui_combo && pressed_buttons & inputtino::Joypad::START &&
+              pressed_buttons & inputtino::Joypad::DPAD_UP && pressed_buttons & inputtino::Joypad::RIGHT_BUTTON) {
             session.event_bus->fire_event(immer::box<events::ClientWolfUIComboEvent>{
                 events::ClientWolfUIComboEvent{.session_id = session.session_id}});
           }

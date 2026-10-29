@@ -106,6 +106,8 @@ struct Profile {
  */
 constexpr std::string_view MOONLIGHT_PROFILE_ID = "moonlight-profile-id";
 
+struct ParkedJoypads;
+
 struct Lobby {
   const std::string id;
   const std::string name;
@@ -153,6 +155,13 @@ struct Lobby {
    * A queue of devices that will be plugged into the runner when ready
    */
   std::shared_ptr<events::devices_atom_queue> plugged_devices_queue = std::make_shared<events::devices_atom_queue>();
+
+  /**
+   * WOLF_LOBBY_KEEPS_JOYPADS: the joypads of a stream that ended in this lobby, by session_id. They stay plugged into
+   * the lobby's app until the session's next stream takes them over, so the app never sees them unplugged.
+   */
+  std::shared_ptr<immer::atom<immer::map<std::size_t, std::shared_ptr<const ParkedJoypads>>>> parked_joypads =
+      std::make_shared<immer::atom<immer::map<std::size_t, std::shared_ptr<const ParkedJoypads>>>>();
 };
 
 struct VideoSettings {
@@ -498,6 +507,23 @@ struct ControlFeedback {
   std::function<void(std::string_view /* plaintext */)> send;
 };
 
+/**
+ * Joypads a lobby keeps for a session whose stream ended (Lobby::parked_joypads), with the feedback their callbacks
+ * send through, so that the next stream that takes them over gets their rumble too.
+ */
+struct ParkedJoypads {
+  JoypadList joypads;
+  std::shared_ptr<immer::atom<ControlFeedback>> control_feedback;
+};
+
+/**
+ * The joypads a stream took over from a lobby's keep (sessions/add), still plugged into that lobby's app
+ */
+struct TakenOverJoypads {
+  std::string lobby_id;
+  JoypadList joypads;
+};
+
 struct StreamSession {
   moonlight::DisplayMode display_mode;
   int audio_channel_count;
@@ -507,6 +533,11 @@ struct StreamSession {
   std::shared_ptr<App> app;
   std::string app_local_state_folder;
   std::string app_host_state_folder;
+
+  /**
+   * Whether the WolfUI hotkeys are intercepted for this session (see state::Host::wolf_ui_combo)
+   */
+  bool wolf_ui_combo = true;
 
   // gcm encryption keys
   std::string aes_key;
@@ -586,6 +617,13 @@ struct StreamSession {
    * first stream's (dead) peer with its old key after a /resume.
    */
   std::shared_ptr<immer::atom<ControlFeedback>> control_feedback = std::make_shared<immer::atom<ControlFeedback>>();
+
+  /**
+   * WOLF_LOBBY_KEEPS_JOYPADS: set by sessions/add when it takes over a lobby's kept joypads, taken (cleared) by the
+   * stream's next lobby join, which must not move them out of an app that has them already.
+   */
+  std::shared_ptr<immer::atom<std::shared_ptr<const TakenOverJoypads>>> taken_over_joypads =
+      std::make_shared<immer::atom<std::shared_ptr<const TakenOverJoypads>>>();
 
   /**
    * Bitmask (KEYBOARD_MODIFIERS) of the modifier keys the client is currently physically holding.

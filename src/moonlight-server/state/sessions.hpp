@@ -69,6 +69,20 @@ inline std::optional<events::Lobby> get_lobby_by_connected_session(const immer::
 }
 
 /**
+ * The lobby keeping joypads for `session_id` (Lobby::parked_joypads, WOLF_LOBBY_KEEPS_JOYPADS), and those joypads
+ */
+inline std::optional<std::pair<events::Lobby, std::shared_ptr<const events::ParkedJoypads>>>
+find_parked_joypads(const immer::vector<events::Lobby> &lobbies, std::size_t session_id) {
+  for (const events::Lobby &lobby : lobbies) {
+    auto all = lobby.parked_joypads->load();
+    if (auto parked = all->find(session_id)) {
+      return std::make_pair(lobby, *parked);
+    }
+  }
+  return {};
+}
+
+/**
  * Reads WOLF_RTSP_REQUIRE_ENCRYPTION. It's a security switch: a value that's neither clearly on nor off turns it on
  * (with a warning) instead of silently leaving it off.
  */
@@ -118,6 +132,7 @@ inline std::shared_ptr<events::StreamSession> create_stream_session(immer::box<s
       .app_local_state_folder = full_path.string(),
       .app_host_state_folder = std::filesystem::path(state->host->host_base_state_folder) /
                                current_client.app_state_folder / run_app.base.title,
+      .wolf_ui_combo = state->host->wolf_ui_combo,
 
       .aes_key = aes_key,
       .aes_iv = aes_iv,
