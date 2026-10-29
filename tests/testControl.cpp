@@ -20,6 +20,7 @@ using Catch::Matchers::Equals;
 #include <streaming/streaming.hpp>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 using namespace moonlight::control;
 using namespace std::chrono_literals;
@@ -565,7 +566,8 @@ TEST_CASE("control: a resumed stream's client is asked for its carried-over pad'
   const std::string old_key = "EDF04A215C4FBEA20934120C8480D855", new_key = "00112233445566778899AABBCCDDEEFF";
   auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
   auto make_session = [&](std::uint32_t enet_secret, const std::string &aes_key) {
-    StreamSession session{.event_bus = event_bus, .app = std::make_shared<wolf::core::events::App>(wolf::core::events::App{.base = {}})};
+    StreamSession session{.event_bus = event_bus,
+                          .app = std::make_shared<wolf::core::events::App>(wolf::core::events::App{.base = {}})};
     session.session_id = 42;
     session.enet_secret_payload = enet_secret;
     session.aes_key = aes_key;
@@ -586,9 +588,11 @@ TEST_CASE("control: a resumed stream's client is asked for its carried-over pad'
     pkt.type = pkts::CONTROLLER_ARRIVAL;
     client.send_encrypted(key, seq, {(char *)&pkt, sizeof(pkt)});
   };
-  // The motion types (ACCELERATION, GYROSCOPE) Wolf asked the client for
+  // The (controller, motion type) pairs Wolf asked the client for
+  using MotionRequests = std::vector<std::pair<int, int>>;
+  const MotionRequests pad_0_motion = {{0, pkts::ACCELERATION}, {0, pkts::GYROSCOPE}};
   auto motion_requests = [](const TestENetClient &client, const std::string &key) {
-    std::vector<int> types;
+    MotionRequests types;
     for (const auto &packet : client.received_packets) {
       auto plaintext = decrypt_packet(*(ControlEncryptedPacket *)packet.data(),
                                       key,
@@ -596,7 +600,7 @@ TEST_CASE("control: a resumed stream's client is asked for its carried-over pad'
                                       ControlPacketOrigin::HOST);
       auto motion = (ControlMotionEventPacket *)plaintext.data();
       if (plaintext.size() == sizeof(ControlMotionEventPacket) && motion->header.type == pkts::MOTION_EVENT) {
-        types.push_back(motion->type);
+        types.emplace_back(motion->controller_number, motion->type);
       }
     }
     return types;
@@ -618,7 +622,7 @@ TEST_CASE("control: a resumed stream's client is asked for its carried-over pad'
   send_arrival(first_client, old_key, 2, 1, pkts::XBOX);
   first_client.service(500ms);
   REQUIRE(first.joypads->load()->size() == 2);
-  REQUIRE(motion_requests(first_client, old_key) == std::vector<int>{pkts::ACCELERATION, pkts::GYROSCOPE});
+  REQUIRE(motion_requests(first_client, old_key) == pad_0_motion);
 
   // /resume carries the joypad over to a new stream instance with a new key and, once it connects, a new peer
   auto resumed = make_session(2, new_key);
@@ -632,7 +636,7 @@ TEST_CASE("control: a resumed stream's client is asked for its carried-over pad'
   send_arrival(resumed_client, new_key, 2, 1, pkts::PS); // the Xbox pad stays an Xbox pad
   resumed_client.service(500ms);
   REQUIRE(resumed.joypads->load()->size() == 2); // the pads were taken over, not recreated
-  REQUIRE(motion_requests(resumed_client, new_key) == std::vector<int>{pkts::ACCELERATION, pkts::GYROSCOPE});
+  REQUIRE(motion_requests(resumed_client, new_key) == pad_0_motion);
 }
 
 /*
