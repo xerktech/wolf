@@ -408,7 +408,9 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
     // WOLF_LOBBY_KEEPS_JOYPADS: take over the joypads a lobby kept from this session's last stream, still plugged into
     // its app, so the app never sees them replaced (controller_arrival skips a controller already present). Their
     // callbacks send feedback through their own control_feedback, which this stream's ENet connect then points at it.
-    auto parked = state::find_parked_joypads(state_->app_state->lobbies->load(), new_session->session_id);
+    auto parked = state_->app_state->lobbies
+                      ? state::find_parked_joypads(state_->app_state->lobbies->load(), new_session->session_id)
+                      : std::nullopt;
     if (parked) {
       new_session->joypads->store(parked->second->joypads);
       new_session->control_feedback = parked->second->control_feedback;

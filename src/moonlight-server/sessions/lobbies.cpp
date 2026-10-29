@@ -71,7 +71,7 @@ void leave_lobby(const std::shared_ptr<events::EventBusType> &ev_bus,
   // Switch over all joypads present in the lobby back into the original session, unless the lobby keeps them for the
   // session's next stream: then the lobby's app must not see them unplugged
   auto parked = lobby.parked_joypads->load();
-  events::JoypadList joypads = parked->find(session.session_id) ? events::JoypadList{} : session.joypads->load();
+  events::JoypadList joypads = parked->find(session.session_id) ? events::JoypadList{} : *session.joypads->load();
   for (auto [_joypad_nr, joypad] : joypads) {
     // Plug them into original session
     events::PlugDeviceEvent plug_ev{.session_id = std::to_string(session.session_id)};
