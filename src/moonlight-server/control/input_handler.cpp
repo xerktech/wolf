@@ -18,7 +18,7 @@ using namespace std::string_literals;
 using namespace moonlight::control;
 
 std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSession &session,
-                                                       immer::box<std::shared_ptr<ENetPeer>> connected_client,
+                                                       immer::box<std::shared_ptr<EnetClient>> connected_client,
                                                        int controller_number,
                                                        CONTROLLER_TYPE requested_type,
                                                        uint8_t capabilities) {
@@ -620,7 +620,7 @@ void pen(const PEN_PACKET &pkt, events::StreamSession &session) {
 
 void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
                         events::StreamSession &session,
-                        immer::box<std::shared_ptr<ENetPeer>> connected_client) {
+                        immer::box<std::shared_ptr<EnetClient>> connected_client) {
   auto joypads = session.joypads->load();
   if (joypads->find(pkt.controller_number)) {
     // TODO: should we replace it instead?
@@ -638,7 +638,7 @@ void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
 
 void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
                       events::StreamSession &session,
-                      immer::box<std::shared_ptr<ENetPeer>> connected_client) {
+                      immer::box<std::shared_ptr<EnetClient>> connected_client) {
   auto joypads = session.joypads->load();
   std::shared_ptr<events::JoypadTypes> selected_pad;
   if (auto joypad = joypads->find(pkt.controller_number)) {
@@ -775,7 +775,7 @@ void controller_battery(const CONTROLLER_BATTERY_PACKET &pkt, events::StreamSess
 }
 
 void handle_input(events::StreamSession &session,
-                  immer::box<std::shared_ptr<ENetPeer>> connected_client,
+                  immer::box<std::shared_ptr<EnetClient>> connected_client,
                   INPUT_PKT *pkt) {
   switch (pkt->type) {
   case MOUSE_MOVE_REL: {

@@ -71,23 +71,26 @@ std::pair<std::string /* ip */, int /* port */> get_ip(const sockaddr *const ip_
   return {std::string{data}, port};
 }
 
-bool send_packet(std::string_view payload, ENetPeer *peer) {
+bool send_packet(std::string_view payload, const EnetClient &client) {
   logs::log(logs::trace, "[ENET] Sending packet");
   auto packet = enet_packet_create(payload.data(), payload.size(), ENET_PACKET_FLAG_RELIABLE);
-  if (enet_peer_send(peer, 0, packet) < 0) {
+  std::lock_guard lock(*client.host_mutex);
+  if (enet_peer_send(client.peer, 0, packet) < 0) {
     logs::log(logs::warning, "[ENET] Failed to send packet");
     enet_packet_destroy(packet);
     return false;
   }
+  // The control thread only flushes when it next services the host, which can be up to `timeout` away
+  enet_host_flush(client.peer->host);
   return true;
 }
 
 bool encrypt_and_send(std::string_view payload,
                       std::string_view aes_key,
-                      immer::box<std::shared_ptr<ENetPeer>> connected_client) {
+                      immer::box<std::shared_ptr<EnetClient>> connected_client) {
   if (auto enet_client = connected_client->get()) {
     auto encrypted = control::encrypt_packet(aes_key, 0, payload); // TODO: seq?
-    return send_packet({(char *)encrypted.get(), encrypted->full_size()}, enet_client);
+    return send_packet({(char *)encrypted.get(), encrypted->full_size()}, *enet_client);
   } else {
     logs::log(logs::warning, "[ENET] Failed to send packet, client is not connected");
     return false;
@@ -122,10 +125,11 @@ std::optional<events::StreamSession> get_current_session(const enet_clients_map 
   return std::nullopt;
 }
 
-std::shared_ptr<ENetPeer> to_shared_ptr(ENetPeer *peer) {
-  return std::shared_ptr<ENetPeer>(peer, [](auto _peer) {
-    // DO NOTHING, we don't want to free peer, the lifecycle is dictated by enet
-  });
+/**
+ * The peer itself is not owned: its lifecycle is dictated by enet
+ */
+immer::box<std::shared_ptr<EnetClient>> to_enet_client(ENetPeer *peer, const std::shared_ptr<std::mutex> &host_mutex) {
+  return {std::make_shared<EnetClient>(EnetClient{.peer = peer, .host_mutex = host_mutex})};
 }
 
 void run_control(int port,
@@ -136,6 +140,8 @@ void run_control(int port,
                  const std::string &host_ip) {
 
   enet_host host = create_host(host_ip, port, peers);
+  // Guards every ENet call on `host` and its peers, see EnetClient
+  auto host_mutex = std::make_shared<std::mutex>();
   logs::log(logs::info, "Control server started on port: {}", port);
 
   ENetEvent event;
@@ -143,13 +149,12 @@ void run_control(int port,
   immer::atom<enet_clients_map> connected_clients;
 
   auto stop_ev = event_bus->register_handler<immer::box<StopStreamEvent>>(
-      [&connected_clients](const immer::box<StopStreamEvent> &ev) {
+      [&connected_clients, host_mutex](const immer::box<StopStreamEvent> &ev) {
         auto terminate_pkt = ControlTerminatePacket{};
         std::string plaintext = {(char *)&terminate_pkt, sizeof(terminate_pkt)};
         for (auto &[peer, session] : *connected_clients.load()) {
           if (session->session_id == ev->session_id) {
-            immer::box<std::shared_ptr<ENetPeer>> enet_client = {to_shared_ptr(peer)};
-            encrypt_and_send(plaintext, session->aes_key, enet_client);
+            encrypt_and_send(plaintext, session->aes_key, to_enet_client(peer, host_mutex));
             return;
           }
         }
@@ -157,7 +162,17 @@ void run_control(int port,
       });
 
   while (true) {
-    if (enet_host_service(host.get(), &event, timeout.count()) > 0) {
+    int service_result;
+    {
+      std::lock_guard lock(*host_mutex);
+      service_result = enet_host_service(host.get(), &event, 0);
+    }
+    if (service_result <= 0) {
+      // Nothing to process: block on the socket without holding the lock, so other threads can send meanwhile.
+      // This is what enet_host_service(host, &event, timeout) would do internally, minus the lock.
+      enet_uint32 wait_condition = ENET_SOCKET_WAIT_RECEIVE;
+      enet_socket_wait(host->socket, &wait_condition, timeout.count());
+    } else {
       auto [client_ip, client_port] = get_ip((sockaddr *)&event.peer->address.address);
       auto client_session = get_current_session(connected_clients, running_sessions, client_ip, event);
       if (client_session) {
@@ -206,8 +221,9 @@ void run_control(int port,
                 event_bus->fire_event(
                     immer::box<PauseStreamEvent>(PauseStreamEvent{.session_id = client_session->session_id}));
               } else if (sub_type == INPUT_DATA) {
-                immer::box<std::shared_ptr<ENetPeer>> enet_client = {to_shared_ptr(event.peer)};
-                handle_input(client_session.value(), enet_client, (INPUT_PKT *)decrypted.data());
+                handle_input(client_session.value(),
+                             to_enet_client(event.peer, host_mutex),
+                             (INPUT_PKT *)decrypted.data());
               } else if (sub_type == IDR_FRAME) {
                 auto ev = IDRRequestEvent{.session_id = client_session->session_id};
                 event_bus->fire_event(immer::box<IDRRequestEvent>{ev});
@@ -225,6 +241,10 @@ void run_control(int port,
         }
       } else {
         logs::log(logs::warning, "[ENET] Received packet from unrecognised client {}:{}", client_ip, client_port);
+        if (event.type == ENET_EVENT_TYPE_RECEIVE) {
+          enet_packet_destroy(event.packet);
+        }
+        std::lock_guard lock(*host_mutex);
         enet_peer_disconnect_now(event.peer, 0);
       }
     }

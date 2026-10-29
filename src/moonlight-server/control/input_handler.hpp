@@ -13,7 +13,7 @@ using namespace wolf::core;
  * Side effect: session devices might be updated when hotplugging
  */
 void handle_input(events::StreamSession &session,
-                  immer::box<std::shared_ptr<ENetPeer>> connected_client,
+                  immer::box<std::shared_ptr<EnetClient>> connected_client,
                   INPUT_PKT *pkt);
 
 void mouse_move_rel(const MOUSE_MOVE_REL_PACKET &pkt, events::StreamSession &session);
@@ -36,11 +36,11 @@ void pen(const PEN_PACKET &pkt, events::StreamSession &session);
 
 void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
                         events::StreamSession &session,
-                        immer::box<std::shared_ptr<ENetPeer>> connected_client);
+                        immer::box<std::shared_ptr<EnetClient>> connected_client);
 
 void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
                       events::StreamSession &session,
-                      immer::box<std::shared_ptr<ENetPeer>> connected_client);
+                      immer::box<std::shared_ptr<EnetClient>> connected_client);
 
 void controller_touch(const CONTROLLER_TOUCH_PACKET &pkt, events::StreamSession &session);
 
