@@ -516,6 +516,14 @@ struct ParkedJoypads {
   std::shared_ptr<immer::atom<ControlFeedback>> control_feedback;
 };
 
+/**
+ * The joypads a stream took over from a lobby's keep (sessions/add), still plugged into that lobby's app
+ */
+struct TakenOverJoypads {
+  std::string lobby_id;
+  JoypadList joypads;
+};
+
 struct StreamSession {
   moonlight::DisplayMode display_mode;
   int audio_channel_count;
@@ -604,6 +612,13 @@ struct StreamSession {
    * first stream's (dead) peer with its old key after a /resume.
    */
   std::shared_ptr<immer::atom<ControlFeedback>> control_feedback = std::make_shared<immer::atom<ControlFeedback>>();
+
+  /**
+   * WOLF_LOBBY_KEEPS_JOYPADS: set by sessions/add when it takes over a lobby's kept joypads, taken (cleared) by the
+   * stream's next lobby join, which must not move them out of an app that has them already.
+   */
+  std::shared_ptr<immer::atom<std::shared_ptr<const TakenOverJoypads>>> taken_over_joypads =
+      std::make_shared<immer::atom<std::shared_ptr<const TakenOverJoypads>>>();
 
   /**
    * Bitmask (KEYBOARD_MODIFIERS) of the modifier keys the client is currently physically holding.

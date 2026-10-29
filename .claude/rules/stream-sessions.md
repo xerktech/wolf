@@ -142,6 +142,8 @@ paths:
     didn't take over, and a lobby stop unplugs all it keeps: nothing else tells the app they are gone.
   - A join neither unplugs (from the stream) nor queues to the lobby's runner the ones it took over: they
     are plugged in already, and a docker runner would plug them twice (XERK-2403).
+    - `sessions/add` erases the lobby's keep, so the join knows them by `StreamSession::taken_over_joypads`
+      (pad pointers, not indexes). Joining another lobby unplugs them from the one they were taken from.
   - Not on the WolfUI combo: that stream goes on, back in WolfUI, and needs its joypads.
   - Tests: `tests/testWolfAPI.cpp` "Lobbies: a stream that ends in a lobby leaves its joypads plugged in
     for the next one", "...doesn't take over the kept joypads unplugs them on joining" (skip without

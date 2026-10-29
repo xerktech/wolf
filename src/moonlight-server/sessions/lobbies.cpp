@@ -12,12 +12,11 @@ namespace wolf::core::sessions {
 /**
  * Unplugs from `lobby` the joypads it keeps for `session_id` (Lobby::parked_joypads) that aren't in `keep`, and forgets
  * them: the lobby's app hears of each, before its device goes away with the last reference.
- * Returns the kept joypads that are in `keep`: still plugged into the lobby's app.
  */
-events::JoypadList release_parked_joypads(const std::shared_ptr<events::EventBusType> &ev_bus,
-                                          const events::Lobby &lobby,
-                                          std::size_t session_id,
-                                          const events::JoypadList &keep = {}) {
+void release_parked_joypads(const std::shared_ptr<events::EventBusType> &ev_bus,
+                            const events::Lobby &lobby,
+                            std::size_t session_id,
+                            const events::JoypadList &keep = {}) {
   std::shared_ptr<const events::ParkedJoypads> parked;
   lobby.parked_joypads->update([&](const auto &all) {
     if (auto found = all.find(session_id)) {
@@ -26,13 +25,11 @@ events::JoypadList release_parked_joypads(const std::shared_ptr<events::EventBus
     }
     return all;
   });
-  events::JoypadList still_plugged;
   if (!parked) {
-    return still_plugged;
+    return;
   }
   for (auto [joypad_nr, joypad] : parked->joypads) {
     if (auto kept = keep.find(joypad_nr); kept && *kept == joypad) {
-      still_plugged = still_plugged.set(joypad_nr, joypad);
       continue;
     }
     events::UnplugDeviceEvent unplug_ev{.session_id = lobby.id};
@@ -44,7 +41,6 @@ events::JoypadList release_parked_joypads(const std::shared_ptr<events::EventBus
         *joypad);
     ev_bus->fire_event(immer::box<events::UnplugDeviceEvent>{unplug_ev});
   }
-  return still_plugged;
 }
 
 /**
@@ -283,11 +279,15 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         // Migrate joypads BEFORE adding the session to connected_sessions, or the relayed unplug races the queued plug
         events::JoypadList joypads = session->joypads->load();
         // Joypads the lobby kept for this session: those its stream took over (sessions/add) are in `joypads`, plugged
-        // into the lobby all along, so they aren't moved again; any other is unplugged now
-        auto taken_over = release_parked_joypads(app_state->event_bus, *lobby, session->session_id, joypads);
+        // into the lobby all along; any other is unplugged now
+        release_parked_joypads(app_state->event_bus, *lobby, session->session_id, joypads);
+        // The ones its stream took over are in a lobby's app, not in the stream's runner
+        std::shared_ptr<const events::TakenOverJoypads> taken_over = session->taken_over_joypads->exchange(nullptr).get();
         for (auto [joypad_nr, joypad] : joypads) {
-          if (taken_over.find(joypad_nr)) {
-            continue;
+          auto taken = taken_over ? taken_over->joypads.find(joypad_nr) : nullptr;
+          bool is_taken_over = taken && *taken == joypad;
+          if (is_taken_over && taken_over->lobby_id == lobby->id) {
+            continue; // already plugged into this lobby's app
           }
           events::PlugDeviceEvent plug_ev{.session_id = lobby->id};
           std::visit(
@@ -296,11 +296,11 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                 plug_ev.udev_hw_db_entries = pad.get_udev_hw_db_entries();
               },
               *joypad);
-          // Unplug it from the current session's runner
-          app_state->event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{
-              events::UnplugDeviceEvent{.session_id = std::to_string(session->session_id),
-                                        .udev_events = plug_ev.udev_events,
-                                        .udev_hw_db_entries = plug_ev.udev_hw_db_entries}});
+          // Unplug it from where it is: the current session's runner, or the app of the lobby it was taken over from
+          app_state->event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{events::UnplugDeviceEvent{
+              .session_id = is_taken_over ? taken_over->lobby_id : std::to_string(session->session_id),
+              .udev_events = plug_ev.udev_events,
+              .udev_hw_db_entries = plug_ev.udev_hw_db_entries}});
 
           // Add it to the lobby runner's devices queue, addressed to the lobby id
           // (same routing the PlugDeviceEvent relay performs for connected sessions)
