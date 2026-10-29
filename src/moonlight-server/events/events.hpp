@@ -17,6 +17,7 @@
 #include <immer/vector.hpp>
 #include <moonlight/control.hpp>
 #include <moonlight/data-structures.hpp>
+#include <mutex>
 #include <rfl.hpp>
 #include <rfl/json.hpp>
 #include <state/serialised_config.hpp>
@@ -454,6 +455,14 @@ struct StreamSession {
       std::make_shared<std::optional<TouchScreenTypes>>(); /* Now added at the start */
 
   std::shared_ptr<immer::atom<JoypadList>> joypads = std::make_shared<immer::atom<JoypadList>>();
+
+  /**
+   * Orders "joypad set changed" against "session joined/left a lobby".
+   * Held while a pad is added/removed together with its Plug/UnplugDeviceEvent, and by join/leave
+   * around the joypads snapshot + connected_sessions update, so a pad is never routed to the wrong runner.
+   * Never fire Join/Leave/StopLobby events while holding it.
+   */
+  std::shared_ptr<std::mutex> joypads_lobby_mutex = std::make_shared<std::mutex>();
 
   /**
    * Bitmask (KEYBOARD_MODIFIERS) of the modifier keys the client is currently physically holding.
