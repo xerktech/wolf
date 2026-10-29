@@ -133,3 +133,14 @@ paths:
     joypad feedback leaves at once at the production timeout" fails only when both are gone.
   - Only ThreadSanitizer catches a missing lock (dozens of races); the seq order fails without it.
     Tests: "control: joypad feedback sent while the client streams input arrives intact".
+- `WOLF_LOBBY_KEEPS_JOYPADS=TRUE` (fenrir sets it): a stream that ends (pause/stop) in a lobby leaves its
+  joypads plugged into the lobby's app (`Lobby::parked_joypads`), and the session's next `sessions/add`
+  takes them over with their `control_feedback` (XERK-2365).
+  - Why: fenrir stops a paused stream and adds a new one, so its joypads were destroyed and recreated; WoW
+    under Wine missed the new pad after about half the resumes, though Wine itself saw it.
+  - `leave_lobby` sends no plug/unplug for kept joypads; a join unplugs (to the lobby) kept ones its stream
+    didn't take over, and a lobby stop unplugs all it keeps: nothing else tells the app they are gone.
+  - Not on the WolfUI combo: that stream goes on, back in WolfUI, and needs its joypads.
+  - Tests: `tests/testWolfAPI.cpp` "Lobbies: a stream that ends in a lobby leaves its joypads plugged in
+    for the next one", "...doesn't take over the kept joypads unplugs them on joining" (skip without
+    `/dev/uinput`).

@@ -170,6 +170,12 @@ struct Host {
    * instead of falling back to plaintext RTSP for them.
    */
   bool rtsp_require_encryption = false;
+
+  /**
+   * WOLF_LOBBY_KEEPS_JOYPADS: a stream that ends in a lobby leaves its joypads plugged into the lobby's app for the
+   * session's next stream (Lobby::parked_joypads), instead of moving them back to the session that is going away.
+   */
+  bool lobby_keeps_joypads = false;
 };
 
 enum class PAIR_PHASE {

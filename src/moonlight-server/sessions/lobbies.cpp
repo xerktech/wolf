@@ -10,6 +10,40 @@
 namespace wolf::core::sessions {
 
 /**
+ * Unplugs from `lobby` the joypads it keeps for `session_id` (Lobby::parked_joypads) that aren't in `keep`, and forgets
+ * them: the lobby's app hears of each, before its device goes away with the last reference.
+ */
+void release_parked_joypads(const std::shared_ptr<events::EventBusType> &ev_bus,
+                            const events::Lobby &lobby,
+                            std::size_t session_id,
+                            const events::JoypadList &keep = {}) {
+  std::shared_ptr<const events::ParkedJoypads> parked;
+  lobby.parked_joypads->update([&](const auto &all) {
+    if (auto found = all.find(session_id)) {
+      parked = *found;
+      return all.erase(session_id);
+    }
+    return all;
+  });
+  if (!parked) {
+    return;
+  }
+  for (auto [joypad_nr, joypad] : parked->joypads) {
+    if (auto kept = keep.find(joypad_nr); kept && *kept == joypad) {
+      continue;
+    }
+    events::UnplugDeviceEvent unplug_ev{.session_id = lobby.id};
+    std::visit(
+        [&unplug_ev](auto &pad) {
+          unplug_ev.udev_events = pad.get_udev_events();
+          unplug_ev.udev_hw_db_entries = pad.get_udev_hw_db_entries();
+        },
+        *joypad);
+    ev_bus->fire_event(immer::box<events::UnplugDeviceEvent>{unplug_ev});
+  }
+}
+
+/**
  * @brief Removes the StreamSession from the input Lobby and switches everything to the original session
  *
  * @note Leaving a lobby may have side effects,
@@ -34,8 +68,10 @@ void leave_lobby(const std::shared_ptr<events::EventBusType> &ev_bus,
   session.keyboard->emplace(virtual_display::WaylandKeyboard(wl_state));
   session.touch_screen->emplace(virtual_display::WaylandTouchScreen(wl_state));
 
-  // Switch over all joypads present in the lobby back into the original session
-  events::JoypadList joypads = session.joypads->load();
+  // Switch over all joypads present in the lobby back into the original session, unless the lobby keeps them for the
+  // session's next stream: then the lobby's app must not see them unplugged
+  auto parked = lobby.parked_joypads->load();
+  events::JoypadList joypads = parked->find(session.session_id) ? events::JoypadList{} : session.joypads->load();
   for (auto [_joypad_nr, joypad] : joypads) {
     // Plug them into original session
     events::PlugDeviceEvent plug_ev{.session_id = std::to_string(session.session_id)};
@@ -242,6 +278,9 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
 
         // Migrate joypads BEFORE adding the session to connected_sessions, or the relayed unplug races the queued plug
         events::JoypadList joypads = session->joypads->load();
+        // Joypads the lobby kept for this session: those its stream took over (sessions/add) are in `joypads`, plugged
+        // into the lobby all along; any other is unplugged now
+        release_parked_joypads(app_state->event_bus, *lobby, session->session_id, joypads);
         for (auto [_joypad_nr, joypad] : joypads) {
           events::PlugDeviceEvent plug_ev{.session_id = lobby->id};
           std::visit(
@@ -324,6 +363,10 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           app_state->event_bus->fire_event(immer::box<events::LeaveLobbyEvent>{
               events::LeaveLobbyEvent{.lobby_id = lobby->id, .moonlight_session_id = std::stoul(*session_id)}});
         }
+        auto parked = lobby->parked_joypads->load();
+        for (auto [session_id, _joypads] : *parked) {
+          release_parked_joypads(app_state->event_bus, *lobby, session_id);
+        }
 
         // Finally, remove the lobby from the app_state
         app_state->lobbies->update([stop_lobby_event](const immer::vector<events::Lobby> &lobbies) {
@@ -365,10 +408,28 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         }
       }));
 
-  auto on_moonlight_session_over = [app_state](std::size_t moonlight_session_id) {
+  // `stream_over`: the stream ended (paused or stopped), rather than its user going back to WolfUI
+  auto on_moonlight_session_over = [app_state](std::size_t moonlight_session_id, bool stream_over) {
     immer::vector<events::Lobby> lobbies = app_state->lobbies->load();
     if (auto lobby = state::get_lobby_by_connected_session(lobbies, std::to_string(moonlight_session_id))) {
       logs::log(logs::info, "[LOBBY] Moonlight stream {} over, leaving lobby {}", moonlight_session_id, lobby->id);
+      if (stream_over && app_state->host->lobby_keeps_joypads) {
+        // Before the leave, which then leaves them plugged into the lobby (leave_lobby)
+        auto sessions = app_state->running_sessions->load();
+        if (auto session = state::get_session_by_id(sessions.get(), moonlight_session_id)) {
+          if (events::JoypadList joypads = session->joypads->load(); !joypads.empty()) {
+            auto parked = std::make_shared<const events::ParkedJoypads>(
+                events::ParkedJoypads{.joypads = joypads, .control_feedback = session->control_feedback});
+            lobby->parked_joypads->update(
+                [&](const auto &all) { return all.set(moonlight_session_id, std::move(parked)); });
+            logs::log(logs::info,
+                      "[LOBBY] Keeping {} joypad(s) of session {} plugged into lobby {} for its next stream",
+                      joypads.size(),
+                      moonlight_session_id,
+                      lobby->id);
+          }
+        }
+      }
       // Fire the LeaveLobbyEvent so that it can also be picked up by WolfUI via SSE
       app_state->event_bus->fire_event(immer::box<events::LeaveLobbyEvent>{
           events::LeaveLobbyEvent{.lobby_id = lobby->id, .moonlight_session_id = moonlight_session_id}});
@@ -378,20 +439,20 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
   // When a Moonlight client Pauses a session, we get the user out of a lobby
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
       [=](const immer::box<events::PauseStreamEvent> &pause_stream_event) {
-        on_moonlight_session_over(pause_stream_event->session_id);
+        on_moonlight_session_over(pause_stream_event->session_id, true);
       }));
 
   // When a Moonlight client Stops a session, we get the user out of a lobby
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::StopStreamEvent>>(
       [=](const immer::box<events::StopStreamEvent> &stop_stream_event) {
-        on_moonlight_session_over(stop_stream_event->session_id);
+        on_moonlight_session_over(stop_stream_event->session_id, true);
       }));
 
   // When a client presses the WolfUI special combo, we get the user out of the lobby (and back to WolfUI)
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::ClientWolfUIComboEvent>>(
       [=](const immer::box<events::ClientWolfUIComboEvent> &event) {
         logs::log(logs::info, "Detected WolfUI combo for session {}", event->session_id);
-        on_moonlight_session_over(event->session_id);
+        on_moonlight_session_over(event->session_id, false);
       }));
 
   return handlers.persistent();

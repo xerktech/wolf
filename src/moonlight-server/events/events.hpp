@@ -106,6 +106,8 @@ struct Profile {
  */
 constexpr std::string_view MOONLIGHT_PROFILE_ID = "moonlight-profile-id";
 
+struct ParkedJoypads;
+
 struct Lobby {
   const std::string id;
   const std::string name;
@@ -153,6 +155,13 @@ struct Lobby {
    * A queue of devices that will be plugged into the runner when ready
    */
   std::shared_ptr<events::devices_atom_queue> plugged_devices_queue = std::make_shared<events::devices_atom_queue>();
+
+  /**
+   * WOLF_LOBBY_KEEPS_JOYPADS: the joypads of a stream that ended in this lobby, by session_id. They stay plugged into
+   * the lobby's app until the session's next stream takes them over, so the app never sees them unplugged.
+   */
+  std::shared_ptr<immer::atom<immer::map<std::size_t, std::shared_ptr<const ParkedJoypads>>>> parked_joypads =
+      std::make_shared<immer::atom<immer::map<std::size_t, std::shared_ptr<const ParkedJoypads>>>>();
 };
 
 struct VideoSettings {
@@ -496,6 +505,15 @@ struct ControlFeedback {
   /** The ENet peer `send` goes to, so that its disconnect only clears its own */
   const void *peer = nullptr;
   std::function<void(std::string_view /* plaintext */)> send;
+};
+
+/**
+ * Joypads a lobby keeps for a session whose stream ended (Lobby::parked_joypads), with the feedback their callbacks
+ * send through, so that the next stream that takes them over gets their rumble too.
+ */
+struct ParkedJoypads {
+  JoypadList joypads;
+  std::shared_ptr<immer::atom<ControlFeedback>> control_feedback;
 };
 
 struct StreamSession {
