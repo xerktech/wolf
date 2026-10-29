@@ -386,8 +386,8 @@ void UnixSocketServer::sse_keepalive(const boost::system::error_code &e) {
   // MAX_WRITE_QUEUE_BYTES and drop a subscriber that is still reading.
   // The timer runs on the io_context thread, which owns the sockets and their write queues.
   // Never destroyed: a static's destructor runs at exit while the io_context thread may still be copying it.
-  static const auto &keepalive = *new std::shared_ptr<const std::string>(
-      std::make_shared<const std::string>(":keepalive\n\n"));
+  static const auto &keepalive =
+      *new std::shared_ptr<const std::string>(std::make_shared<const std::string>(":keepalive\n\n"));
   for (const auto &socket : state_->sockets) {
     if (socket->write_queue.empty()) {
       queue_write(socket, keepalive);
