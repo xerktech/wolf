@@ -50,6 +50,10 @@ jobs:
             echo "cache_from=type=registry,ref=${REGISTRY_IMAGE}:buildcache" >> $GITHUB_OUTPUT
             echo "cache_to=" >> $GITHUB_OUTPUT
           fi
+          if [ "$IMAGES" = "" ]; then
+            # No registry token (e.g. a fork): still build-check Wolf, tagged locally and never pushed
+            IMAGES="${REGISTRY_IMAGE}"
+          fi
           echo "images=${IMAGES}" >> $GITHUB_OUTPUT
           echo "push=${PUSH}" >> $GITHUB_OUTPUT
           echo "github_server_url=${GITHUB_SERVER_URL}" >> $GITHUB_OUTPUT
@@ -95,6 +99,7 @@ jobs:
           password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Build GPU Drivers
+        if: steps.prep.outputs.push == 'true'
         uses: docker/build-push-action@v3
         with:
           builder: ${{ steps.buildx.outputs.name }}
@@ -107,6 +112,7 @@ jobs:
           cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/gpu-drivers:buildcache,mode=max
 
       - name: Build Gstreamer
+        if: steps.prep.outputs.push == 'true'
         uses: docker/build-push-action@v3
         with:
           builder: ${{ steps.buildx.outputs.name }}
@@ -131,7 +137,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/gstreamer:1.26.7
+            ${{ steps.prep.outputs.push == 'true' && format('BASE_IMAGE=ghcr.io/{0}/gstreamer:1.26.7', github.repository_owner) || '' }}
             IMAGE_SOURCE=${{ steps.prep.outputs.github_server_url }}/${{ github.repository }}
           cache-from: ${{ steps.prep.outputs.cache_from }}
           cache-to: ${{ steps.prep.outputs.cache_to }}
