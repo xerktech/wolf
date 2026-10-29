@@ -2823,6 +2823,51 @@ TEST_CASE("Lobbies: a kept joypad never claimed is unplugged from the lobby its 
   REQUIRE(stream.joypads->load()->empty());
 }
 
+TEST_CASE("Lobbies: a stream stopped before it joins unplugs the joypads it took over from the lobby", "[API]") {
+  auto created = inputtino::XboxOneJoypad::create();
+  if (!created) {
+    SKIP("Creating a joypad needs /dev/uinput: " << created.getErrorMessage());
+  }
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .host = immer::box<state::Host>(state::Host{.lobby_keeps_joypads = true}),
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
+      .running_sessions = running_sessions});
+  constexpr std::size_t session_id = 4323;
+  events::Lobby lobby{.id = "kept-in", .name = "kept-in", .multi_user = false, .stop_when_everyone_leaves = false};
+  app_state->lobbies->update([&](const immer::vector<events::Lobby> &lobbies) { return lobbies.push_back(lobby); });
+  // The stream took over a joypad that the lobby kept for it (sessions/add), still plugged into its app; its client
+  // claimed it, but the stream never joins the lobby
+  std::weak_ptr<events::JoypadTypes> pad;
+  {
+    auto joypad = std::make_shared<events::JoypadTypes>(input::XboxOneJoypad(std::move(*created)));
+    pad = joypad;
+    auto stream = events::StreamSession{.event_bus = event_bus, .session_id = session_id};
+    stream.joypads->store(events::JoypadList{}.set(0, joypad));
+    stream.taken_over_joypads->store(std::make_shared<const events::TakenOverJoypads>(
+        events::TakenOverJoypads{.lobby_id = "kept-in", .joypads = events::JoypadList{}.set(0, joypad)}));
+    running_sessions->update([&](const auto &sessions) { return sessions.push_back(stream); });
+  }
+  auto moonlight_handlers = sessions::setup_moonlight_handlers(app_state, api_runtime_dir(), {});
+  auto lobbies_handlers = sessions::setup_lobbies_handlers(app_state, api_runtime_dir(), {});
+
+  std::vector<std::string> unplugged;
+  auto unplug_observer = event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
+      [&](const immer::box<events::UnplugDeviceEvent> &ev) { unplugged.push_back(ev->session_id); });
+  event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session_id}));
+  // The lobby no longer keeps it and the stream isn't in the lobby: only this tells the app it's gone
+  REQUIRE(unplugged == std::vector<std::string>{"kept-in"});
+  REQUIRE(running_sessions->load()->empty());
+  REQUIRE(lobby.parked_joypads->load()->empty());
+  REQUIRE(pad.expired());
+}
+
 TEST_CASE("Lobbies: joining another lobby moves the joypads a stream took over out of the first one", "[API]") {
   auto created = inputtino::XboxOneJoypad::create();
   if (!created) {

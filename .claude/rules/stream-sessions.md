@@ -161,6 +161,10 @@ paths:
       `KeptJoypads::mutex`; without it QA lost the pad in ~90% of forced arrival-vs-release races.
       Fire events only after unlocking: lobby handlers take the mutex while the bus lock is held.
     - Re-parking clears the unclaimed set, so a stream that ends before its timeout releases nothing.
+    - A stream stopped before it joins a lobby unplugs its `taken_over_joypads` from the lobby that kept
+      them (the `StopStreamEvent` handler in `sessions/moonlight.cpp`): the lobby no longer lists them and
+      the stream isn't in it, so nothing else would (XERK-2407). Tests: "Lobbies: a stream stopped before
+      it joins unplugs the joypads it took over from the lobby".
     - Tests: `tests/platforms/linux/inputtino.cpp` "uinput - joypads kept from a lobby are replaced or
       released unless the client claims them"; `tests/testWolfAPI.cpp` "Lobbies: a kept joypad never
       claimed is unplugged from the lobby its stream joined".
