@@ -570,7 +570,7 @@ TEST_CASE("Lobby join and leave wait for an in-flight joypad change", "[API]") {
         events::JoinLobbyEvent{.lobby_id = lobby_id, .moonlight_session_id = moonlight_session_id}};
     std::thread join([&]() { event_bus->fire_event(immer::box<events::JoinLobbyEvent>(join_ev)); });
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    REQUIRE(connected() == 0);
+    CHECK(connected() == 0);
     pad_change.unlock();
     join.join();
     REQUIRE(join_ev->error_message.get()->get_future().get().empty());
@@ -584,7 +584,7 @@ TEST_CASE("Lobby join and leave wait for an in-flight joypad change", "[API]") {
           events::LeaveLobbyEvent{.lobby_id = lobby_id, .moonlight_session_id = moonlight_session_id}});
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    REQUIRE(connected() == 1);
+    CHECK(connected() == 1);
     pad_change.unlock();
     leave.join();
     REQUIRE(connected() == 0);
