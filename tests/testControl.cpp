@@ -620,8 +620,13 @@ TEST_CASE("control: a resumed stream's client is asked for its carried-over pad'
   first_client.send_idr(old_key, 0, ControlEncryption::V1);
   send_arrival(first_client, old_key, 1, 0, pkts::PS);
   send_arrival(first_client, old_key, 2, 1, pkts::XBOX);
-  first_client.service(500ms);
+  // Creating a joypad can take seconds on a loaded host
+  for (auto deadline = std::chrono::steady_clock::now() + 10s;
+       first.joypads->load()->size() < 2 && std::chrono::steady_clock::now() < deadline;) {
+    first_client.service(50ms);
+  }
   REQUIRE(first.joypads->load()->size() == 2);
+  first_client.service(200ms); // the motion requests are sent before the pad is listed
   REQUIRE(motion_requests(first_client, old_key) == pad_0_motion);
 
   // /resume carries the joypad over to a new stream instance with a new key and, once it connects, a new peer
