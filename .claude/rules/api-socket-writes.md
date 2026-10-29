@@ -11,6 +11,9 @@ paths:
 - `sse_keepalive` queues only to sockets with an empty `write_queue`. Don't route it through
   `sse_broadcast`: a keepalive queued behind a backlog over `MAX_WRITE_QUEUE_BYTES` drops a
   subscriber that is still reading. Tests: "SSE APIs large events".
+- The keepalive interval is a `start_server` parameter (default `SSE_KEEPALIVE_INTERVAL`, 15 s) so
+  tests can shorten it; a test waiting on 15 s would slow the suite. Tests: "SSE APIs idle subscriber
+  gets keepalives" (the only test that fails if keepalives stop being sent).
   - `async_write` returns before the bytes are sent, so the buffer must be owned by the queue, never
     a view of a local or a temporary. The bug only shows on replies larger than one socket write
     (~64 KiB); small replies hide it.

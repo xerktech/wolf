@@ -26,9 +26,11 @@ std::string to_str(boost::asio::streambuf &streambuf, std::size_t end) {
 
 UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
                                    const std::string &socket_path,
-                                   immer::box<state::AppState> app_state) {
+                                   immer::box<state::AppState> app_state,
+                                   std::chrono::milliseconds sse_keepalive_interval) {
 
   state_ = std::make_shared<UnixSocketState>(io_context, app_state, socket_path);
+  state_->sse_keepalive_interval = sse_keepalive_interval;
 
   state_->http.add(HTTPMethod::GET,
                    "/api/v1/events",
@@ -391,7 +393,7 @@ void UnixSocketServer::sse_keepalive(const boost::system::error_code &e) {
       queue_write(socket, keepalive);
     }
   }
-  state_->sse_keepalive_timer.expires_after(SSE_KEEPALIVE_INTERVAL);
+  state_->sse_keepalive_timer.expires_after(state_->sse_keepalive_interval);
   state_->sse_keepalive_timer.async_wait([this](auto e) { sse_keepalive(e); });
 }
 
