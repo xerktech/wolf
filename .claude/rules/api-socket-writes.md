@@ -27,6 +27,8 @@ paths:
   guard kills large parallel builds.
 - ASan: set `ASAN_OPTIONS=allow_user_segv_handler=0`. `wolf.cpp` installs its own SIGSEGV handler,
   which otherwise swallows ASan's report.
+- The io_context thread can outlive `main` (tests detach it), so it must never touch a static with a
+  destructor: TSan reported `sse_keepalive` copying its static keepalive buffer after exit freed it.
 - Never `close()` a socket right after queueing its reply: it cancels the write in flight. A reply's socket
   closes by itself once the write completes and the last reference goes.
 
