@@ -553,29 +553,35 @@ TEST_CASE("control: joypad feedback reaches the resumed stream's client", "[ENET
 /*
  * A /resume (or a lobby that kept its joypads) carries a PS pad over to the new stream, so its client's
  * CONTROLLER_ARRIVAL finds the pad already there: it must still be asked for the motion data it advertises
- * (XERK-2401). Creates a real DualSense, so it needs write access to /dev/uhid.
+ * (XERK-2401); a carried-over Xbox pad can't forward motion, so it isn't. Creates real joypads, so it needs write
+ * access to /dev/uhid and /dev/uinput.
  */
 TEST_CASE("control: a resumed stream's client is asked for its carried-over pad's motion", "[ENET][UHID]") {
-  if (access("/dev/uhid", W_OK) != 0) {
-    SKIP("needs write access to /dev/uhid");
+  if (access("/dev/uhid", W_OK) != 0 || access("/dev/uinput", W_OK) != 0) {
+    SKIP("needs write access to /dev/uhid and /dev/uinput");
   }
   using wolf::core::events::StreamSession;
-  constexpr int port = 47994;
+  constexpr int port = 47991; // every test leaves its control server running: never reuse another test's port
   const std::string old_key = "EDF04A215C4FBEA20934120C8480D855", new_key = "00112233445566778899AABBCCDDEEFF";
   auto event_bus = std::make_shared<wolf::core::events::EventBusType>();
   auto make_session = [&](std::uint32_t enet_secret, const std::string &aes_key) {
-    StreamSession session{.event_bus = event_bus, .app = std::make_shared<wolf::core::events::App>()};
+    StreamSession session{.event_bus = event_bus, .app = std::make_shared<wolf::core::events::App>(wolf::core::events::App{.base = {}})};
     session.session_id = 42;
     session.enet_secret_payload = enet_secret;
     session.aes_key = aes_key;
     session.ip = "10.255.255.1"; // never matches loopback, keep the IP fallback out of the way
     return session;
   };
-  auto send_arrival = [](TestENetClient &client, const std::string &key, std::uint32_t seq) {
-    auto pkt = pkts::CONTROLLER_ARRIVAL_PACKET{.controller_number = 0,
-                                               .controller_type = pkts::PS,
-                                               .capabilities = pkts::ANALOG_TRIGGERS | pkts::RUMBLE |
-                                                               pkts::ACCELEROMETER | pkts::GYRO};
+  // Every arrival advertises motion; only the pad's type decides whether it's requested
+  auto send_arrival = [](TestENetClient &client,
+                         const std::string &key,
+                         std::uint32_t seq,
+                         std::uint8_t controller_number,
+                         pkts::CONTROLLER_TYPE type) {
+    auto pkt = pkts::CONTROLLER_ARRIVAL_PACKET{
+        .controller_number = controller_number,
+        .controller_type = type,
+        .capabilities = pkts::ANALOG_TRIGGERS | pkts::RUMBLE | pkts::ACCELEROMETER | pkts::GYRO};
     pkt.packet_type = pkts::INPUT_DATA;
     pkt.type = pkts::CONTROLLER_ARRIVAL;
     client.send_encrypted(key, seq, {(char *)&pkt, sizeof(pkt)});
@@ -608,9 +614,10 @@ TEST_CASE("control: a resumed stream's client is asked for its carried-over pad'
   first_client.service(100ms);
   // A first authenticated packet fixes the mode, so that what Wolf sends goes out once (not in both modes)
   first_client.send_idr(old_key, 0, ControlEncryption::V1);
-  send_arrival(first_client, old_key, 1);
+  send_arrival(first_client, old_key, 1, 0, pkts::PS);
+  send_arrival(first_client, old_key, 2, 1, pkts::XBOX);
   first_client.service(500ms);
-  REQUIRE(first.joypads->load()->size() == 1);
+  REQUIRE(first.joypads->load()->size() == 2);
   REQUIRE(motion_requests(first_client, old_key) == std::vector<int>{pkts::ACCELERATION, pkts::GYROSCOPE});
 
   // /resume carries the joypad over to a new stream instance with a new key and, once it connects, a new peer
@@ -621,9 +628,10 @@ TEST_CASE("control: a resumed stream's client is asked for its carried-over pad'
   TestENetClient resumed_client(port, 2);
   resumed_client.service(100ms);
   resumed_client.send_idr(new_key, 0, ControlEncryption::V1);
-  send_arrival(resumed_client, new_key, 1);
+  send_arrival(resumed_client, new_key, 1, 0, pkts::PS);
+  send_arrival(resumed_client, new_key, 2, 1, pkts::PS); // the Xbox pad stays an Xbox pad
   resumed_client.service(500ms);
-  REQUIRE(resumed.joypads->load()->size() == 1); // the pad was taken over, not recreated
+  REQUIRE(resumed.joypads->load()->size() == 2); // the pads were taken over, not recreated
   REQUIRE(motion_requests(resumed_client, new_key) == std::vector<int>{pkts::ACCELERATION, pkts::GYROSCOPE});
 }
 
