@@ -282,7 +282,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         // into the lobby all along; any other is unplugged now
         release_parked_joypads(app_state->event_bus, *lobby, session->session_id, joypads);
         // The ones its stream took over are in a lobby's app, not in the stream's runner
-        std::shared_ptr<const events::TakenOverJoypads> taken_over = session->taken_over_joypads->exchange(nullptr).get();
+        std::shared_ptr<const events::TakenOverJoypads> taken_over = session->taken_over_joypads->exchange(nullptr);
         for (auto [joypad_nr, joypad] : joypads) {
           auto taken = taken_over ? taken_over->joypads.find(joypad_nr) : nullptr;
           bool is_taken_over = taken && *taken == joypad;
