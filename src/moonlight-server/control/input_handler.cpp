@@ -748,7 +748,7 @@ void release_unclaimed_joypads_after(const state::SessionsAtoms &running_session
       return;
     }
   }
-  std::thread([running_sessions, session, timeout]() mutable {
+  std::thread([running_sessions, session = events::StreamSession(session), timeout]() mutable {
     std::this_thread::sleep_for(timeout);
     // Not for a stream that a /resume replaced or that was stopped meanwhile
     if (state::is_running_instance(running_sessions->load(), session)) {

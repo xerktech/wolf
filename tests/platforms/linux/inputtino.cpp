@@ -526,6 +526,33 @@ TEST_CASE("uinput - joypads kept from a lobby are replaced or released unless th
     REQUIRE(session.joypads->load()->size() == 2);
   }
 
+  SECTION("Another type of controller replaces the pad") {
+    arrival(1, pkts::NINTENDO);
+    REQUIRE(unplugged == std::vector<std::string>{lobby_id});
+    REQUIRE(plugged == std::vector<std::string>{std::to_string(session.session_id)});
+    auto replaced = session.joypads->load()->at(1);
+    REQUIRE(std::holds_alternative<SwitchJoypad>(*replaced));
+
+    // Claimed now: a second arrival (or the release) leaves the new pad alone
+    arrival(1, pkts::XBOX);
+    REQUIRE(session.joypads->load()->at(1) == replaced);
+    unplugged.clear();
+    arrival(0, pkts::XBOX);
+    control::release_unclaimed_joypads(session);
+    REQUIRE(unplugged.empty());
+    REQUIRE(session.joypads->load()->size() == 2);
+
+    // The new pad was plugged in through the session: so is its unplug, while the old one stays in the lobby
+    auto c_pkt = pkts::CONTROLLER_MULTI_PACKET{.controller_number = 1, .active_gamepad_mask = 0b01};
+    c_pkt.type = pkts::CONTROLLER_MULTI;
+    control::handle_input(session, {}, &c_pkt, sizeof(c_pkt));
+    REQUIRE(unplugged == std::vector<std::string>{std::to_string(session.session_id)});
+    c_pkt.controller_number = 0;
+    c_pkt.active_gamepad_mask = 0;
+    control::handle_input(session, {}, &c_pkt, sizeof(c_pkt));
+    REQUIRE(unplugged == std::vector<std::string>{std::to_string(session.session_id), lobby_id});
+  }
+
   SECTION("A kept pad's first input claims it (old Moonlight sends no arrival)") {
     for (short nr = 0; nr < 2; nr++) {
       auto c_pkt = pkts::CONTROLLER_MULTI_PACKET{.controller_number = nr, .active_gamepad_mask = 0b11};
