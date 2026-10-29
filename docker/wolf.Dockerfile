@@ -1,4 +1,6 @@
-ARG BASE_IMAGE=ghcr.io/games-on-whales/gstreamer:1.26.7
+# Pinned by digest: upstream repointed the plain `1.26.7` tag to a Fedora image, which breaks every apt-get below.
+# CI overrides this with the gstreamer image it builds itself (see .github/workflows/docker-build.yml).
+ARG BASE_IMAGE=ghcr.io/games-on-whales/gstreamer:1.26.7-ubuntu@sha256:10af2094164e4ea09099c333a61cfad689846bf882f2ffd90ed193275cdb449f
 ########################################################
 FROM $BASE_IMAGE AS wolf-builder
 
