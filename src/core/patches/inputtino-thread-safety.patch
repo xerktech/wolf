@@ -447,7 +447,7 @@ index ad50edf..3563159 100644
  }
  } // namespace inputtino
 diff --git a/src/uinput/joypad_utils.hpp b/src/uinput/joypad_utils.hpp
-index 6822641..2da4a26 100644
+index 6822641..2983e4e 100644
 --- a/src/uinput/joypad_utils.hpp
 +++ b/src/uinput/joypad_utils.hpp
 @@ -148,7 +148,11 @@ static ActiveRumbleEffect create_rumble_effect(const ff_effect &effect) {
@@ -457,7 +457,7 @@ index 6822641..2da4a26 100644
 -  std::this_thread::sleep_for(100ms); // We have to sleep in order to be able to read from the newly created device
 +  // We have to sleep in order to be able to read from the newly created device
 +  pollfd stop_pfd = {.fd = state->stop_events_fd, .events = POLLIN};
-+  if (poll(&stop_pfd, 1, 100) != 0 || state->stop_listening_events) {
++  if (poll(&stop_pfd, 1, 100) > 0 || state->stop_listening_events) {
 +    return;
 +  }
  
