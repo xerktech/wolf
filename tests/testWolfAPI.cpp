@@ -1,6 +1,7 @@
 #include "storm.hpp"
 #include <api/api.hpp>
 #include <array>
+#include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -2144,9 +2145,25 @@ struct SSEEvent {
   std::string data;
 };
 
-void listen_sse(CURL *handle, std::shared_ptr<TSQueue<SSEEvent>> queue, std::string_view api_endpoint) {
+/**
+ * Blocks until `stop` is set: curl checks it at least once a second, even while no data arrives.
+ * The caller must join the thread running this: a detached one would log keepalives after main returned, while exit
+ * destroys the logger (ThreadSanitizer reports that and fails the run).
+ */
+void listen_sse(CURL *handle,
+                std::shared_ptr<TSQueue<SSEEvent>> queue,
+                std::string_view api_endpoint,
+                std::atomic_bool &stop) {
   curl_easy_setopt(handle, CURLOPT_URL, api_endpoint.data());
   curl_easy_setopt(handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
+  curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(handle,
+                   CURLOPT_XFERINFOFUNCTION,
+                   static_cast<int (*)(void *, curl_off_t, curl_off_t, curl_off_t, curl_off_t)>(
+                       [](void *stop, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+                         return static_cast<std::atomic_bool *>(stop)->load() ? 1 : 0; // non-zero aborts
+                       }));
+  curl_easy_setopt(handle, CURLOPT_XFERINFODATA, &stop);
 
   curl_easy_setopt(
       handle,
@@ -2192,10 +2209,15 @@ TEST_CASE("SSE APIs", "[API]") {
 
   auto queue = std::make_shared<TSQueue<SSEEvent>>();
 
-  // The thread owns the handle: it never returns from curl_easy_perform, so the test must not free it
-  std::thread sse_thread(
-      [curl = std::move(curl), queue]() { listen_sse(curl.get(), queue, "http://localhost/api/v1/events"); });
-  sse_thread.detach();
+  std::atomic_bool stop = false;
+  std::thread sse_thread([curl = std::move(curl), queue, &stop]() {
+    listen_sse(curl.get(), queue, "http://localhost/api/v1/events", stop);
+  });
+  // Also on a failed REQUIRE
+  auto stop_on_exit = std::shared_ptr<void>(nullptr, [&stop, &sse_thread](void *) {
+    stop = true;
+    sse_thread.join();
+  });
   std::this_thread::sleep_for(std::chrono::milliseconds(42)); // Wait for the SSE client to start
 
   // Test out one of the events
