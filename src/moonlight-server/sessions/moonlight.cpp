@@ -248,15 +248,48 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
         // Remove session from app state so that HTTP/S applist gets updated
         // This should effectively destroy the virtual Wayland session since it holds the last reference
         std::vector<std::shared_ptr<audio::VSink>> sinks;
-        running_sessions->update([&ev, &sinks](const immer::vector<events::StreamSession> &ses_v) {
+        std::vector<events::StreamSession> stopped;
+        running_sessions->update([&ev, &sinks, &stopped](const immer::vector<events::StreamSession> &ses_v) {
           sinks.clear();
+          stopped.clear();
           for (const auto &session : ses_v) {
             if (session.session_id == ev->session_id) {
               sinks.push_back(session.audio_sink->load());
+              stopped.push_back(session);
             }
           }
           return state::remove_session(ses_v, {.session_id = ev->session_id});
         });
+
+        // Joypads the stream took over from a lobby (sessions/add) but never moved by joining one still sit in that
+        // lobby's app, which no longer keeps them: only this tells it they are gone (XERK-2407)
+        std::vector<std::pair<std::shared_ptr<events::EventBusType>, events::UnplugDeviceEvent>> left_behind;
+        for (const auto &session : stopped) {
+          std::lock_guard kept_lock(session.kept_joypads->mutex);
+          events::JoypadList joypads = session.joypads->load();
+          for (auto [joypad_nr, kept_in] : session.kept_joypads->plugged_into) {
+            if (auto joypad = joypads.find(joypad_nr)) {
+              events::UnplugDeviceEvent unplug_ev{.session_id = kept_in};
+              std::visit(
+                  [&unplug_ev](auto &pad) {
+                    unplug_ev.udev_events = pad.get_udev_events();
+                    unplug_ev.udev_hw_db_entries = pad.get_udev_hw_db_entries();
+                  },
+                  **joypad);
+              left_behind.emplace_back(session.event_bus, unplug_ev);
+            }
+          }
+          session.kept_joypads->plugged_into.clear();
+          session.kept_joypads->unclaimed.clear();
+        }
+        for (const auto &[event_bus, unplug_ev] : left_behind) {
+          logs::log(logs::info,
+                    "[STREAM_SESSION] Session {} stopped before joining a lobby; unplugging a joypad it took over from "
+                    "lobby {}",
+                    ev->session_id,
+                    unplug_ev.session_id);
+          event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{unplug_ev});
+        }
 
         plugged_devices_queue->update([=](const auto map) { return map.erase(std::to_string(ev->session_id)); });
 
