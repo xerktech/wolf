@@ -210,6 +210,8 @@ std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSessi
     request_motion_events(session, connected_client, controller_number, capabilities);
   }
 
+  // Under joypads_lobby_mutex, so a concurrent lobby join/leave either sees this pad or routes its plug
+  std::lock_guard lobby_lock(*session.joypads_lobby_mutex);
   session.joypads->update([&](events::JoypadList joypads) {
     logs::log(logs::debug,
               "[INPUT] Sending PlugDeviceEvent for joypad {} of type: {}",
@@ -679,10 +681,14 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
             unplug_ev.udev_hw_db_entries = pad.get_udev_hw_db_entries();
           },
           *selected_pad);
-      session.event_bus->fire_event(immer::box<events::UnplugDeviceEvent>(unplug_ev));
+      {
+        // Under joypads_lobby_mutex, so a concurrent lobby join/leave either sees this pad or routes its unplug
+        std::lock_guard lobby_lock(*session.joypads_lobby_mutex);
+        session.event_bus->fire_event(immer::box<events::UnplugDeviceEvent>(unplug_ev));
 
-      // Remove the joypad, this will delete the last reference
-      session.joypads->update([&](events::JoypadList joypads) { return joypads.erase(pkt.controller_number); });
+        // Remove the joypad, this will delete the last reference
+        session.joypads->update([&](events::JoypadList joypads) { return joypads.erase(pkt.controller_number); });
+      }
     }
   } else {
     // Old Moonlight doesn't support CONTROLLER_ARRIVAL, we create a default pad when it's first mentioned

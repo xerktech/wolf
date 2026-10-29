@@ -152,6 +152,17 @@ paths:
   - Tests: `tests/testWolfAPI.cpp` "Lobbies: a stream that ends in a lobby leaves its joypads plugged in
     for the next one", "...doesn't take over the kept joypads unplugs them on joining" (skip without
     `/dev/uinput`).
+- `StreamSession::joypads_lobby_mutex` orders a joypad plug/unplug against a lobby join/leave (XERK-2410).
+  - Pad create/remove hold it across the joypads update and the Plug/UnplugDeviceEvent; join/leave across
+    the joypads snapshot and `connected_sessions` update. Without it a pad changed between the two is
+    routed by neither (ghost pad in the lobby's app, or a pad in the wrong runner).
+  - Lock order: `membership_lock` before it. A join takes it only after leaving its current lobby (which
+    takes it too); never fire Join/Leave/StopLobby while holding it. Resume carries it with the joypads.
+  - A leave rewrites the lobby's keep (`parked_joypads`) to the joypads the stream has then: pads changed
+    since `on_moonlight_session_over` parked them were relayed to the lobby.
+  - Tests: "Lobby join and leave wait for an in-flight joypad change", "Lobbies: a leave keeps the joypads
+    the stream has then, not those it had when they were kept" (skips without `/dev/uinput`).
+  - Not covered: the docker runner plugs from its queue later but unplugs at once (XERK-2409).
 - `WOLF_HTTP_SERVERS=FALSE` also turns the WolfUI combo off (`Host::wolf_ui_combo`): streams then come only
   through the API (fenrir, no WolfUI), and the combo's lobby leave would take the game's joypads (XERK-2403).
   - Tests: "Lobbies: the WolfUI combo leaves a stream's joypads with it" (both settings).
