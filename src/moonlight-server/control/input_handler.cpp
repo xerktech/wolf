@@ -422,7 +422,7 @@ void keyboard_key(const KEYBOARD_PACKET &pkt, events::StreamSession &session) {
       wolf_ui_combo_pressed++;
 
     // CTRL + ALT + SHIFT + W
-    const bool wolf_ui_combo = (wolf_ui_combo_pressed == 3 && moonlight_key == 0x57);
+    const bool wolf_ui_combo = session.wolf_ui_combo && wolf_ui_combo_pressed == 3 && moonlight_key == 0x57;
     if (wolf_ui_combo) {
       // Ensure modifiers are released before we return to overlay
       std::visit(
@@ -677,8 +677,8 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
           std::uint32_t bf2 = pkt.buttonFlags2;
           auto pressed_buttons = bf | (bf2 << 16);
           // Check for our special WOLF-UI combo (START + UP + RB)
-          if (pressed_buttons & inputtino::Joypad::START && pressed_buttons & inputtino::Joypad::DPAD_UP &&
-              pressed_buttons & inputtino::Joypad::RIGHT_BUTTON) {
+          if (session.wolf_ui_combo && pressed_buttons & inputtino::Joypad::START &&
+              pressed_buttons & inputtino::Joypad::DPAD_UP && pressed_buttons & inputtino::Joypad::RIGHT_BUTTON) {
             session.event_bus->fire_event(immer::box<events::ClientWolfUIComboEvent>{
                 events::ClientWolfUIComboEvent{.session_id = session.session_id}});
           }

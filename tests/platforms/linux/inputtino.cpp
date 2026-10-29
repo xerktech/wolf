@@ -2,6 +2,7 @@
 #include <boost/endian/conversion.hpp>
 #include <boost/locale.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <catch2/matchers/catch_matchers_vector.hpp>
@@ -51,6 +52,40 @@ TEST_CASE("uinput - keyboard", "[UINPUT]") {
   REQUIRE_THAT(libevdev_event_type_get_name(events[0]->type), Equals("EV_KEY"));
   REQUIRE_THAT(libevdev_event_code_get_name(events[0]->type, events[0]->code), Equals("KEY_LEFTSHIFT"));
   REQUIRE(events[0]->value == 0);
+}
+
+TEST_CASE("uinput - keyboard WolfUI combo", "[UINPUT]") {
+  libevdev_ptr keyboard_dev(libevdev_new(), ::libevdev_free);
+  auto wolf_ui_combo = GENERATE(true, false);
+  auto session = events::StreamSession{
+      .event_bus = std::make_shared<events::EventBusType>(),
+      .wolf_ui_combo = wolf_ui_combo,
+      .keyboard = std::make_shared<std::optional<events::KeyboardTypes>>(std::move(*Keyboard::create()))};
+  link_devnode(keyboard_dev.get(), std::get<state::input::Keyboard>(session.keyboard->value()).get_nodes()[0]);
+  fetch_events_debug(keyboard_dev);
+
+  int combo_events = 0;
+  auto handler = session.event_bus->register_handler<immer::box<events::ClientWolfUIComboEvent>>(
+      [&combo_events](const immer::box<events::ClientWolfUIComboEvent> &) { combo_events++; });
+
+  // Ctrl+Alt+Shift+W, with the modifiers only flagged on the packet
+  auto press_w = pkts::KEYBOARD_PACKET{.key_code = boost::endian::native_to_little((short)0x57)};
+  press_w.type = pkts::KEY_PRESS;
+  press_w.modifiers = static_cast<char>(pkts::KEYBOARD_MODIFIERS::CTRL | pkts::KEYBOARD_MODIFIERS::ALT |
+                                        pkts::KEYBOARD_MODIFIERS::SHIFT);
+  control::handle_input(session, {}, &press_w);
+  auto events = fetch_events_debug(keyboard_dev);
+
+  bool w_pressed = std::any_of(events.begin(), events.end(), [](const auto &ev) {
+    return ev->type == EV_KEY && ev->code == KEY_W && ev->value == 1;
+  });
+  if (wolf_ui_combo) {
+    REQUIRE(combo_events == 1);
+    REQUIRE_FALSE(w_pressed);
+  } else {
+    REQUIRE(combo_events == 0);
+    REQUIRE(w_pressed);
+  }
 }
 
 TEST_CASE("uinput - pen tablet", "[UINPUT]") {
@@ -356,6 +391,27 @@ TEST_CASE("uinput - joypad", "[UINPUT]") {
       }
     }
   }
+}
+
+TEST_CASE("uinput - joypad WolfUI combo", "[UINPUT]") {
+  auto wolf_ui_combo = GENERATE(true, false);
+  events::App app = {};
+  auto session = events::StreamSession{.event_bus = std::make_shared<events::EventBusType>(),
+                                       .app = std::make_shared<events::App>(app),
+                                       .wolf_ui_combo = wolf_ui_combo};
+
+  int combo_events = 0;
+  auto handler = session.event_bus->register_handler<immer::box<events::ClientWolfUIComboEvent>>(
+      [&combo_events](const immer::box<events::ClientWolfUIComboEvent> &) { combo_events++; });
+
+  // START + UP + RB
+  auto c_pkt = pkts::CONTROLLER_MULTI_PACKET{
+      .controller_number = 1,
+      .button_flags = static_cast<short>(pkts::START | pkts::DPAD_UP | pkts::RIGHT_BUTTON)};
+  c_pkt.type = pkts::CONTROLLER_MULTI;
+  control::handle_input(session, {}, &c_pkt);
+
+  REQUIRE(combo_events == (wolf_ui_combo ? 1 : 0));
 }
 
 TEST_CASE("uinput - paste UTF8", "[UINPUT]") {

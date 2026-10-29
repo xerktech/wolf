@@ -152,3 +152,6 @@ paths:
 - `WOLF_HTTP_SERVERS=FALSE` also turns the WolfUI combo off (`Host::wolf_ui_combo`): streams then come only
   through the API (fenrir, no WolfUI), and the combo's lobby leave would take the game's joypads (XERK-2403).
   - Tests: "Lobbies: the WolfUI combo leaves a stream's joypads with it" (both settings).
+  - Off, the control path doesn't detect the combo at all (`StreamSession::wolf_ui_combo`): Ctrl+Alt+Shift+W
+    and START+UP+RB reach the game instead of being swallowed (XERK-2406).
+    Tests: "uinput - keyboard WolfUI combo", "uinput - joypad WolfUI combo" (both `[UINPUT]`).

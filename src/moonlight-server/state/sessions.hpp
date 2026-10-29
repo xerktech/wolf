@@ -132,6 +132,7 @@ inline std::shared_ptr<events::StreamSession> create_stream_session(immer::box<s
       .app_local_state_folder = full_path.string(),
       .app_host_state_folder = std::filesystem::path(state->host->host_base_state_folder) /
                                current_client.app_state_folder / run_app.base.title,
+      .wolf_ui_combo = state->host->wolf_ui_combo,
 
       .aes_key = aes_key,
       .aes_iv = aes_iv,
