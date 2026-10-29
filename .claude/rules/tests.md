@@ -30,3 +30,7 @@ paths:
   concurrent runs on a host reach each other's server.
   - Start servers with `start_api_server` (waits until it accepts), never a fixed sleep.
 - Don't `setenv()` in a test: earlier tests' detached server threads may be reading the environment.
+- ENet tests leave their `run_control` thread bound for the rest of the run: give each a port no other
+  test uses, or the second bind aborts the whole binary.
+- A real joypad (uhid/uinput) can take seconds to appear on a loaded host: poll for it with a deadline,
+  never a fixed sleep.

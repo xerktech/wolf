@@ -29,6 +29,9 @@ paths:
   - Joypads outlive a /resume, so their feedback (rumble, LEDs) sends through `control_feedback`, which
     each ENet connect points at its peer/key. Never capture the peer or key in a device callback.
     Tests: "control: joypad feedback reaches the resumed stream's client".
+  - A carried-over pad's CONTROLLER_ARRIVAL takes the "already present" path, which must still send that
+    client its motion requests (PS pads only): they are per client, not per pad (XERK-2401). Tests: "control:
+    a resumed stream's client is asked for its carried-over pad's motion" (needs uhid/uinput, skips in CI).
   - A stop's runner exits milliseconds after the stop, often after a /resume re-added the
     session_id. The runner-exit path fires `StopStreamEvent` only while its own instance is the
     running one (`state::is_running_instance`), else `EndSupersededStreamEvent` (XERK-1964).
