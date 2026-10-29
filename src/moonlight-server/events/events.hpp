@@ -606,6 +606,14 @@ struct StreamSession {
   std::shared_ptr<immer::atom<ControlFeedback>> control_feedback = std::make_shared<immer::atom<ControlFeedback>>();
 
   /**
+   * WOLF_LOBBY_KEEPS_JOYPADS: the joypads this stream took over from a lobby (sessions/add) that its client hasn't
+   * claimed yet, by controller number, with the id of the lobby whose app they are plugged into. A CONTROLLER_ARRIVAL
+   * or the pad's first input claims one; those still unclaimed a while after the client connects are unplugged.
+   */
+  std::shared_ptr<immer::atom<immer::map<int, std::string>>> unclaimed_joypads =
+      std::make_shared<immer::atom<immer::map<int, std::string>>>();
+
+  /**
    * Bitmask (KEYBOARD_MODIFIERS) of the modifier keys the client is currently physically holding.
    * Used to avoid synthesizing a virtual press/release around keys the client already holds down.
    */

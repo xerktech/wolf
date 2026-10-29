@@ -2692,6 +2692,10 @@ TEST_CASE("Lobbies: a stream that ends in a lobby leaves its joypads plugged in 
     REQUIRE(taken_over);
     REQUIRE(*taken_over == pad.lock());
     REQUIRE(stream->control_feedback == feedback); // its rumble reaches the new stream's client
+    // Until the client claims it: then it's control's to unplug from the lobby's app (release_unclaimed_joypads)
+    auto unclaimed = stream->unclaimed_joypads->load();
+    REQUIRE(unclaimed->size() == 1);
+    REQUIRE(unclaimed->at(0) == lobby_id);
   }
   REQUIRE(parked() == 0);
 

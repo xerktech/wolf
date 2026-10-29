@@ -141,6 +141,15 @@ paths:
   - `leave_lobby` sends no plug/unplug for kept joypads; a join unplugs (to the lobby) kept ones its stream
     didn't take over, and a lobby stop unplugs all it keeps: nothing else tells the app they are gone.
   - Not on the WolfUI combo: that stream goes on, back in WolfUI, and needs its joypads.
+  - The pads a stream took over stay `StreamSession::unclaimed_joypads` (nr → the lobby they're plugged
+    into) until the client claims each, with a CONTROLLER_ARRIVAL or its first input (XERK-2402).
+    - An arrival of another type replaces the kept pad; a pad still unclaimed `unclaimed_joypads_timeout`
+      after the ENet connect is unplugged. Both unplugs go to the lobby id: the stream may not have
+      joined the lobby yet, so an unplug addressed to the session would never reach the lobby's app.
+    - Only kept pads are replaced: a second arrival for a pad this stream created is still ignored.
+    - Re-parking clears the set, so a stream that ends before its timeout releases nothing.
+    - Tests: `tests/platforms/linux/inputtino.cpp` "uinput - joypads kept from a lobby are replaced or
+      released unless the client claims them".
   - Tests: `tests/testWolfAPI.cpp` "Lobbies: a stream that ends in a lobby leaves its joypads plugged in
     for the next one", "...doesn't take over the kept joypads unplugs them on joining" (skip without
     `/dev/uinput`).

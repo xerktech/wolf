@@ -17,6 +17,60 @@ using namespace wolf::core;
 using namespace std::string_literals;
 using namespace moonlight::control;
 
+/**
+ * The kind of joypad to create for `controller_number` when the client reports `requested_type` with `capabilities`,
+ * after the client's overrides (`controllers_override`, `motion_controller_override`). AUTO means Xbox.
+ */
+wolf::config::ControllerType joypad_type(const events::StreamSession &session,
+                                         int controller_number,
+                                         CONTROLLER_TYPE requested_type,
+                                         uint8_t capabilities) {
+  auto controllers_override = session.client_settings->controllers_override;
+  auto final_type = controllers_override.size() > controller_number ? controllers_override[controller_number]
+                                                                    : wolf::config::ControllerType::AUTO;
+  if (final_type == wolf::config::ControllerType::AUTO) {
+    // Motion-gated per-client override. When this slot has no
+    // `controllers_override`, the client advertises GYRO or
+    // ACCELEROMETER, AND `motion_controller_override` is set to a
+    // specific type, route to that type. Sibling to
+    // `controllers_override` (unconditional force, per-slot), but
+    // gated on the client actually having motion to forward so
+    // non-motion clients are unaffected.
+    if ((capabilities & (ACCELEROMETER | GYRO)) &&
+        session.client_settings->motion_controller_override != wolf::config::ControllerType::AUTO) {
+      final_type = session.client_settings->motion_controller_override;
+    } else {
+      switch (requested_type) {
+      case XBOX:
+        final_type = wolf::config::ControllerType::XBOX;
+        break;
+      case PS:
+        final_type = wolf::config::ControllerType::PS;
+        break;
+      case NINTENDO:
+        final_type = wolf::config::ControllerType::NINTENDO;
+        break;
+      default:
+        // Client reported UNKNOWN. If it advertises GYRO or
+        // ACCELEROMETER (typically a phone with built-in sensors
+        // overlaying any underlying pad — see
+        // moonlight-android ControllerHandler.java:3148) promote to
+        // PS so the motion-request blocks below actually fire and the
+        // gyro/accel data the client is ready to send gets requested
+        // and forwarded. Without this it stays AUTO → XBOX and the
+        // motion is silently dropped.
+        if (capabilities & (ACCELEROMETER | GYRO)) {
+          final_type = wolf::config::ControllerType::PS;
+        } else {
+          final_type = wolf::config::ControllerType::AUTO;
+        }
+        break;
+      }
+    }
+  }
+  return final_type;
+}
+
 std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSession &session,
                                                        immer::box<std::shared_ptr<ENetPeer>> connected_client,
                                                        int controller_number,
@@ -61,49 +115,7 @@ std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSessi
   });
 
   std::shared_ptr<events::JoypadTypes> new_pad;
-  auto controllers_override = session.client_settings->controllers_override;
-  auto final_type = controllers_override.size() > controller_number ? controllers_override[controller_number]
-                                                                    : wolf::config::ControllerType::AUTO;
-  if (final_type == wolf::config::ControllerType::AUTO) {
-    // Motion-gated per-client override. When this slot has no
-    // `controllers_override`, the client advertises GYRO or
-    // ACCELEROMETER, AND `motion_controller_override` is set to a
-    // specific type, route to that type. Sibling to
-    // `controllers_override` (unconditional force, per-slot), but
-    // gated on the client actually having motion to forward so
-    // non-motion clients are unaffected.
-    if ((capabilities & (ACCELEROMETER | GYRO)) &&
-        session.client_settings->motion_controller_override != wolf::config::ControllerType::AUTO) {
-      final_type = session.client_settings->motion_controller_override;
-    } else {
-      switch (requested_type) {
-      case XBOX:
-        final_type = wolf::config::ControllerType::XBOX;
-        break;
-      case PS:
-        final_type = wolf::config::ControllerType::PS;
-        break;
-      case NINTENDO:
-        final_type = wolf::config::ControllerType::NINTENDO;
-        break;
-      default:
-        // Client reported UNKNOWN. If it advertises GYRO or
-        // ACCELEROMETER (typically a phone with built-in sensors
-        // overlaying any underlying pad — see
-        // moonlight-android ControllerHandler.java:3148) promote to
-        // PS so the motion-request blocks below actually fire and the
-        // gyro/accel data the client is ready to send gets requested
-        // and forwarded. Without this it stays AUTO → XBOX and the
-        // motion is silently dropped.
-        if (capabilities & (ACCELEROMETER | GYRO)) {
-          final_type = wolf::config::ControllerType::PS;
-        } else {
-          final_type = wolf::config::ControllerType::AUTO;
-        }
-        break;
-      }
-    }
-  }
+  auto final_type = joypad_type(session, controller_number, requested_type, capabilities);
   switch (final_type) {
   case wolf::config::ControllerType::AUTO:
   case wolf::config::ControllerType::XBOX: {
@@ -624,21 +636,94 @@ void pen(const PEN_PACKET &pkt, events::StreamSession &session) {
   }
 }
 
+/**
+ * Unplugs joypad `controller_number` from where it is plugged in (`plugged_into`: a session or lobby id) and drops it
+ * from the session; the device goes away with the last reference.
+ */
+static void unplug_joypad(events::StreamSession &session,
+                          int controller_number,
+                          const events::JoypadTypes &joypad,
+                          const std::string &plugged_into) {
+  events::UnplugDeviceEvent unplug_ev{.session_id = plugged_into};
+  std::visit(
+      [&unplug_ev](auto &pad) {
+        unplug_ev.udev_events = pad.get_udev_events();
+        unplug_ev.udev_hw_db_entries = pad.get_udev_hw_db_entries();
+      },
+      joypad);
+  session.event_bus->fire_event(immer::box<events::UnplugDeviceEvent>(unplug_ev));
+  session.joypads->update([&](events::JoypadList joypads) { return joypads.erase(controller_number); });
+}
+
+/**
+ * The client claims joypad `controller_number` (it sent its arrival or input): if it was one the stream took over from
+ * a lobby (StreamSession::unclaimed_joypads), returns the id of the lobby it's plugged into, and it is no longer
+ * unclaimed.
+ */
+static std::optional<std::string> claim_joypad(events::StreamSession &session, int controller_number) {
+  if (session.unclaimed_joypads->load()->empty()) { // the usual case, on every joypad input
+    return {};
+  }
+  std::optional<std::string> lobby_id;
+  session.unclaimed_joypads->update([&](const immer::map<int, std::string> &unclaimed) {
+    auto found = unclaimed.find(controller_number);
+    lobby_id = found ? std::optional<std::string>{*found} : std::nullopt;
+    return found ? unclaimed.erase(controller_number) : unclaimed;
+  });
+  return lobby_id;
+}
+
+static bool is_joypad_type(const events::JoypadTypes &joypad, wolf::config::ControllerType type) {
+  switch (type) {
+  case wolf::config::ControllerType::PS:
+    return std::holds_alternative<PS5Joypad>(joypad);
+  case wolf::config::ControllerType::NINTENDO:
+    return std::holds_alternative<SwitchJoypad>(joypad);
+  default:
+    return std::holds_alternative<XboxOneJoypad>(joypad);
+  }
+}
+
 void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
                         events::StreamSession &session,
                         immer::box<std::shared_ptr<ENetPeer>> connected_client) {
   auto joypads = session.joypads->load();
-  if (joypads->find(pkt.controller_number)) {
-    // TODO: should we replace it instead?
-    logs::log(logs::debug,
-              "[INPUT] Received CONTROLLER_ARRIVAL for controller {} which is already present; skipping...",
-              pkt.controller_number);
-  } else {
-    create_new_joypad(session,
-                      connected_client,
-                      pkt.controller_number,
-                      (CONTROLLER_TYPE)pkt.controller_type,
-                      pkt.capabilities);
+  auto kept_in_lobby = claim_joypad(session, pkt.controller_number);
+  if (auto joypad = joypads->find(pkt.controller_number)) {
+    auto requested =
+        joypad_type(session, pkt.controller_number, (CONTROLLER_TYPE)pkt.controller_type, pkt.capabilities);
+    if (!kept_in_lobby || is_joypad_type(**joypad, requested)) {
+      logs::log(logs::debug,
+                "[INPUT] Received CONTROLLER_ARRIVAL for controller {} which is already present; skipping...",
+                pkt.controller_number);
+      return;
+    }
+    // A pad kept from the session's last stream, but this client brings another kind of controller in its place
+    logs::log(logs::info,
+              "[INPUT] Controller {} of session {} arrives as another type than the joypad kept for it; replacing it",
+              pkt.controller_number,
+              session.session_id);
+    unplug_joypad(session, pkt.controller_number, **joypad, *kept_in_lobby);
+  }
+  create_new_joypad(session,
+                    connected_client,
+                    pkt.controller_number,
+                    (CONTROLLER_TYPE)pkt.controller_type,
+                    pkt.capabilities);
+}
+
+void release_unclaimed_joypads(events::StreamSession &session) {
+  immer::map<int, std::string> unclaimed = session.unclaimed_joypads->exchange({}).get();
+  auto joypads = session.joypads->load();
+  for (auto [joypad_nr, lobby_id] : unclaimed) {
+    if (auto joypad = joypads->find(joypad_nr)) {
+      logs::log(logs::info,
+                "[INPUT] Session {} didn't claim the joypad {} kept for it; unplugging it from lobby {}",
+                session.session_id,
+                joypad_nr,
+                lobby_id);
+      unplug_joypad(session, joypad_nr, **joypad, lobby_id);
+    }
   }
 }
 
@@ -649,22 +734,17 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
   std::shared_ptr<events::JoypadTypes> selected_pad;
   if (auto joypad = joypads->find(pkt.controller_number)) {
     selected_pad = std::move(*joypad);
+    // Old Moonlight sends no CONTROLLER_ARRIVAL: a kept pad's first input claims it
+    auto kept_in_lobby = claim_joypad(session, pkt.controller_number);
 
     // Check if Moonlight is sending the final packet for this pad
     if (!(pkt.active_gamepad_mask & (1 << pkt.controller_number))) {
       logs::log(logs::debug, "Removing joypad {}", pkt.controller_number);
       // Send the event downstream, Docker will pick it up and remove the device
-      events::UnplugDeviceEvent unplug_ev{.session_id = std::to_string(session.session_id)};
-      std::visit(
-          [&unplug_ev](auto &pad) {
-            unplug_ev.udev_events = pad.get_udev_events();
-            unplug_ev.udev_hw_db_entries = pad.get_udev_hw_db_entries();
-          },
-          *selected_pad);
-      session.event_bus->fire_event(immer::box<events::UnplugDeviceEvent>(unplug_ev));
-
-      // Remove the joypad, this will delete the last reference
-      session.joypads->update([&](events::JoypadList joypads) { return joypads.erase(pkt.controller_number); });
+      unplug_joypad(session,
+                    pkt.controller_number,
+                    *selected_pad,
+                    kept_in_lobby ? *kept_in_lobby : std::to_string(session.session_id));
     }
   } else {
     // Old Moonlight doesn't support CONTROLLER_ARRIVAL, we create a default pad when it's first mentioned

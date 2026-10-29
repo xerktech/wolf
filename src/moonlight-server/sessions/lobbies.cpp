@@ -422,6 +422,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                 events::ParkedJoypads{.joypads = joypads, .control_feedback = session->control_feedback});
             lobby->parked_joypads->update(
                 [&](const auto &all) { return all.set(moonlight_session_id, std::move(parked)); });
+            // All of them kept again, claimed or not: this stream's wait for its client to claim them is over
+            session->unclaimed_joypads->store({});
             logs::log(logs::info,
                       "[LOBBY] Keeping {} joypad(s) of session {} plugged into lobby {} for its next stream",
                       joypads.size(),

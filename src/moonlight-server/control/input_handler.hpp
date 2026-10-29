@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <control/control.hpp>
 #include <events/events.hpp>
 #include <moonlight/control.hpp>
@@ -43,6 +44,18 @@ void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
 void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
                       events::StreamSession &session,
                       immer::box<std::shared_ptr<ENetPeer>> connected_client);
+
+/**
+ * How long after its client connects a stream waits for the client to claim the joypads it took over from a lobby
+ * (StreamSession::unclaimed_joypads) before release_unclaimed_joypads.
+ */
+constexpr std::chrono::seconds unclaimed_joypads_timeout{10};
+
+/**
+ * Unplugs the joypads the stream took over from a lobby that its client hasn't claimed (with a CONTROLLER_ARRIVAL or
+ * the pad's input): the client brought fewer or other controllers this time.
+ */
+void release_unclaimed_joypads(events::StreamSession &session);
 
 void controller_touch(const CONTROLLER_TOUCH_PACKET &pkt, events::StreamSession &session);
 
