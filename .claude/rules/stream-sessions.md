@@ -140,7 +140,12 @@ paths:
     under Wine missed the new pad after about half the resumes, though Wine itself saw it.
   - `leave_lobby` sends no plug/unplug for kept joypads; a join unplugs (to the lobby) kept ones its stream
     didn't take over, and a lobby stop unplugs all it keeps: nothing else tells the app they are gone.
+  - A join neither unplugs (from the stream) nor queues to the lobby's runner the ones it took over: they
+    are plugged in already, and a docker runner would plug them twice (XERK-2403).
   - Not on the WolfUI combo: that stream goes on, back in WolfUI, and needs its joypads.
   - Tests: `tests/testWolfAPI.cpp` "Lobbies: a stream that ends in a lobby leaves its joypads plugged in
     for the next one", "...doesn't take over the kept joypads unplugs them on joining" (skip without
     `/dev/uinput`).
+- `WOLF_HTTP_SERVERS=FALSE` also turns the WolfUI combo off (`Host::wolf_ui_combo`): streams then come only
+  through the API (fenrir, no WolfUI), and the combo's lobby leave would take the game's joypads (XERK-2403).
+  - Tests: "Lobbies: the WolfUI combo leaves a stream's joypads with it" (both settings).
