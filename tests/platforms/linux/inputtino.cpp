@@ -6,10 +6,12 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <catch2/matchers/catch_matchers_vector.hpp>
+#include <atomic>
 #include <chrono>
 #include <control/input_handler.hpp>
 #include <cstring>
 #include <platforms/input.hpp>
+#include <mutex>
 #include <platforms/linux/uinput/uinput.hpp>
 #include <thread>
 #include <vector>
@@ -412,6 +414,48 @@ TEST_CASE("uinput - joypad WolfUI combo", "[UINPUT]") {
   control::handle_input(session, {}, &c_pkt, sizeof(c_pkt));
 
   REQUIRE(combo_events == (wolf_ui_combo ? 1 : 0));
+}
+
+TEST_CASE("uinput - joypad plug/unplug waits for a lobby join/leave in progress", "[UINPUT]") {
+  auto session = events::StreamSession{.event_bus = std::make_shared<events::EventBusType>(),
+                                       .app = std::make_shared<events::App>(events::App{})};
+  std::atomic<int> plugged = 0, unplugged = 0;
+  auto plug_handler = session.event_bus->register_handler<immer::box<events::PlugDeviceEvent>>(
+      [&](const immer::box<events::PlugDeviceEvent> &) { plugged++; });
+  auto unplug_handler = session.event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
+      [&](const immer::box<events::UnplugDeviceEvent> &) { unplugged++; });
+
+  auto send_multi = [&](short active_gamepad_mask) {
+    auto c_pkt = pkts::CONTROLLER_MULTI_PACKET{.controller_number = 0, .active_gamepad_mask = active_gamepad_mask};
+    c_pkt.type = pkts::CONTROLLER_MULTI;
+    control::handle_input(session, {}, &c_pkt, sizeof(c_pkt));
+  };
+
+  // A join/leave holds joypads_lobby_mutex across its joypads snapshot and lobby update: a pad must not be added and
+  // announced in between. CHECK, not REQUIRE, while a thread is joinable: a thrown REQUIRE would std::terminate.
+  {
+    std::unique_lock lobby_switch(*session.joypads_lobby_mutex);
+    std::thread arrival([&]() { send_multi(1); }); // first mention of pad 0 creates it
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(plugged == 0);
+    CHECK(session.joypads->load()->size() == 0);
+    lobby_switch.unlock();
+    arrival.join();
+    REQUIRE(plugged == 1);
+    REQUIRE(session.joypads->load()->size() == 1);
+  }
+
+  { // ...nor removed and announced in between
+    std::unique_lock lobby_switch(*session.joypads_lobby_mutex);
+    std::thread removal([&]() { send_multi(0); }); // pad 0 no longer active
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(unplugged == 0);
+    CHECK(session.joypads->load()->size() == 1);
+    lobby_switch.unlock();
+    removal.join();
+    REQUIRE(unplugged == 1);
+    REQUIRE(session.joypads->load()->size() == 0);
+  }
 }
 
 TEST_CASE("uinput - paste UTF8", "[UINPUT]") {
