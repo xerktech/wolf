@@ -1,4 +1,5 @@
-ARG BASE_IMAGE=ghcr.io/games-on-whales/gstreamer:1.26.7
+# Pinned by digest: upstream retagged gstreamer:1.26.7 as a Fedora image, which the apt-get steps below can't use.
+ARG BASE_IMAGE=ghcr.io/games-on-whales/gstreamer:1.26.7@sha256:512b53b03b256a87fb4bd204ed1d91219148b0b77ff4ee4fc121c37d869f8d29
 ########################################################
 FROM $BASE_IMAGE AS wolf-builder
 

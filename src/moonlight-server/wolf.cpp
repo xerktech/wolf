@@ -133,7 +133,8 @@ state::Host get_host_config(std::string_view pkey_filename, std::string_view cer
           local_base_state_folder,
           host_xdg_runtime_dir,
           rtsp_require_encryption,
-          lobby_keeps_joypads};
+          lobby_keeps_joypads,
+          state::http_servers_enabled()};
 }
 
 /**

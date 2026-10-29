@@ -266,20 +266,24 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
         std::vector<std::pair<std::shared_ptr<events::EventBusType>, events::UnplugDeviceEvent>> left_behind;
         for (const auto &session : stopped) {
           std::lock_guard kept_lock(session.kept_joypads->mutex);
+          std::shared_ptr<const events::TakenOverJoypads> taken_over = session.taken_over_joypads->exchange(nullptr);
+          if (!taken_over) {
+            continue;
+          }
           events::JoypadList joypads = session.joypads->load();
-          for (auto [joypad_nr, kept_in] : session.kept_joypads->plugged_into) {
-            if (auto joypad = joypads.find(joypad_nr)) {
-              events::UnplugDeviceEvent unplug_ev{.session_id = kept_in};
+          for (auto [joypad_nr, joypad] : joypads) {
+            // Only those it still has, and still the very pads it took over (not a replacement)
+            if (auto taken = taken_over->joypads.find(joypad_nr); taken && *taken == joypad) {
+              events::UnplugDeviceEvent unplug_ev{.session_id = taken_over->lobby_id};
               std::visit(
                   [&unplug_ev](auto &pad) {
                     unplug_ev.udev_events = pad.get_udev_events();
                     unplug_ev.udev_hw_db_entries = pad.get_udev_hw_db_entries();
                   },
-                  **joypad);
+                  *joypad);
               left_behind.emplace_back(session.event_bus, unplug_ev);
             }
           }
-          session.kept_joypads->plugged_into.clear();
           session.kept_joypads->unclaimed.clear();
         }
         for (const auto &[event_bus, unplug_ev] : left_behind) {

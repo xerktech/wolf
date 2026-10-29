@@ -460,9 +460,10 @@ TEST_CASE("uinput - joypads kept from a lobby are replaced or released unless th
     REQUIRE(created);
     kept.push_back(std::make_shared<events::JoypadTypes>(XboxOneJoypad(std::move(*created))));
     session.joypads->update([&](auto joypads) { return joypads.set(nr, kept.back()); });
-    session.kept_joypads->plugged_into[nr] = lobby_id;
     session.kept_joypads->unclaimed.insert(nr);
   }
+  session.taken_over_joypads->store(std::make_shared<const events::TakenOverJoypads>(
+      events::TakenOverJoypads{.lobby_id = lobby_id, .joypads = session.joypads->load()}));
 
   std::vector<std::string> plugged, unplugged; // session ids the events are addressed to
   auto plug_observer = event_bus->register_handler<immer::box<events::PlugDeviceEvent>>(
@@ -500,7 +501,7 @@ TEST_CASE("uinput - joypads kept from a lobby are replaced or released unless th
   }
 
   SECTION("Once the session joined a lobby, the unplug follows the session") {
-    session.kept_joypads->plugged_into.clear(); // what the join does (sessions/lobbies.cpp)
+    session.taken_over_joypads->store(nullptr); // what the join does (sessions/lobbies.cpp)
     control::release_unclaimed_joypads(session);
     REQUIRE(unplugged ==
             std::vector<std::string>{std::to_string(session.session_id), std::to_string(session.session_id)});

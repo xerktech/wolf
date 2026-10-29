@@ -176,6 +176,12 @@ struct Host {
    * session's next stream (Lobby::parked_joypads), instead of moving them back to the session that is going away.
    */
   bool lobby_keeps_joypads = false;
+
+  /**
+   * The WolfUI combo takes a stream out of its lobby, back to WolfUI. Off with WOLF_HTTP_SERVERS=FALSE: streams then
+   * come only through the API (fenrir), which has no WolfUI, and leaving the lobby would take the game's joypads.
+   */
+  bool wolf_ui_combo = true;
 };
 
 enum class PAIR_PHASE {
