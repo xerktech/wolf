@@ -94,7 +94,7 @@ jobs:
             std: 20
             test_docker: ON
             test_nvidia: OFF
-            test_virtual_input: OFF
+            test_virtual_input: ON
             test_exceptions: OFF
             name: aarch64
           - runner: ubuntu-26.04
@@ -105,7 +105,7 @@ jobs:
             std: 20
             test_docker: ON
             test_nvidia: OFF
-            test_virtual_input: OFF
+            test_virtual_input: ON
             test_exceptions: ON
             name: g++-12 - STD 20 - Shared true
           - runner: ubuntu-26.04
@@ -116,7 +116,7 @@ jobs:
             std: 20
             test_docker: ON
             test_nvidia: OFF
-            test_virtual_input: OFF
+            test_virtual_input: ON
             test_exceptions: ON
             name: g++-12 - STD 20 - Shared false
           - runner: ubuntu-26.04
@@ -127,7 +127,7 @@ jobs:
             std: 20
             test_docker: ON
             test_nvidia: OFF
-            test_virtual_input: OFF
+            test_virtual_input: ON
             test_exceptions: ON
             name: clang++ - STD 20 - Shared true
           - runner: ubuntu-26.04
@@ -138,7 +138,7 @@ jobs:
             std: 20
             test_docker: ON
             test_nvidia: OFF
-            test_virtual_input: OFF
+            test_virtual_input: ON
             test_exceptions: ON
             name: clang++ - STD 20 - Shared false
           # AddressSanitizer: a use-after-free (e.g. of a freed immer snapshot) almost never crashes the other legs.
@@ -152,7 +152,7 @@ jobs:
             timeout: 60
             test_docker: ON
             test_nvidia: OFF
-            test_virtual_input: OFF
+            test_virtual_input: ON
             test_exceptions: ON
             name: ASan - g++ - STD 20 - Shared false
           # ThreadSanitizer: unsynchronised access across threads, e.g. API sockets touched off the io_context thread.
@@ -166,6 +166,7 @@ jobs:
             timeout: 60
             test_docker: ON
             test_nvidia: OFF
+            # Off until XERK-2412: inputtino's keyboard/uhid threads (and Wolf's joypad feedback) race; ~40 reports
             test_virtual_input: OFF
             test_exceptions: ON
             name: TSan - g++ - STD 20 - Shared false
@@ -216,6 +217,25 @@ jobs:
           mkdir build
           meson build -Denable-gtk-doc=false --prefix ${{runner.workspace}}/libgstwaylanddisplay
           meson install -C build
+
+      # GitHub-hosted runners are VMs without uinput/uhid loaded, and the runner user can't open the
+      # devices the tests create. Load the modules and open the nodes up (the VM is throwaway) so the
+      # virtual input tests (inputtino, uhid, fake-udev, lobby joypads) run instead of being skipped.
+      - name: Enable virtual input devices
+        if: matrix.test_virtual_input == 'ON'
+        run: |
+          sudo modprobe uinput
+          sudo modprobe uhid
+          sudo tee /etc/udev/rules.d/99-wolf-ci.rules <<'RULES'
+          KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0666", OPTIONS+="static_node=uinput"
+          KERNEL=="uhid", MODE="0666"
+          SUBSYSTEM=="input", MODE="0666"
+          KERNEL=="hidraw*", MODE="0666"
+          RULES
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger
+          sudo chmod 0666 /dev/uinput /dev/uhid
+          ls -l /dev/uinput /dev/uhid
 
       - name: Configure build
         working-directory: ${{runner.workspace}}
