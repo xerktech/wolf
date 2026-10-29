@@ -13,6 +13,8 @@ on:
 jobs:
   buildx:
     runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.prep.outputs.images }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -147,6 +149,7 @@ jobs:
   test_devcontainer:
     runs-on: ubuntu-latest
     needs: buildx
+    if: needs.buildx.outputs.images != '' # skipped with the image build (no registry secret)
     steps:
       - name: Checkout
         uses: actions/checkout@v4
