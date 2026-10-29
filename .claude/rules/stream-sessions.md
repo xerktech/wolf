@@ -29,6 +29,9 @@ paths:
   - Joypads outlive a /resume, so their feedback (rumble, LEDs) sends through `control_feedback`, which
     each ENet connect points at its peer/key. Never capture the peer or key in a device callback.
     Tests: "control: joypad feedback reaches the resumed stream's client".
+  - A carried-over pad's CONTROLLER_ARRIVAL takes the "already present" path, which must still send that
+    client its motion requests (PS pads only): they are per client, not per pad (XERK-2401). Tests: "control:
+    a resumed stream's client is asked for its carried-over pad's motion" (needs uhid/uinput, skips in CI).
   - A stop's runner exits milliseconds after the stop, often after a /resume re-added the
     session_id. The runner-exit path fires `StopStreamEvent` only while its own instance is the
     running one (`state::is_running_instance`), else `EndSupersededStreamEvent` (XERK-1964).
@@ -158,6 +161,7 @@ paths:
       `KeptJoypads::mutex`; without it QA lost the pad in ~90% of forced arrival-vs-release races.
       Fire events only after unlocking: lobby handlers take the mutex while the bus lock is held.
     - Re-parking clears the unclaimed set, so a stream that ends before its timeout releases nothing.
+<<<<<<< HEAD
     - A stream stopped before it joins a lobby unplugs its `taken_over_joypads` from the lobby that kept
       them (the `StopStreamEvent` handler in `sessions/moonlight.cpp`): the lobby no longer lists them and
       the stream isn't in it, so nothing else would (XERK-2407). Tests: "Lobbies: a stream stopped before
@@ -166,9 +170,20 @@ paths:
       released unless the client claims them"; `tests/testWolfAPI.cpp` "Lobbies: a kept joypad never
       claimed is unplugged from the lobby its stream joined".
     - CI builds neither with uinput: `test_virtual_input` is OFF and the uinput API tests skip.
+=======
+    - Tests: `tests/platforms/linux/inputtino.cpp` "uinput - joypads kept from a lobby are replaced or
+      released unless the client claims them"; `tests/testWolfAPI.cpp` "Lobbies: a kept joypad never
+      claimed is unplugged from the lobby its stream joined".
+>>>>>>> origin/XERK-2402
   - Tests: `tests/testWolfAPI.cpp` "Lobbies: a stream that ends in a lobby leaves its joypads plugged in
     for the next one", "...doesn't take over the kept joypads unplugs them on joining" (skip without
     `/dev/uinput`).
 - `WOLF_HTTP_SERVERS=FALSE` also turns the WolfUI combo off (`Host::wolf_ui_combo`): streams then come only
   through the API (fenrir, no WolfUI), and the combo's lobby leave would take the game's joypads (XERK-2403).
   - Tests: "Lobbies: the WolfUI combo leaves a stream's joypads with it" (both settings).
+<<<<<<< HEAD
+=======
+  - Off, the control path doesn't detect the combo at all (`StreamSession::wolf_ui_combo`): Ctrl+Alt+Shift+W
+    and START+UP+RB reach the game instead of being swallowed (XERK-2406).
+    Tests: "uinput - keyboard WolfUI combo", "uinput - joypad WolfUI combo" (both `[UINPUT]`).
+>>>>>>> origin/XERK-2402

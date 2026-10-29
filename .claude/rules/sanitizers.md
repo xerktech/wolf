@@ -29,3 +29,5 @@ paths:
   `videotestsrc` "Stopping a stuck pipeline doesn't block the event bus" fails and hangs the run).
   - The suite takes ~2 min under TSan (CI and 4 pinned cores).
   - `TSAN_OPTIONS=log_path=<prefix>` keeps reports out of the console.
+- The TSan row keeps `test_virtual_input: OFF` (XERK-2412): inputtino's keyboard repeat and uhid
+  threads race (non-atomic stop flags, `cur_press_keys`), giving ~40 reports. Turn it on with the fix.

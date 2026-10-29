@@ -549,6 +549,11 @@ struct StreamSession {
   std::string app_local_state_folder;
   std::string app_host_state_folder;
 
+  /**
+   * Whether the WolfUI hotkeys are intercepted for this session (see state::Host::wolf_ui_combo)
+   */
+  bool wolf_ui_combo = true;
+
   // gcm encryption keys
   std::string aes_key;
   std::string aes_iv;
