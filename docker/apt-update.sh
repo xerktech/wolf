@@ -14,8 +14,12 @@ if [ "$rc" -ne 0 ] && grep -qE '\.ubuntu\.com/ubuntu(-ports)? .*ha(s|ve) a Relea
   # Archived ports (arm) releases live under old-releases' /ubuntu too, not /ubuntu-ports.
   sed -i -E 's#https?://(([a-z]{2}\.)?archive|security|ports)\.ubuntu\.com/ubuntu(-ports)?#http://old-releases.ubuntu.com/ubuntu#' \
     /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null
-  echo "apt-update: release archived, switched apt sources to old-releases.ubuntu.com"
-  exec apt-get update -y "$@"
+  # A mirror the sed doesn't know (e.g. a cloud-regional one) is left as is; fail as apt did.
+  if grep -qs 'old-releases\.ubuntu\.com' /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; then
+    echo "apt-update: release archived, switched apt sources to old-releases.ubuntu.com"
+    exec apt-get update -y "$@"
+  fi
+  exit "$rc"
 fi
 rm -f "$log"
 exit "$rc"
