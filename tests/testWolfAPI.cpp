@@ -1963,6 +1963,29 @@ TEST_CASE("A device queue drops the queued elements matching a predicate", "[API
   REQUIRE(!queue.pop(0ms));
 }
 
+TEST_CASE("An unplug matches its device's plug whenever its udev events were built", "[API]") {
+  std::map<std::string, std::string> node = {{"DEVNAME", "/dev/input/event7"}, {"USEC_INITIALIZED", "100"}};
+  events::PlugDeviceEvent plug{.session_id = "1", .udev_events = {node}, .udev_hw_db_entries = {{"c13:71", {"E:a"}}}};
+  events::UnplugDeviceEvent unplug{.session_id = "1",
+                                   .udev_events = {node},
+                                   .udev_hw_db_entries = {{"c13:71", {"E:a"}}}};
+  REQUIRE(events::is_same_device(plug, unplug));
+
+  // Built a second later: still the same device
+  unplug.udev_events[0]["USEC_INITIALIZED"] = "101";
+  REQUIRE(events::is_same_device(plug, unplug));
+
+  auto other_node = unplug;
+  other_node.udev_events[0]["DEVNAME"] = "/dev/input/event8";
+  REQUIRE(!events::is_same_device(plug, other_node));
+  auto other_hw_db = unplug;
+  other_hw_db.udev_hw_db_entries[0].first = "c13:72";
+  REQUIRE(!events::is_same_device(plug, other_hw_db));
+  auto more_nodes = unplug;
+  more_nodes.udev_events.push_back(node);
+  REQUIRE(!events::is_same_device(plug, more_nodes));
+}
+
 TEST_CASE("Lobbies APIs", "[API]") {
   auto event_bus = std::make_shared<events::EventBusType>();
   auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();

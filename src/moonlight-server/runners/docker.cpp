@@ -253,8 +253,7 @@ void RunDocker::run(std::string_view session_id,
             logs::log(logs::debug, "[DOCKER] Received UnplugDeviceEvent for session: {}", ev->session_id);
             std::lock_guard lock(devices_mutex);
             auto never_plugged = plugged_devices_queue->remove_if([&](const immer::box<events::PlugDeviceEvent> &plug) {
-              return plug->session_id == session_id && plug->udev_events == ev->udev_events &&
-                     plug->udev_hw_db_entries == ev->udev_hw_db_entries;
+              return plug->session_id == session_id && events::is_same_device(*plug, *ev);
             });
             if (never_plugged > 0) {
               logs::log(logs::debug, "[DOCKER] Dropped the queued plug of a device unplugged before it was plugged");

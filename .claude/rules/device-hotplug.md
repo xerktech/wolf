@@ -14,10 +14,12 @@ paths:
   container keeps a device nobody removes.
   - `runners/docker.cpp` holds one mutex over the queue drain + plug commands and over the unplug handler;
     an unplug whose plug is still queued drops it from the queue instead of running remove commands.
+  - Match plug and unplug with `events::is_same_device`, never `==` on the udev events: `USEC_INITIALIZED`
+    is a seconds timestamp taken each time a pad's events are built (XERK-2409 QA: 14/200 ghosts).
 - Lobby joins: the lobby relay only forwards a session's unplug once the session is in `connected_sessions`,
   but the join queues the pads' plugs before that (so a relayed unplug can't overtake them).
-  - The join re-reads `session->joypads` after connecting and unplugs from the lobby any pad it queued that
-    has gone. Residual gap: a pad whose unplug's relay check ran before the connect but whose erase lands after
+  - The join re-reads `session->joypads` after connecting and unplugs from the lobby any snapshot pad (queued
+    or taken over) that has gone. Residual gap: a pad whose unplug's relay check ran before the connect but whose erase lands after
     the re-check (microseconds: the erase follows the fire). XERK-2410 tracks a per-session lock instead.
   - Keep control's unplug as fire-then-erase. Erase-then-fire looks like it closes that gap, but same-type
     handlers run newest-first, so the session runner's exec runs between the erase and the relay's check: a
