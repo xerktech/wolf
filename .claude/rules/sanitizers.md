@@ -1,6 +1,7 @@
 ---
 paths:
   - .github/workflows/linux-build-test.yml
+  - tests/main.cpp
   - tests/tsan-suppressions.txt
   - tests/storm.hpp
 ---
@@ -9,9 +10,13 @@ paths:
 
 - Both are `sanitize:` entries in the `test` matrix: g++, static, RelWithDebInfo, `-DIMMER_NO_FREE_LIST=1`.
 - Reports vary run to run (interleavings): one clean run proves little; compare several.
-- TSan doesn't stop at a report: the suite runs to the end and exits 66, so "All tests passed" with a
-  red step means races were reported. Grep the log for `WARNING: ThreadSanitizer`.
+- TSan doesn't stop at a report: the suite runs to the end and exits 66 (only when every test passed;
+  otherwise Catch2's nonzero code), so "All tests passed" with a red step means races were reported.
+  Grep the log for `WARNING: ThreadSanitizer`.
   - Detached server threads outlive their test, so a report may name a later test. Read the stacks.
+- `tests/main.cpp` ends in `::_exit`, never `return` (XERK-2434): detached API servers and SSE clients
+  otherwise hit destroyed statics during `exit()` (boost.log, the SSE keepalive) → flaky exit-time reports.
+  - Not `std::_Exit`: TSan intercepts only `_exit`, so `_Exit` would drop the exit code 66 and pass races.
 - `tests/tsan-suppressions.txt` (`race:` = any frame of either racing stack, by function/file/library):
   - Catch2's per-test std::clog capture (JUnit reporter, CI only) races detached servers' logging.
   - Boost.Thread: only `~thread_data_base` (detach of a `future::then` thread); never the whole .so.
