@@ -2,13 +2,19 @@ name: Linux build and test
 
 on:
   push:
-    paths-ignore:
-      - "docs/**"
-      - "docker/**"
+    # Later patterns win: docker/patches is built into the gst-wayland-display job below
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!docker/**"
+      - "docker/patches/**"
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "docker/**"
+    # Later patterns win: docker/patches is built into the gst-wayland-display job below
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!docker/**"
+      - "docker/patches/**"
 
 env:
   GST_WAYLAND_COMMIT: 016b4fc
