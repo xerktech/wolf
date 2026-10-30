@@ -38,15 +38,19 @@ ENV RUST_VERSION=$RUST_VERSION
 RUN rustup install $RUST_VERSION && rustup default $RUST_VERSION
 
 WORKDIR /tmp/
+# Upstream gst-wayland-display plus our fix for waylanddisplaysrc releasing Wolf's cached CUDA
+# context once per stream (XERK-1740), which upstream stable doesn't have yet. Pinned so the
+# patch keeps applying; bump the ref and the patch together.
+ARG GST_WAYLAND_DISPLAY_REF=016b4fc66d62b6a34c37169ecf6d511eef140d7c
+COPY docker/patches/gst-wayland-display-*.patch /tmp/gst-wayland-display-patches/
 RUN <<_GST_WAYLAND_DISPLAY
     #!/bin/bash
     set -e
 
-    # xerktech fork, tag xerk-1740: upstream 016b4fc + the fix for waylanddisplaysrc
-    # releasing Wolf's cached CUDA context once per stream (XERK-1740).
-    git clone https://github.com/xerktech/gst-wayland-display
+    git clone https://github.com/games-on-whales/gst-wayland-display
     cd gst-wayland-display
-    git checkout 58c55f7d9b9466c2d8b0b78a5d32bf6465fc2189
+    git checkout $GST_WAYLAND_DISPLAY_REF
+    git apply /tmp/gst-wayland-display-patches/gst-wayland-display-*.patch
     # Pinned because it can cause issues when RUST_VERSION isn't the absolute latest
     cargo install cargo-c@0.10.23 --locked
     # The plugin installs into <libdir>/gstreamer-1.0, the C library into <libdir>.

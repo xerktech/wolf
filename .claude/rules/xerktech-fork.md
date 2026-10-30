@@ -21,10 +21,13 @@ pods run (`ghcr.io/xerktech/wolf`, XERK-1944).
   the run summary prints the digest.
   - Never trigger it from PR branches or pull_request: PR CI must not publish images.
   - fenrir pins the image by digest in `charts/direwolf-operator/values.yaml` (`WOLF_IMAGE`).
-- `docker/wolf.Dockerfile` builds gst-wayland-display from xerktech/gst-wayland-display, pinned
-  to a commit on a `xerk-*` tag (tags keep the commit fetchable whatever its branch does).
-  - That commit must sit on the upstream gst-wayland-display commit `stable` pinned; when a
-    rebase moves the upstream pin, rebase the gst-wayland-display fix onto it and cut a new tag.
+- `docker/wolf.Dockerfile` builds upstream gst-wayland-display at `GST_WAYLAND_DISPLAY_REF` and
+  applies `docker/patches/gst-wayland-display-*.patch` (XERK-2487; there is no gst-wayland-display
+  fork any more).
+  - The CUDA context patch (XERK-1740) is upstream only in PR #70, which needs GStreamer 1.28.
+    Drop it once the image builds an upstream release that has it.
+  - When the ref moves, rebase the patch onto it and keep `GST_WAYLAND_COMMIT` in
+    `linux-build-test.yml` on the same ref.
 - `docker/wolf.Dockerfile`'s default `BASE_IMAGE` is pinned by the same digest as docker-build.yml: upstream
   retagged `gstreamer:1.26.7` as a Fedora image (2026-10), which its apt-get steps can't build on.
 - `mirror-repo.yml` only runs in games-on-whales/wolf; it must never push from the fork.
