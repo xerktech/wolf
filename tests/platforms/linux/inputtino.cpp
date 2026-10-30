@@ -503,3 +503,129 @@ TEST_CASE("uinput - paste UTF8", "[UINPUT]") {
     require_ev("KEY_LEFTCTRL", false);
   }
 }
+
+TEST_CASE("uinput - joypads kept from a lobby are replaced or released unless the client claims them", "[UINPUT]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto session = events::StreamSession{.event_bus = event_bus, .session_id = 1234};
+  const std::string lobby_id = "game-lobby";
+
+  // The stream took over two Xbox pads kept by the lobby, still plugged into its app (sessions/add)
+  std::vector<std::shared_ptr<events::JoypadTypes>> kept;
+  for (int nr = 0; nr < 2; nr++) {
+    auto created = inputtino::XboxOneJoypad::create();
+    REQUIRE(created);
+    kept.push_back(std::make_shared<events::JoypadTypes>(XboxOneJoypad(std::move(*created))));
+    session.joypads->update([&](auto joypads) { return joypads.set(nr, kept.back()); });
+    session.kept_joypads->unclaimed.insert(nr);
+  }
+  session.taken_over_joypads->store(std::make_shared<const events::TakenOverJoypads>(
+      events::TakenOverJoypads{.lobby_id = lobby_id, .joypads = session.joypads->load()}));
+
+  std::vector<std::string> plugged, unplugged; // session ids the events are addressed to
+  auto plug_observer = event_bus->register_handler<immer::box<events::PlugDeviceEvent>>(
+      [&](const immer::box<events::PlugDeviceEvent> &ev) { plugged.push_back(ev->session_id); });
+  auto unplug_observer = event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
+      [&](const immer::box<events::UnplugDeviceEvent> &ev) { unplugged.push_back(ev->session_id); });
+  auto arrival = [&](uint8_t controller_number, pkts::CONTROLLER_TYPE type) {
+    auto c_pkt = pkts::CONTROLLER_ARRIVAL_PACKET{.controller_number = controller_number,
+                                                 .controller_type = type,
+                                                 .capabilities = pkts::ANALOG_TRIGGERS};
+    c_pkt.type = pkts::CONTROLLER_ARRIVAL;
+    control::handle_input(session, {}, &c_pkt, sizeof(c_pkt));
+  };
+
+  SECTION("The same controller arriving keeps its pad") {
+    arrival(0, pkts::XBOX);
+    REQUIRE(session.joypads->load()->at(0) == kept[0]);
+    REQUIRE(plugged.empty());
+    REQUIRE(unplugged.empty());
+
+    // The one it didn't bring is unplugged from the lobby's app it's plugged into
+    control::release_unclaimed_joypads(session);
+    REQUIRE(unplugged == std::vector<std::string>{lobby_id});
+    REQUIRE(session.joypads->load()->size() == 1);
+    REQUIRE(!session.joypads->load()->find(1));
+    REQUIRE(session.kept_joypads->unclaimed.empty());
+
+    // Once claimed, the input's unplug (Moonlight's mask) still goes to where the pad is plugged in
+    unplugged.clear();
+    auto c_pkt = pkts::CONTROLLER_MULTI_PACKET{.controller_number = 0, .active_gamepad_mask = 0};
+    c_pkt.type = pkts::CONTROLLER_MULTI;
+    control::handle_input(session, {}, &c_pkt, sizeof(c_pkt));
+    REQUIRE(unplugged == std::vector<std::string>{lobby_id});
+    REQUIRE(session.joypads->load()->empty());
+  }
+
+  SECTION("Once the session joined a lobby, the unplug follows the session") {
+    session.taken_over_joypads->store(nullptr); // what the join does (sessions/lobbies.cpp)
+    control::release_unclaimed_joypads(session);
+    REQUIRE(unplugged ==
+            std::vector<std::string>{std::to_string(session.session_id), std::to_string(session.session_id)});
+    REQUIRE(session.joypads->load()->empty());
+  }
+
+  SECTION("The release waits for the timeout") {
+    auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>(
+        immer::vector<events::StreamSession>{session});
+    control::release_unclaimed_joypads_after(running_sessions, session, std::chrono::milliseconds(200));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    REQUIRE(unplugged.empty());
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    REQUIRE(unplugged == std::vector<std::string>{lobby_id, lobby_id});
+    REQUIRE(session.joypads->load()->empty());
+  }
+
+  SECTION("A stream no longer running releases nothing") {
+    auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+    control::release_unclaimed_joypads_after(running_sessions, session, std::chrono::milliseconds(50));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    REQUIRE(unplugged.empty());
+    REQUIRE(session.joypads->load()->size() == 2);
+  }
+
+  SECTION("Another type of controller replaces the pad") {
+    arrival(1, pkts::NINTENDO);
+    REQUIRE(unplugged == std::vector<std::string>{lobby_id});
+    REQUIRE(plugged == std::vector<std::string>{std::to_string(session.session_id)});
+    auto replaced = session.joypads->load()->at(1);
+    REQUIRE(std::holds_alternative<SwitchJoypad>(*replaced));
+
+    // Claimed now: a second arrival (or the release) leaves the new pad alone
+    arrival(1, pkts::XBOX);
+    REQUIRE(session.joypads->load()->at(1) == replaced);
+    unplugged.clear();
+    arrival(0, pkts::XBOX);
+    control::release_unclaimed_joypads(session);
+    REQUIRE(unplugged.empty());
+    REQUIRE(session.joypads->load()->size() == 2);
+
+    // The new pad was plugged in through the session: so is its unplug, while the old one stays in the lobby
+    auto c_pkt = pkts::CONTROLLER_MULTI_PACKET{.controller_number = 1, .active_gamepad_mask = 0b01};
+    c_pkt.type = pkts::CONTROLLER_MULTI;
+    control::handle_input(session, {}, &c_pkt, sizeof(c_pkt));
+    REQUIRE(unplugged == std::vector<std::string>{std::to_string(session.session_id)});
+    c_pkt.controller_number = 0;
+    c_pkt.active_gamepad_mask = 0;
+    control::handle_input(session, {}, &c_pkt, sizeof(c_pkt));
+    REQUIRE(unplugged == std::vector<std::string>{std::to_string(session.session_id), lobby_id});
+  }
+
+  SECTION("A kept pad's first input claims it (old Moonlight sends no arrival)") {
+    for (short nr = 0; nr < 2; nr++) {
+      auto c_pkt = pkts::CONTROLLER_MULTI_PACKET{.controller_number = nr, .active_gamepad_mask = 0b11};
+      c_pkt.type = pkts::CONTROLLER_MULTI;
+      control::handle_input(session, {}, &c_pkt, sizeof(c_pkt));
+    }
+    control::release_unclaimed_joypads(session);
+    REQUIRE(unplugged.empty());
+    REQUIRE(session.joypads->load()->at(0) == kept[0]);
+    REQUIRE(session.joypads->load()->at(1) == kept[1]);
+  }
+
+  SECTION("A pad the stream created itself is never replaced") {
+    session.kept_joypads->unclaimed.clear();
+    arrival(0, pkts::NINTENDO);
+    REQUIRE(session.joypads->load()->at(0) == kept[0]);
+    REQUIRE(unplugged.empty());
+  }
+}
