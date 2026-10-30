@@ -1,0 +1,26 @@
+name: Instruction file size
+
+# Claude Code warns and follows instructions less closely past 40,000 characters per file.
+on:
+  pull_request:
+    paths:
+      - "**/CLAUDE.md"
+      - "**/CLAUDE.local.md"
+      - "**/AGENTS.md"
+      - ".claude/rules/**"
+      - ".github/workflows/instruction-size.yml"
+
+jobs:
+  size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every instruction file is under 40,000 characters
+        run: |
+          fail=0
+          while IFS= read -r -d '' f; do
+            n=$(wc -m < "$f")
+            echo "$n $f"
+            if [ "$n" -ge 40000 ]; then echo "::error file=$f::$n characters (limit 40000)"; fail=1; fi
+          done < <(find . -path ./.git -prune -o \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name AGENTS.md -o -path './.claude/rules/*.md' \) -type f -print0)
+          exit $fail
