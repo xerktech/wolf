@@ -458,6 +458,42 @@ TEST_CASE("uinput - joypad plug/unplug waits for a lobby join/leave in progress"
   }
 }
 
+TEST_CASE("uinput - a kept joypad's replace or release waits for a lobby join/leave in progress", "[UINPUT]") {
+  auto session = events::StreamSession{.event_bus = std::make_shared<events::EventBusType>(), .session_id = 1234};
+  // A pad the stream took over from a lobby's keep, not claimed by its client yet
+  auto created = inputtino::XboxOneJoypad::create();
+  REQUIRE(created);
+  session.joypads->store(
+      events::JoypadList{}.set(0, std::make_shared<events::JoypadTypes>(XboxOneJoypad(std::move(*created)))));
+  session.kept_joypads->unclaimed.insert(0);
+  std::atomic<int> unplugged = 0;
+  auto unplug_handler = session.event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
+      [&](const immer::box<events::UnplugDeviceEvent> &) { unplugged++; });
+
+  // A join/leave holds joypads_lobby_mutex across its joypads snapshot and lobby update: the pad must not be taken and
+  // its unplug announced in between. CHECK, not REQUIRE, while a thread is joinable.
+  std::unique_lock lobby_switch(*session.joypads_lobby_mutex);
+  std::thread removal;
+  SECTION("Another type of controller arrives in its place") {
+    removal = std::thread([&]() {
+      auto c_pkt = pkts::CONTROLLER_ARRIVAL_PACKET{.controller_number = 0,
+                                                   .controller_type = pkts::NINTENDO,
+                                                   .capabilities = pkts::ANALOG_TRIGGERS};
+      c_pkt.type = pkts::CONTROLLER_ARRIVAL;
+      control::handle_input(session, {}, &c_pkt, sizeof(c_pkt));
+    });
+  }
+  SECTION("The client never claims it") {
+    removal = std::thread([&]() { control::release_unclaimed_joypads(session); });
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  CHECK(unplugged == 0);
+  CHECK(std::holds_alternative<XboxOneJoypad>(*session.joypads->load()->at(0)));
+  lobby_switch.unlock();
+  removal.join();
+  REQUIRE(unplugged == 1);
+}
+
 TEST_CASE("uinput - paste UTF8", "[UINPUT]") {
 
   SECTION("UTF8 to HEX") {
