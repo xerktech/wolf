@@ -1,4 +1,5 @@
-ARG BASE_IMAGE=ghcr.io/games-on-whales/gpu-drivers:2025.05
+# Upstream retagged gpu-drivers:2025.05 to a Fedora image; this build uses apt, so pin the Ubuntu build.
+ARG BASE_IMAGE=ghcr.io/games-on-whales/gpu-drivers:2025.05-ubuntu@sha256:b0c21dabde6c5e92039c1993d69ecba9a22ed08e8904f76d1c6e705f5d1a6dac
 FROM $BASE_IMAGE AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 ENV BUILD_ARCHITECTURE=amd64

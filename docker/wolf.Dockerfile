@@ -1,4 +1,6 @@
-ARG BASE_IMAGE=ghcr.io/games-on-whales/gstreamer:1.26.7
+# Upstream retagged gstreamer:1.26.7 to a Fedora image; these stages use apt, so pin the Ubuntu build.
+# The devcontainer build uses this default; CI's image build passes its own (docker-build.yml).
+ARG BASE_IMAGE=ghcr.io/games-on-whales/gstreamer:1.26.7-ubuntu@sha256:10af2094164e4ea09099c333a61cfad689846bf882f2ffd90ed193275cdb449f
 ########################################################
 FROM $BASE_IMAGE AS wolf-builder
 
