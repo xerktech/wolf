@@ -21,10 +21,11 @@ pods run (`ghcr.io/xerktech/wolf`, XERK-1944).
   the run summary prints the digest.
   - Never trigger it from PR branches or pull_request: PR CI must not publish images.
   - fenrir pins the image by digest in `charts/direwolf-operator/values.yaml` (`WOLF_IMAGE`).
-- `docker/wolf.Dockerfile` builds gst-wayland-display from xerktech/gst-wayland-display, pinned
-  to a commit on a `xerk-*` tag (tags keep the commit fetchable whatever its branch does).
-  - That commit must sit on the upstream gst-wayland-display commit `stable` pinned; when a
-    rebase moves the upstream pin, rebase the gst-wayland-display fix onto it and cut a new tag.
+- `docker/wolf.Dockerfile` and the CI `build-gst-wayland` job build upstream gst-wayland-display
+  at the commit `stable` pins, plus `docker/patches/gst-wayland-display-cuda-context.patch` (the
+  XERK-1740 CUDA context fix; no gst-wayland-display fork is used).
+  - The patch must apply to that pin: when a rebase moves it, refresh the patch in the same
+    commit. Drop it once an upstream release our GStreamer can build carries the fix.
 - `docker/wolf.Dockerfile`'s default `BASE_IMAGE` is pinned by the same digest as docker-build.yml: upstream
   retagged `gstreamer:1.26.7` as a Fedora image (2026-10), which its apt-get steps can't build on.
 - `mirror-repo.yml` only runs in games-on-whales/wolf; it must never push from the fork.
@@ -36,7 +37,8 @@ pods run (`ghcr.io/xerktech/wolf`, XERK-1944).
 2. Branch from `origin/xerktech` and `git rebase upstream/stable`. Drop any patch upstream
    has since merged (the rebase usually empties it).
 3. If upstream moved `docker/wolf.Dockerfile`'s gst-wayland-display pin or its GStreamer
-   `BASE_IMAGE`, update the fork's equivalents (see Image) in the commits that own them.
+   `BASE_IMAGE`, update the fork's equivalents (see Image) in the commits that own them;
+   check the gst-wayland-display patch still applies to the new pin.
 4. Also refresh the `stable` branch on the fork: `git push origin upstream/stable:stable`.
 5. Push the branch, run Docker build on it by hand (`gh workflow run docker-build.yml --ref
    <branch>`), and test that image in fenrir (a talos04
