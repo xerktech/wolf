@@ -28,6 +28,10 @@ paths:
     each gap open).
 - The sink unregisters its node in dispose, before the parent releases its pads (teardown patch, fix 2).
   Tests: "An interpipe producer is unregistered before its pads go" (deterministic, unlike the teardown stress test).
+- A listener that switches listen-to takes the new node's current caps (renegotiate patch, XERK-2496). Stock
+  interpipe kept the old node's caps, so a zero-copy stream joining a lobby got system-memory frames under CUDAMemory
+  caps ("Input buffer is not CUDA", no video). Tests: "An interpipe consumer takes the caps of the producer it
+  switches to".
 - `block=true` consumers can hang a producer's `set_state(NULL)`: its streaming thread waits in the consumer's
   appsrc push for as long as that consumer doesn't drain (e.g. sits in PAUSED). Inherent to `block=true`;
   Wolf's default configs use `block=false`. Keep it that way.

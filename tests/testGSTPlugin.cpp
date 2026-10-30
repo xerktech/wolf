@@ -1034,3 +1034,66 @@ TEST_CASE_METHOD(GStreamerTestsFixture, "An interpipe producer is unregistered b
   gst_element_set_state(consumer, GST_STATE_NULL);
   gst_object_unref(consumer);
 }
+
+/**
+ * A consumer that switches listen-to to a producer with different caps must renegotiate to that producer's caps.
+ * Unpatched gst-interpipe kept the old producer's caps: with zero copy on NVIDIA a stream joining a lobby got the
+ * lobby's system-memory frames under its own producer's CUDAMemory caps and lost its video (XERK-2496, see
+ * docker/patches/gst-interpipe-renegotiate-on-switch.patch). Different sizes stand in for different memory types.
+ */
+TEST_CASE_METHOD(GStreamerTestsFixture,
+                 "An interpipe consumer takes the caps of the producer it switches to",
+                 "[GSTPlugin]") {
+  auto interpipe = gst_element_factory_find("interpipesrc");
+  REQUIRE(interpipe);
+  gst_object_unref(interpipe);
+
+  auto own = gst_parse_launch("videotestsrc is-live=true ! video/x-raw,format=BGRx,width=128,height=128 ! "
+                              "interpipesink name=caps_own sync=false async=false max-buffers=1",
+                              nullptr);
+  auto lobby = gst_parse_launch("videotestsrc is-live=true ! video/x-raw,format=NV12,width=64,height=64 ! "
+                                "interpipesink name=caps_lobby sync=false async=false max-buffers=1",
+                                nullptr);
+  auto consumer = gst_parse_launch("interpipesrc name=caps_c listen-to=caps_own is-live=true stream-sync=restart-ts "
+                                   "max-bytes=0 max-buffers=1 leaky-type=downstream ! fakesink sync=false",
+                                   nullptr);
+  gst_element_set_state(own, GST_STATE_PLAYING);
+  gst_element_set_state(lobby, GST_STATE_PLAYING);
+  gst_element_set_state(consumer, GST_STATE_PLAYING);
+  auto consumer_src = gst_bin_get_by_name(GST_BIN(consumer), "caps_c");
+  auto consumer_pad = gst_element_get_static_pad(consumer_src, "src");
+
+  // Polls until the consumer's negotiated caps carry `width`, or gives up after 5s
+  auto wait_for_width = [consumer_pad](int width) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (auto caps = gst_pad_get_current_caps(consumer_pad)) {
+        int w = 0;
+        gst_structure_get_int(gst_caps_get_structure(caps, 0), "width", &w);
+        gst_caps_unref(caps);
+        if (w == width) {
+          return true;
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+  };
+
+  REQUIRE(wait_for_width(128));
+  for (int i = 0; i < 3; i++) { // to the lobby and back, like repeated resumes
+    g_object_set(consumer_src, "listen-to", "caps_lobby", nullptr);
+    CHECK(wait_for_width(64));
+    g_object_set(consumer_src, "listen-to", "caps_own", nullptr);
+    CHECK(wait_for_width(128));
+  }
+
+  gst_element_set_state(consumer, GST_STATE_NULL);
+  gst_element_set_state(own, GST_STATE_NULL);
+  gst_element_set_state(lobby, GST_STATE_NULL);
+  gst_object_unref(consumer_pad);
+  gst_object_unref(consumer_src);
+  gst_object_unref(consumer);
+  gst_object_unref(own);
+  gst_object_unref(lobby);
+}
