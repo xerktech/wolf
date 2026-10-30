@@ -1,8 +1,8 @@
 diff --git a/gst/interpipe/gstinterpipesink.c b/gst/interpipe/gstinterpipesink.c
-index 4e0acfc..be936a3 100644
+index 4e0acfc..e2b25b6 100644
 --- a/gst/interpipe/gstinterpipesink.c
 +++ b/gst/interpipe/gstinterpipesink.c
-@@ -979,9 +979,31 @@ gst_inter_pipe_sink_add_listener (GstInterPipeINode * iface,
+@@ -979,9 +979,33 @@ gst_inter_pipe_sink_add_listener (GstInterPipeINode * iface,
  
    if (src_negotiated) {
      gboolean has_listeners;
@@ -17,12 +17,14 @@ index 4e0acfc..be936a3 100644
 +    padcaps = gst_pad_get_current_caps (GST_INTER_PIPE_SINK_PAD (sink));
 +    /* With allow-renegotiation=false srccaps are the listener's current caps:
 +     * skip the no-op instead of logging a refused renegotiation. */
-+    if (padcaps && !(srccaps && gst_caps_is_equal (srccaps, padcaps))) {
-+      GST_INFO_OBJECT (sink, "Setting listener caps to %" GST_PTR_FORMAT,
-+          padcaps);
-+      if (!gst_inter_pipe_ilistener_set_caps (listener, padcaps))
-+        GST_WARNING_OBJECT (sink, "Failed to set caps to listener %s",
-+            listener_name);
++    if (padcaps) {
++      if (!(srccaps && gst_caps_is_equal (srccaps, padcaps))) {
++        GST_INFO_OBJECT (sink, "Setting listener caps to %" GST_PTR_FORMAT,
++            padcaps);
++        if (!gst_inter_pipe_ilistener_set_caps (listener, padcaps))
++          GST_WARNING_OBJECT (sink, "Failed to set caps to listener %s",
++              listener_name);
++      }
 +      gst_caps_unref (padcaps);
 +    }
  
