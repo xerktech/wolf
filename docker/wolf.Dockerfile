@@ -57,7 +57,8 @@ RUN <<_GST_WAYLAND_DISPLAY
     cargo cinstall --features="cuda" --prefix=/usr/local/lib/x86_64-linux-gnu/ --libdir=/usr/local/lib/x86_64-linux-gnu
 _GST_WAYLAND_DISPLAY
 
-# gst-interpipe with our teardown-race (XERK-2114) and stop-hang (XERK-2130) fixes, replacing the base image's copy:
+# gst-interpipe with our teardown-race (XERK-2114), stop-hang (XERK-2130) and switch-renegotiation (XERK-2496)
+# fixes, replacing the base image's copy:
 # installs into the same /usr/local/lib/x86_64-linux-gnu/gstreamer-1.0 the runner copies from. The glob applies the
 # patches in name order. Pinned so they keep applying; bump the ref and patches together.
 ARG GST_INTERPIPE_REF=0c454917cb3cf4f2b2f2729f5f72a4dee072c7c9
