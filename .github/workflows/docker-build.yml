@@ -186,3 +186,6 @@ jobs:
           #   ninja -j $(nproc) wolftests
           #
           #   ./wolftests --reporter JUnit::out=${{runner.workspace}}/report.xml --reporter console::out=-::colour-mode=ansi
+          #
+          # When re-enabling, add the "Sanitize test report" step from linux-build-test.yml after this one:
+          # Catch2 writes XML-forbidden bytes (e.g. \v, \f from logged RTSP ciphertext) into report.xml.
