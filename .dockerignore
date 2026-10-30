@@ -10,3 +10,4 @@
 !docker/startup.sh
 !docker/supervisord.conf
 !docker/patches
+!docker/apt-update.sh

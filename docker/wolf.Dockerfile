@@ -6,7 +6,9 @@ FROM $BASE_IMAGE AS wolf-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update -y && \
+COPY --chmod=755 docker/apt-update.sh /usr/local/bin/apt-update
+
+RUN apt-update && \
     apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
@@ -81,8 +83,10 @@ RUN --mount=type=cache,target=/cache/ccache \
 FROM $BASE_IMAGE AS runner
 ENV DEBIAN_FRONTEND=noninteractive
 
+COPY --chmod=755 docker/apt-update.sh /usr/local/bin/apt-update
+
 # Wolf runtime dependencies
-RUN apt-get update -y && \
+RUN apt-update && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
@@ -96,7 +100,7 @@ RUN apt-get update -y && \
     && rm -rf /var/lib/apt/lists/*
 
 # gst-plugin-wayland runtime dependencies
-RUN apt-get update -y && \
+RUN apt-update && \
     apt-get install -y --no-install-recommends \
     libwayland-server0 libinput10 libxkbcommon0 libgbm1 \
     libglvnd0 libgl1 libglx0 libegl1 libgles2 xwayland hwdata \
@@ -108,7 +112,7 @@ RUN apt-get update -y && \
 # sidecar container and its startup race. supervisord starts PA before Wolf,
 # restarts it if it dies, and stops both cleanly on container shutdown.
 # pulseaudio-utils ships pactl, handy for debugging audio from inside the container.
-RUN apt-get update -y && \
+RUN apt-update && \
     apt-get install -y --no-install-recommends \
     pulseaudio pulseaudio-utils supervisor \
     && rm -rf /var/lib/apt/lists/*

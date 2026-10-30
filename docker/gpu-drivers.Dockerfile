@@ -1,6 +1,9 @@
 ARG BASE_IMAGE=ghcr.io/games-on-whales/base-app:edge
 FROM $BASE_IMAGE
 ENV DEBIAN_FRONTEND=noninteractive
+
+COPY --chmod=755 apt-update.sh /usr/local/bin/apt-update
+
 ENV BUILD_ARCHITECTURE=amd64
 ENV DEB_BUILD_OPTIONS=noddebs
 
@@ -11,7 +14,7 @@ ARG REQUIRED_PACKAGES="va-driver-all intel-media-va-driver-non-free \
                        libmfx-gen1.2 libigfxcmrt7 \
                        libva-drm2 libva-x11-2 libvpl2"
 
-RUN apt-get update -y && \
+RUN apt-update && \
     apt-get install -y --no-install-recommends \
     $REQUIRED_PACKAGES && \
     rm -rf /var/lib/apt/lists/*
@@ -21,7 +24,7 @@ RUN <<_BUILD_LIBMFX
     #!/bin/bash
     set -e
 
-    apt-get update -y
+    apt-update
     apt-get install -y curl git build-essential cmake pkg-config \
                        libdrm-dev libva-dev libx11-dev libx11-xcb-dev libxcb-present-dev libxcb-dri3-dev
 
@@ -57,7 +60,7 @@ RUN <<_ADD_NVRTC
     set -e
 
     #Extra deps
-    apt-get update -y
+    apt-update
     apt-get install -y unzip curl
 
     cd /tmp

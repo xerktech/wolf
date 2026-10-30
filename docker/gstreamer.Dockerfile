@@ -2,6 +2,9 @@
 ARG BASE_IMAGE=ghcr.io/games-on-whales/gpu-drivers:2025.05-ubuntu@sha256:b0c21dabde6c5e92039c1993d69ecba9a22ed08e8904f76d1c6e705f5d1a6dac
 FROM $BASE_IMAGE AS builder
 ENV DEBIAN_FRONTEND=noninteractive
+
+COPY --chmod=755 apt-update.sh /usr/local/bin/apt-update
+
 ENV BUILD_ARCHITECTURE=amd64
 ENV DEB_BUILD_OPTIONS=noddebs
 
@@ -41,7 +44,7 @@ RUN <<_GSTREAMER_INSTALL
         libharfbuzz-dev libpango1.0-dev libsoup-2.4-1 libopengl-dev libgbm-dev libegl-dev \
         libglu1-mesa-dev freeglut3-dev mesa-common-dev libgl1-mesa-dev libgles-dev libgl-dev libglx-dev libgudev-1.0-dev
         "
-    apt-get update -y
+    apt-update
     apt-get install -y --no-install-recommends $DEV_PACKAGES
 
     # Build gstreamer
