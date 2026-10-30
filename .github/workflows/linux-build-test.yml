@@ -29,12 +29,15 @@ jobs:
             arch: aarch64
             lib_path: aarch64-linux-gnu
     steps:
+      # For the vendored gst-wayland-display patch (applied below, hashed into the cache key)
+      - uses: actions/checkout@v6
+
       - name: Restore cached libgstwaylanddisplay-${{ matrix.arch }}
         id: cache-gst-wayland
         uses: actions/cache@v5
         with:
           path: ${{runner.workspace}}/usr
-          key: libgstwaylanddisplay-${{ matrix.arch }}-${{ env.GST_WAYLAND_COMMIT }}
+          key: libgstwaylanddisplay-${{ matrix.arch }}-${{ env.GST_WAYLAND_COMMIT }}-${{ hashFiles('docker/patches/gst-wayland-display-*.patch') }}
 
       - name: Prepare environment
         if: steps.cache-gst-wayland.outputs.cache-hit != 'true'
@@ -56,6 +59,7 @@ jobs:
           git clone https://github.com/games-on-whales/gst-wayland-display
           cd gst-wayland-display
           git checkout ${{ env.GST_WAYLAND_COMMIT }}
+          git apply ${{ github.workspace }}/docker/patches/gst-wayland-display-cuda-context.patch
           cargo install --locked cargo-c
           cargo cinstall -p gst-plugin-wayland-display --prefix=/usr/local --destdir=${{runner.workspace}}
 
