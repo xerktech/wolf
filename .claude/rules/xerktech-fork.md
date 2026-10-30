@@ -26,8 +26,11 @@ pods run (`ghcr.io/xerktech/wolf`, XERK-1944).
   XERK-1740 CUDA context fix; no gst-wayland-display fork is used).
   - The patch must apply to that pin: when a rebase moves it, refresh the patch in the same
     commit. Drop it once an upstream release our GStreamer can build carries the fix.
-- `docker/wolf.Dockerfile`'s default `BASE_IMAGE` is pinned by the same digest as docker-build.yml: upstream
-  retagged `gstreamer:1.26.7` as a Fedora image (2026-10), which its apt-get steps can't build on.
+- The image chain is Fedora 44 (dnf), following upstream; Ubuntu 25.04 is EOL (XERK-2494).
+  - `docker/wolf.Dockerfile`'s default `BASE_IMAGE` is pinned by the same digest as docker-build.yml:
+    upstream tags are mutable (`gstreamer:1.26.7` was retagged from Ubuntu to Fedora in 2026-10).
+  - The base image ships an unpatched gst-interpipe in `/usr/local/lib64/gstreamer-1.0`, GStreamer's
+    system plugin dir; the runner deletes it so our patched copy is the only one (XERK-2114).
 - `mirror-repo.yml` only runs in games-on-whales/wolf; it must never push from the fork.
 
 ## Rebasing onto a newer upstream stable
