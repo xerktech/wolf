@@ -4,15 +4,9 @@ FROM $BASE_IMAGE AS wolf-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Ubuntu moves an end-of-life release (25.04 plucky included) to old-releases.ubuntu.com, after which the
-# stock archive URLs 404. Repoint apt there only once the stock archive stops serving this release.
-RUN if ! apt-get update -y >/tmp/apt-update.log 2>&1 && grep -qE 'ha(s|ve) a Release file' /tmp/apt-update.log; then \
-      sed -i -E 's#https?://(archive|security)\.ubuntu\.com/ubuntu#http://old-releases.ubuntu.com/ubuntu#' \
-        /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true; \
-    fi; \
-    rm -rf /tmp/apt-update.log /var/lib/apt/lists/*
+COPY --chmod=755 docker/apt-update.sh /usr/local/bin/apt-update
 
-RUN apt-get update -y && \
+RUN apt-update && \
     apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
@@ -87,16 +81,10 @@ RUN --mount=type=cache,target=/cache/ccache \
 FROM $BASE_IMAGE AS runner
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Ubuntu moves an end-of-life release (25.04 plucky included) to old-releases.ubuntu.com, after which the
-# stock archive URLs 404. Repoint apt there only once the stock archive stops serving this release.
-RUN if ! apt-get update -y >/tmp/apt-update.log 2>&1 && grep -qE 'ha(s|ve) a Release file' /tmp/apt-update.log; then \
-      sed -i -E 's#https?://(archive|security)\.ubuntu\.com/ubuntu#http://old-releases.ubuntu.com/ubuntu#' \
-        /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true; \
-    fi; \
-    rm -rf /tmp/apt-update.log /var/lib/apt/lists/*
+COPY --chmod=755 docker/apt-update.sh /usr/local/bin/apt-update
 
 # Wolf runtime dependencies
-RUN apt-get update -y && \
+RUN apt-update && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
@@ -110,7 +98,7 @@ RUN apt-get update -y && \
     && rm -rf /var/lib/apt/lists/*
 
 # gst-plugin-wayland runtime dependencies
-RUN apt-get update -y && \
+RUN apt-update && \
     apt-get install -y --no-install-recommends \
     libwayland-server0 libinput10 libxkbcommon0 libgbm1 \
     libglvnd0 libgl1 libglx0 libegl1 libgles2 xwayland hwdata \
@@ -122,7 +110,7 @@ RUN apt-get update -y && \
 # sidecar container and its startup race. supervisord starts PA before Wolf,
 # restarts it if it dies, and stops both cleanly on container shutdown.
 # pulseaudio-utils ships pactl, handy for debugging audio from inside the container.
-RUN apt-get update -y && \
+RUN apt-update && \
     apt-get install -y --no-install-recommends \
     pulseaudio pulseaudio-utils supervisor \
     && rm -rf /var/lib/apt/lists/*

@@ -2,13 +2,8 @@ ARG BASE_IMAGE=ghcr.io/games-on-whales/base-app:edge
 FROM $BASE_IMAGE
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Ubuntu moves an end-of-life release (25.04 plucky included) to old-releases.ubuntu.com, after which the
-# stock archive URLs 404. Repoint apt there only once the stock archive stops serving this release.
-RUN if ! apt-get update -y >/tmp/apt-update.log 2>&1 && grep -qE 'ha(s|ve) a Release file' /tmp/apt-update.log; then \
-      sed -i -E 's#https?://(archive|security)\.ubuntu\.com/ubuntu#http://old-releases.ubuntu.com/ubuntu#' \
-        /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true; \
-    fi; \
-    rm -rf /tmp/apt-update.log /var/lib/apt/lists/*
+COPY --chmod=755 apt-update.sh /usr/local/bin/apt-update
+
 ENV BUILD_ARCHITECTURE=amd64
 ENV DEB_BUILD_OPTIONS=noddebs
 
@@ -19,7 +14,7 @@ ARG REQUIRED_PACKAGES="va-driver-all intel-media-va-driver-non-free \
                        libmfx-gen1.2 libigfxcmrt7 \
                        libva-drm2 libva-x11-2 libvpl2"
 
-RUN apt-get update -y && \
+RUN apt-update && \
     apt-get install -y --no-install-recommends \
     $REQUIRED_PACKAGES && \
     rm -rf /var/lib/apt/lists/*
@@ -29,7 +24,7 @@ RUN <<_BUILD_LIBMFX
     #!/bin/bash
     set -e
 
-    apt-get update -y
+    apt-update
     apt-get install -y curl git build-essential cmake pkg-config \
                        libdrm-dev libva-dev libx11-dev libx11-xcb-dev libxcb-present-dev libxcb-dri3-dev
 
@@ -65,7 +60,7 @@ RUN <<_ADD_NVRTC
     set -e
 
     #Extra deps
-    apt-get update -y
+    apt-update
     apt-get install -y unzip curl
 
     cd /tmp
