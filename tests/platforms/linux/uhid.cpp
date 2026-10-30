@@ -1,4 +1,5 @@
 #include "libinput.h"
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <control/input_handler.hpp>
@@ -35,7 +36,6 @@ TEST_CASE("Create PS5 pad with CONTROLLER_ARRIVAL", "[UHID]") {
   REQUIRE(dev_nodes.size() >= 4);
 
   // Search dev_nodes /dev/input/eventXX device and turn them into libevdev devices
-  std::sort(dev_nodes.begin(), dev_nodes.end()); // ranges::actions::sort doesn't work for some reason
   auto devices =
       dev_nodes |                                                                                              //
       ranges::views::filter([](const std::string &node) { return node.find("event") != std::string::npos; }) | //
@@ -46,8 +46,17 @@ TEST_CASE("Create PS5 pad with CONTROLLER_ARRIVAL", "[UHID]") {
       }) |
       ranges::to_vector;
 
-  // We know the 3rd device is the touchpad
-  auto touch_rel_dev = devices[2];
+  // Pick a device by the name hid-playstation gives it, never by position: sorted as strings the nodes reorder once
+  // their numbers cross a digit (event10 < event9), and the test then read the motion sensor as the touchpad.
+  auto device_named = [&devices](const std::string &suffix) {
+    auto found = std::find_if(devices.begin(), devices.end(), [&suffix](const auto &dev) {
+      return std::string(libevdev_get_name(dev.get())).ends_with(suffix);
+    });
+    REQUIRE(found != devices.end());
+    return *found;
+  };
+
+  auto touch_rel_dev = device_named("Touchpad");
   {   // "Joypad touchpad"
     { // Touch finger one
       auto touch_packet = pkts::CONTROLLER_TOUCH_PACKET{.controller_number = controller_number,
@@ -162,8 +171,7 @@ TEST_CASE("Create PS5 pad with CONTROLLER_ARRIVAL", "[UHID]") {
     }
   }
 
-  // We know the 2nd device is the motion sensor
-  auto motion_dev = devices[1];
+  auto motion_dev = device_named("Motion Sensors");
   { // Motion sensor
     auto motion_pkt = pkts::CONTROLLER_MOTION_PACKET{.controller_number = controller_number,
                                                      .motion_type = pkts::ACCELERATION,
