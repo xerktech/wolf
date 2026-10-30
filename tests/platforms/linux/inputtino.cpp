@@ -9,6 +9,7 @@
 #include <chrono>
 #include <control/input_handler.hpp>
 #include <cstring>
+#include <mutex>
 #include <platforms/input.hpp>
 #include <platforms/linux/uinput/uinput.hpp>
 #include <thread>
@@ -522,10 +523,22 @@ TEST_CASE("uinput - joypads kept from a lobby are replaced or released unless th
       events::TakenOverJoypads{.lobby_id = lobby_id, .joypads = session.joypads->load()}));
 
   std::vector<std::string> plugged, unplugged; // session ids the events are addressed to
+  // The timed release fires from its own thread: read `unplugged` through unplugged_now() while it may run
+  std::mutex observed_mutex;
   auto plug_observer = event_bus->register_handler<immer::box<events::PlugDeviceEvent>>(
-      [&](const immer::box<events::PlugDeviceEvent> &ev) { plugged.push_back(ev->session_id); });
+      [&](const immer::box<events::PlugDeviceEvent> &ev) {
+        std::lock_guard lock(observed_mutex);
+        plugged.push_back(ev->session_id);
+      });
   auto unplug_observer = event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
-      [&](const immer::box<events::UnplugDeviceEvent> &ev) { unplugged.push_back(ev->session_id); });
+      [&](const immer::box<events::UnplugDeviceEvent> &ev) {
+        std::lock_guard lock(observed_mutex);
+        unplugged.push_back(ev->session_id);
+      });
+  auto unplugged_now = [&]() {
+    std::lock_guard lock(observed_mutex);
+    return unplugged;
+  };
   auto arrival = [&](uint8_t controller_number, pkts::CONTROLLER_TYPE type) {
     auto c_pkt = pkts::CONTROLLER_ARRIVAL_PACKET{.controller_number = controller_number,
                                                  .controller_type = type,
@@ -569,9 +582,9 @@ TEST_CASE("uinput - joypads kept from a lobby are replaced or released unless th
         immer::vector<events::StreamSession>{session});
     control::release_unclaimed_joypads_after(running_sessions, session, std::chrono::milliseconds(200));
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    REQUIRE(unplugged.empty());
+    REQUIRE(unplugged_now().empty());
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    REQUIRE(unplugged == std::vector<std::string>{lobby_id, lobby_id});
+    REQUIRE(unplugged_now() == std::vector<std::string>{lobby_id, lobby_id});
     REQUIRE(session.joypads->load()->empty());
   }
 
@@ -579,7 +592,7 @@ TEST_CASE("uinput - joypads kept from a lobby are replaced or released unless th
     auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
     control::release_unclaimed_joypads_after(running_sessions, session, std::chrono::milliseconds(50));
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    REQUIRE(unplugged.empty());
+    REQUIRE(unplugged_now().empty());
     REQUIRE(session.joypads->load()->size() == 2);
   }
 
