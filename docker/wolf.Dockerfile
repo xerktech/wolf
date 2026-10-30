@@ -4,6 +4,14 @@ FROM $BASE_IMAGE AS wolf-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Ubuntu moves an end-of-life release (25.04 plucky included) to old-releases.ubuntu.com, after which the
+# stock archive URLs 404. Repoint apt there only once the stock archive stops serving this release.
+RUN if ! apt-get update -y >/tmp/apt-update.log 2>&1 && grep -qE 'ha(s|ve) a Release file' /tmp/apt-update.log; then \
+      sed -i -E 's#https?://(archive|security)\.ubuntu\.com/ubuntu#http://old-releases.ubuntu.com/ubuntu#' \
+        /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true; \
+    fi; \
+    rm -rf /tmp/apt-update.log /var/lib/apt/lists/*
+
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
     curl \
@@ -78,6 +86,14 @@ RUN --mount=type=cache,target=/cache/ccache \
 ########################################################
 FROM $BASE_IMAGE AS runner
 ENV DEBIAN_FRONTEND=noninteractive
+
+# Ubuntu moves an end-of-life release (25.04 plucky included) to old-releases.ubuntu.com, after which the
+# stock archive URLs 404. Repoint apt there only once the stock archive stops serving this release.
+RUN if ! apt-get update -y >/tmp/apt-update.log 2>&1 && grep -qE 'ha(s|ve) a Release file' /tmp/apt-update.log; then \
+      sed -i -E 's#https?://(archive|security)\.ubuntu\.com/ubuntu#http://old-releases.ubuntu.com/ubuntu#' \
+        /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true; \
+    fi; \
+    rm -rf /tmp/apt-update.log /var/lib/apt/lists/*
 
 # Wolf runtime dependencies
 RUN apt-get update -y && \
