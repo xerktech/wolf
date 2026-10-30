@@ -1,4 +1,5 @@
-ARG BASE_IMAGE=ghcr.io/games-on-whales/base-app:fedora
+# Pinned by digest: the tag is mutable upstream.
+ARG BASE_IMAGE=ghcr.io/games-on-whales/base-app:fedora@sha256:56e5dcaab59ec827d411e18c577be23044eebfcd62d1b20bdfaa1c6507663792
 FROM $BASE_IMAGE
 
 # Intel VA-API / QSV drivers and VPL runtime
