@@ -2344,7 +2344,11 @@ TEST_CASE("SSE APIs idle subscriber gets keepalives", "[API]") {
     }
   }
   REQUIRE(!ec);
-  REQUIRE_THAT(received, Equals(":keepalive\n\n:keepalive\n\n"));
+  // A stalled reader may get more than two at once: check that it got at least two and nothing else
+  REQUIRE(received.size() >= 2 * 12);
+  for (std::size_t pos = 0; pos < received.size(); pos += 12) {
+    REQUIRE_THAT(received.substr(pos, 12), Equals(":keepalive\n\n"));
+  }
 }
 
 TEST_CASE("API refuses requests it can't read with a JSON error", "[API]") {

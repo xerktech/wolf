@@ -5,7 +5,6 @@ namespace wolf::api {
 
 using namespace wolf::core;
 
-constexpr auto SSE_KEEPALIVE_INTERVAL = std::chrono::seconds(15);
 constexpr std::size_t MAX_WRITE_QUEUE_BYTES = 64 * 1024 * 1024;
 // Headers + body of one request: the buffer used to be unbounded, so a huge Content-Length was read (or waited for)
 // in full instead of being refused
