@@ -427,11 +427,15 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         // Before the leave, which then leaves them plugged into the lobby (leave_lobby)
         auto sessions = app_state->running_sessions->load();
         if (auto session = state::get_session_by_id(sessions.get(), moonlight_session_id)) {
+          // Under the lock, so that the pads kept are the ones control hasn't just unplugged
+          std::lock_guard kept_lock(session->kept_joypads->mutex);
           if (events::JoypadList joypads = session->joypads->load(); !joypads.empty()) {
             auto parked = std::make_shared<const events::ParkedJoypads>(
                 events::ParkedJoypads{.joypads = joypads, .control_feedback = session->control_feedback});
             lobby->parked_joypads->update(
                 [&](const auto &all) { return all.set(moonlight_session_id, std::move(parked)); });
+            // All of them kept again, claimed or not: this stream's wait for its client to claim them is over
+            session->kept_joypads->unclaimed.clear();
             logs::log(logs::info,
                       "[LOBBY] Keeping {} joypad(s) of session {} plugged into lobby {} for its next stream",
                       joypads.size(),

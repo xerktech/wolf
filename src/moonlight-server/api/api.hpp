@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <deque>
 
 #include <api/http_server.hpp>
@@ -12,7 +13,11 @@ namespace wolf::api {
 
 using namespace wolf::core;
 
-void start_server(std::string_view runtime_dir, immer::box<state::AppState> app_state);
+constexpr std::chrono::milliseconds SSE_KEEPALIVE_INTERVAL = std::chrono::seconds(15);
+
+void start_server(std::string_view runtime_dir,
+                  immer::box<state::AppState> app_state,
+                  std::chrono::milliseconds sse_keepalive_interval = SSE_KEEPALIVE_INTERVAL);
 
 struct PendingPairClient {
   std::string pair_secret;
@@ -212,7 +217,8 @@ class UnixSocketServer {
 public:
   UnixSocketServer(boost::asio::io_context &io_context,
                    const std::string &socket_path,
-                   immer::box<state::AppState> app_state);
+                   immer::box<state::AppState> app_state,
+                   std::chrono::milliseconds sse_keepalive_interval);
 
   UnixSocketServer(const UnixSocketServer &) = default;
 
@@ -285,6 +291,7 @@ private:
     std::vector<std::shared_ptr<UnixSocket>> sockets;
     HTTPServer<std::shared_ptr<UnixSocket>> http;
     boost::asio::steady_timer sse_keepalive_timer;
+    std::chrono::milliseconds sse_keepalive_interval = SSE_KEEPALIVE_INTERVAL;
     // Bytes of request bodies still being read, over every connection (io_context thread only)
     std::size_t pending_body_bytes = 0;
   };

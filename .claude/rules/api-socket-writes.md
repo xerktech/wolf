@@ -16,6 +16,9 @@ paths:
     (~64 KiB); small replies hide it.
   - Two `async_write`s in flight on one socket interleave their bytes. The per-socket
     `write_queue` keeps exactly one in flight.
+- The keepalive interval is a `start_server` parameter (default `SSE_KEEPALIVE_INTERVAL`, 15 s) so
+  tests can shorten it; a test waiting on 15 s would slow the suite. Tests: "SSE APIs idle subscriber
+  gets keepalives" (the only test that fails if keepalives stop being sent).
 - `state_->sockets` and every `write_queue` belong to the io_context thread. Endpoints, event-bus
   publishers and the docker-pull thread run elsewhere, so they `dispatch` onto it first.
 - `queue_write` posts itself onto the io_context thread when called from another one: a direct call

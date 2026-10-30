@@ -1,9 +1,12 @@
 #include "storm.hpp"
+#include <algorithm>
 #include <api/api.hpp>
 #include <array>
+#include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
+#include <control/input_handler.hpp>
 #include <core/docker.hpp>
 #include <cstdlib>
 #include <curl/curl.h>
@@ -56,11 +59,12 @@ std::string api_socket_path() {
  * Servers started by earlier tests keep running: their socket file is removed first, so that we can't reach one of
  * them instead of the new server.
  */
-void start_api_server(const immer::box<state::AppState> &app_state) {
+void start_api_server(const immer::box<state::AppState> &app_state,
+                      std::chrono::milliseconds sse_keepalive_interval = wolf::api::SSE_KEEPALIVE_INTERVAL) {
   auto socket_path = api_socket_path();
   std::filesystem::remove(socket_path);
-  std::thread([app_state, runtime_dir = api_runtime_dir()]() {
-    wolf::api::start_server(runtime_dir, app_state);
+  std::thread([app_state, runtime_dir = api_runtime_dir(), sse_keepalive_interval]() {
+    wolf::api::start_server(runtime_dir, app_state, sse_keepalive_interval);
   }).detach();
   for (int attempt = 0; attempt < 500; attempt++) {
     boost::asio::io_context ctx;
@@ -2181,9 +2185,25 @@ struct SSEEvent {
   std::string data;
 };
 
-void listen_sse(CURL *handle, std::shared_ptr<TSQueue<SSEEvent>> queue, std::string_view api_endpoint) {
+/**
+ * Blocks until `stop` is set: curl checks it at least once a second, even while no data arrives.
+ * The caller must join the thread running this: a detached one would log keepalives after main returned, while exit
+ * destroys the logger (ThreadSanitizer reports that and fails the run).
+ */
+void listen_sse(CURL *handle,
+                std::shared_ptr<TSQueue<SSEEvent>> queue,
+                std::string_view api_endpoint,
+                std::atomic_bool &stop) {
   curl_easy_setopt(handle, CURLOPT_URL, api_endpoint.data());
   curl_easy_setopt(handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
+  curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(handle,
+                   CURLOPT_XFERINFOFUNCTION,
+                   static_cast<int (*)(void *, curl_off_t, curl_off_t, curl_off_t, curl_off_t)>(
+                       [](void *stop, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+                         return static_cast<std::atomic_bool *>(stop)->load() ? 1 : 0; // non-zero aborts
+                       }));
+  curl_easy_setopt(handle, CURLOPT_XFERINFODATA, &stop);
 
   curl_easy_setopt(
       handle,
@@ -2229,10 +2249,15 @@ TEST_CASE("SSE APIs", "[API]") {
 
   auto queue = std::make_shared<TSQueue<SSEEvent>>();
 
-  // The thread owns the handle: it never returns from curl_easy_perform, so the test must not free it
-  std::thread sse_thread(
-      [curl = std::move(curl), queue]() { listen_sse(curl.get(), queue, "http://localhost/api/v1/events"); });
-  sse_thread.detach();
+  std::atomic_bool stop = false;
+  std::thread sse_thread([curl = std::move(curl), queue, &stop]() {
+    listen_sse(curl.get(), queue, "http://localhost/api/v1/events", stop);
+  });
+  // Also on a failed REQUIRE
+  auto stop_on_exit = std::shared_ptr<void>(nullptr, [&stop, &sse_thread](void *) {
+    stop = true;
+    sse_thread.join();
+  });
   std::this_thread::sleep_for(std::chrono::milliseconds(42)); // Wait for the SSE client to start
 
   // Test out one of the events
@@ -2342,6 +2367,49 @@ TEST_CASE("SSE APIs large events", "[API]") {
   }
   REQUIRE(ec == boost::asio::error::eof);
   REQUIRE(drained < 80 * big_event.container_id.size());
+}
+
+TEST_CASE("SSE APIs idle subscriber gets keepalives", "[API]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .running_sessions = running_sessions});
+
+  // A short interval, so that the test doesn't have to wait for the production one
+  start_api_server(app_state, std::chrono::milliseconds(100));
+
+  boost::asio::io_context client_ctx;
+  boost::asio::local::stream_protocol::socket client(client_ctx);
+  client.connect(boost::asio::local::stream_protocol::endpoint(api_socket_path()));
+  boost::asio::write(client, boost::asio::buffer(std::string_view("GET /api/v1/events HTTP/1.0\r\n\r\n")));
+  boost::asio::streambuf headers;
+  boost::asio::read_until(client, headers, "\r\n\r\n");
+  std::string received(boost::asio::buffers_begin(headers.data()), boost::asio::buffers_end(headers.data()));
+  received = received.substr(received.find("\r\n\r\n") + 4);
+
+  // Send nothing and fire no event: only the keepalive timer writes to us. Two of them show it keeps re-arming.
+  // Fail instead of hanging if they never come
+  client.non_blocking(true);
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  std::array<char, 1024> chunk{};
+  boost::system::error_code ec;
+  while (received.size() < 2 * 12 && !ec && std::chrono::steady_clock::now() < deadline) {
+    pollfd fd = {.fd = client.native_handle(), .events = POLLIN, .revents = 0};
+    if (poll(&fd, 1, 100) > 0) {
+      received.append(chunk.data(), client.read_some(boost::asio::buffer(chunk), ec));
+    }
+  }
+  REQUIRE(!ec);
+  // A stalled reader may get more than two at once: check that it got at least two and nothing else
+  REQUIRE(received.size() >= 2 * 12);
+  for (std::size_t pos = 0; pos < received.size(); pos += 12) {
+    REQUIRE_THAT(received.substr(pos, 12), Equals(":keepalive\n\n"));
+  }
 }
 
 TEST_CASE("API refuses requests it can't read with a JSON error", "[API]") {
@@ -2729,6 +2797,8 @@ TEST_CASE("Lobbies: a stream that ends in a lobby leaves its joypads plugged in 
     REQUIRE(taken_over);
     REQUIRE(*taken_over == pad.lock());
     REQUIRE(stream->control_feedback == feedback); // its rumble reaches the new stream's client
+    // Until the client claims it: then it's control's to unplug from the lobby's app (release_unclaimed_joypads)
+    REQUIRE(stream->kept_joypads->unclaimed == std::set<int>{0});
   }
   REQUIRE(parked() == 0);
 
@@ -2740,9 +2810,12 @@ TEST_CASE("Lobbies: a stream that ends in a lobby leaves its joypads plugged in 
   REQUIRE(plugged.empty());
   REQUIRE(unplugged.empty());
   REQUIRE(!lobby.plugged_devices_queue->pop(std::chrono::milliseconds(0)));
+  auto kept = state::get_session_by_id(running_sessions->load(), session_id)->kept_joypads;
+  REQUIRE(kept->unclaimed == std::set<int>{0});
 
   // Ended again, then the lobby stops: its app hears the joypad unplugged
   event_bus->fire_event(immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = session_id}));
+  REQUIRE(kept->unclaimed.empty()); // kept again: the ended stream's control releases nothing
   running_sessions->store(immer::vector<events::StreamSession>{});
   REQUIRE(parked() == 1);
   unplugged.clear();
@@ -2803,6 +2876,99 @@ TEST_CASE("Lobbies: a stream that doesn't take over the kept joypads unplugs the
   REQUIRE(!lobby.plugged_devices_queue->pop(std::chrono::milliseconds(0)));
   REQUIRE(lobby.parked_joypads->load()->empty());
   REQUIRE(!stream.taken_over_joypads->load().get());
+}
+
+TEST_CASE("Lobbies: a kept joypad never claimed is unplugged from the lobby its stream joined", "[API]") {
+  auto created = inputtino::XboxOneJoypad::create();
+  if (!created) {
+    SKIP("Creating a joypad needs /dev/uinput: " << created.getErrorMessage());
+  }
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .host = immer::box<state::Host>(state::Host{.lobby_keeps_joypads = true}),
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
+      .running_sessions = running_sessions});
+  constexpr std::size_t session_id = 4322;
+  for (auto id : {"kept-in", "joined"}) {
+    events::Lobby lobby{.id = id, .name = id, .multi_user = false, .stop_when_everyone_leaves = false};
+    app_state->lobbies->update([&](const immer::vector<events::Lobby> &lobbies) { return lobbies.push_back(lobby); });
+  }
+  // The stream took over a joypad that lobby "kept-in" kept for it (sessions/add), still plugged into its app
+  auto stream = events::StreamSession{.event_bus = event_bus, .session_id = session_id};
+  auto pads =
+      events::JoypadList{}.set(0, std::make_shared<events::JoypadTypes>(input::XboxOneJoypad(std::move(*created))));
+  stream.joypads->store(pads);
+  stream.taken_over_joypads->store(
+      std::make_shared<const events::TakenOverJoypads>(events::TakenOverJoypads{.lobby_id = "kept-in", .joypads = pads}));
+  stream.kept_joypads->unclaimed.insert(0);
+  running_sessions->update([&](const auto &sessions) { return sessions.push_back(stream); });
+  auto lobbies_handlers = sessions::setup_lobbies_handlers(app_state, api_runtime_dir(), {});
+
+  std::vector<std::string> unplugged;
+  auto unplug_observer = event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
+      [&](const immer::box<events::UnplugDeviceEvent> &ev) { unplugged.push_back(ev->session_id); });
+  auto join = events::JoinLobbyEvent{.lobby_id = "joined", .moonlight_session_id = session_id};
+  event_bus->fire_event(immer::box<events::JoinLobbyEvent>(join));
+  REQUIRE(join.error_message.get()->get_future().get().empty());
+  REQUIRE(unplugged == std::vector<std::string>{"kept-in"}); // out of the app that had it, into the joined one
+
+  // The client never claims it: its unplug follows the session into the lobby it joined
+  unplugged.clear();
+  control::release_unclaimed_joypads(stream);
+  std::sort(unplugged.begin(), unplugged.end()); // the lobby relays it from inside the session's event
+  REQUIRE(unplugged == std::vector<std::string>{std::to_string(session_id), "joined"});
+  REQUIRE(stream.joypads->load()->empty());
+}
+
+TEST_CASE("Lobbies: a stream stopped before it joins unplugs the joypads it took over from the lobby", "[API]") {
+  auto created = inputtino::XboxOneJoypad::create();
+  if (!created) {
+    SKIP("Creating a joypad needs /dev/uinput: " << created.getErrorMessage());
+  }
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .host = immer::box<state::Host>(state::Host{.lobby_keeps_joypads = true}),
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
+      .running_sessions = running_sessions});
+  constexpr std::size_t session_id = 4323;
+  events::Lobby lobby{.id = "kept-in", .name = "kept-in", .multi_user = false, .stop_when_everyone_leaves = false};
+  app_state->lobbies->update([&](const immer::vector<events::Lobby> &lobbies) { return lobbies.push_back(lobby); });
+  // The stream took over a joypad that the lobby kept for it (sessions/add), still plugged into its app; its client
+  // claimed it, but the stream never joins the lobby
+  std::weak_ptr<events::JoypadTypes> pad;
+  {
+    auto joypad = std::make_shared<events::JoypadTypes>(input::XboxOneJoypad(std::move(*created)));
+    pad = joypad;
+    auto stream = events::StreamSession{.event_bus = event_bus, .session_id = session_id};
+    stream.joypads->store(events::JoypadList{}.set(0, joypad));
+    stream.taken_over_joypads->store(std::make_shared<const events::TakenOverJoypads>(
+        events::TakenOverJoypads{.lobby_id = "kept-in", .joypads = events::JoypadList{}.set(0, joypad)}));
+    running_sessions->update([&](const auto &sessions) { return sessions.push_back(stream); });
+  }
+  auto moonlight_handlers = sessions::setup_moonlight_handlers(app_state, api_runtime_dir(), {});
+  auto lobbies_handlers = sessions::setup_lobbies_handlers(app_state, api_runtime_dir(), {});
+
+  std::vector<std::string> unplugged;
+  auto unplug_observer = event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
+      [&](const immer::box<events::UnplugDeviceEvent> &ev) { unplugged.push_back(ev->session_id); });
+  event_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session_id}));
+  // The lobby no longer keeps it and the stream isn't in the lobby: only this tells the app it's gone
+  REQUIRE(unplugged == std::vector<std::string>{"kept-in"});
+  REQUIRE(running_sessions->load()->empty());
+  REQUIRE(lobby.parked_joypads->load()->empty());
+  REQUIRE(pad.expired());
 }
 
 TEST_CASE("Lobbies: joining another lobby moves the joypads a stream took over out of the first one", "[API]") {

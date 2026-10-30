@@ -10,14 +10,16 @@ namespace wolf::api {
 
 using namespace wolf::core;
 
-void start_server(std::string_view runtime_dir, immer::box<state::AppState> app_state) {
+void start_server(std::string_view runtime_dir,
+                  immer::box<state::AppState> app_state,
+                  std::chrono::milliseconds sse_keepalive_interval) {
   auto default_socket_path = std::filesystem::path(runtime_dir) / "wolf.sock";
   auto socket_path = utils::get_env("WOLF_SOCKET_PATH", default_socket_path.c_str());
   logs::log(logs::info, "Starting Wolf API server on {}", socket_path);
 
   ::unlink(socket_path);
   boost::asio::io_context io_context;
-  UnixSocketServer server(io_context, socket_path, app_state);
+  UnixSocketServer server(io_context, socket_path, app_state, sse_keepalive_interval);
   auto server_ptr = std::make_shared<UnixSocketServer>(server);
 
   auto global_ev_handler = app_state->event_bus->register_global_handler([server_ptr](events::EventsVariant ev) {
