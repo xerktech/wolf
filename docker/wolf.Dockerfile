@@ -37,6 +37,9 @@ ENV RUST_VERSION=$RUST_VERSION
 RUN rustup install $RUST_VERSION && rustup default $RUST_VERSION
 
 WORKDIR /tmp/
+# Upstream 016b4fc + the CUDA context refcount fix (XERK-1740), which no upstream stable carries yet.
+# Drop the patch once an upstream release our GStreamer can build includes it.
+COPY docker/patches/gst-wayland-display-cuda-context.patch /tmp/
 RUN <<_GST_WAYLAND_DISPLAY
     #!/bin/bash
     set -e
@@ -44,6 +47,7 @@ RUN <<_GST_WAYLAND_DISPLAY
     git clone https://github.com/games-on-whales/gst-wayland-display
     cd gst-wayland-display
     git checkout 016b4fc
+    git apply /tmp/gst-wayland-display-cuda-context.patch
     # Pinned because it can cause issues when RUST_VERSION isn't the absolute latest
     cargo install cargo-c@0.10.23 --locked
     cargo cinstall --features="cuda" --prefix=/usr/local/lib/x86_64-linux-gnu/ --libdir=/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0
