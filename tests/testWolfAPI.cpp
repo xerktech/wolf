@@ -1758,6 +1758,43 @@ TEST_CASE("Joining a second lobby leaves the first one", "[API]") {
   }
 }
 
+TEST_CASE("Joining a lobby while it stops doesn't leave the session in the stopped lobby", "[API]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
+      .running_sessions = running_sessions});
+  auto session = events::StreamSession{.event_bus = event_bus, .session_id = 4322};
+  running_sessions->update([&](const auto &sessions) { return sessions.push_back(session); });
+  auto lobbies_handlers = sessions::setup_lobbies_handlers(app_state, api_runtime_dir(), {});
+
+  // Lobbies added straight to state (no compositor); the join races the stop
+  for (int round = 0; round < 300; round++) {
+    auto id = fmt::format("stopping-lobby-{}", round);
+    events::Lobby lobby{.id = id, .name = id, .multi_user = true, .stop_when_everyone_leaves = false};
+    app_state->lobbies->update([&](const immer::vector<events::Lobby> &lobbies) { return lobbies.push_back(lobby); });
+
+    std::thread join([&]() {
+      auto ev = events::JoinLobbyEvent{.lobby_id = id, .moonlight_session_id = session.session_id};
+      event_bus->fire_event(immer::box<events::JoinLobbyEvent>(ev));
+      ev.error_message.get()->get_future().get();
+    });
+    std::thread stop(
+        [&]() { event_bus->fire_event(immer::box<events::StopLobbyEvent>(events::StopLobbyEvent{.lobby_id = id})); });
+    join.join();
+    stop.join();
+
+    REQUIRE(!state::get_lobby_by_id(*app_state->lobbies->load(), id));
+    // Whichever ran first, the stopped lobby lists no one
+    REQUIRE(lobby.connected_sessions->load()->empty());
+  }
+}
+
 TEST_CASE("Lobbies APIs", "[API]") {
   auto event_bus = std::make_shared<events::EventBusType>();
   auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();

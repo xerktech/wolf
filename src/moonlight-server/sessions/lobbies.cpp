@@ -108,6 +108,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
   immer::vector_transient<immer::box<events::EventBusHandlers>> handlers;
   // Serialises joins and leaves: a join reads which lobby the session is in, leaves it and joins the new one, so
   // concurrent joins would otherwise leave a session in two lobbies or listed twice in one.
+  // Also held by a lobby stop, so that no join lands between its snapshot of the sessions and its removal.
   // Recursive: leaving can stop a lobby, whose handler fires the LeaveLobbyEvent of its other sessions on this thread.
   auto membership_lock = std::make_shared<std::recursive_mutex>();
 
@@ -347,6 +348,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
   // Stopping a lobby will trigger leave for all the connected sessions
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::StopLobbyEvent>>(
       [=](const immer::box<events::StopLobbyEvent> &stop_lobby_event) {
+        // A join between the snapshot and the removal would leave its session in a lobby that's gone (XERK-2440)
+        std::lock_guard membership_guard(*membership_lock);
         auto lobbies = app_state->lobbies->load();
         auto lobby = state::get_lobby_by_id(lobbies.get(), stop_lobby_event->lobby_id);
 

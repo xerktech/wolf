@@ -64,3 +64,6 @@ paths:
   a full lobby 409; 500 is for Wolf's own failures (a save that failed, a timeout).
 - Lobby joins and leaves are serialised by `membership_lock` in `setup_lobbies_handlers`: a join reads the
   session's current lobby, leaves it and joins the new one. Tests: "Joining a second lobby leaves the first one".
+  - A lobby stop holds it too, from its snapshot of `connected_sessions` to the lobby's removal: a join in
+    between left the session in a lobby that's gone (XERK-2440). Tests: "Joining a lobby while it stops
+    doesn't leave the session in the stopped lobby".
