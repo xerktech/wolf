@@ -22,6 +22,7 @@
 #include <mutex>
 #include <rfl.hpp>
 #include <rfl/json.hpp>
+#include <set>
 #include <state/serialised_config.hpp>
 #include <string_view>
 
@@ -524,6 +525,20 @@ struct TakenOverJoypads {
   JoypadList joypads;
 };
 
+/**
+ * WOLF_LOBBY_KEEPS_JOYPADS: the joypads a stream took over from a lobby (sessions/add), by controller number.
+ * A CONTROLLER_ARRIVAL or the pad's first input claims one; those still unclaimed a while after the client connects
+ * are unplugged (control::release_unclaimed_joypads).
+ *
+ * One mutex over the set and the session's `joypads` they refer to: a claim, a release and the lobby keeping the
+ * pads again each read and change them together. Never fire an event while holding it (lobby handlers take it).
+ */
+struct KeptJoypads {
+  std::mutex mutex;
+  /** Those the client hasn't claimed yet */
+  std::set<int> unclaimed;
+};
+
 struct StreamSession {
   moonlight::DisplayMode display_mode;
   int audio_channel_count;
@@ -617,6 +632,8 @@ struct StreamSession {
    * first stream's (dead) peer with its old key after a /resume.
    */
   std::shared_ptr<immer::atom<ControlFeedback>> control_feedback = std::make_shared<immer::atom<ControlFeedback>>();
+
+  std::shared_ptr<KeptJoypads> kept_joypads = std::make_shared<KeptJoypads>();
 
   /**
    * Orders "joypad set changed" against "session joined/left a lobby".

@@ -31,7 +31,7 @@ paths:
     Tests: "control: joypad feedback reaches the resumed stream's client".
   - A carried-over pad's CONTROLLER_ARRIVAL takes the "already present" path, which must still send that
     client its motion requests (PS pads only): they are per client, not per pad (XERK-2401). Tests: "control:
-    a resumed stream's client is asked for its carried-over pad's motion" (needs uhid/uinput, skips in CI).
+    a resumed stream's client is asked for its carried-over pad's motion" (needs uhid/uinput; skips only on the TSan leg).
   - A stop's runner exits milliseconds after the stop, often after a /resume re-added the
     session_id. The runner-exit path fires `StopStreamEvent` only while its own instance is the
     running one (`state::is_running_instance`), else `EndSupersededStreamEvent` (XERK-1964).
@@ -149,6 +149,25 @@ paths:
       (pad pointers, not indexes). Joining another lobby unplugs them from the one they were taken from.
       Tests: "Lobbies: joining another lobby moves the joypads a stream took over out of the first one".
   - Not on the WolfUI combo: that stream goes on, back in WolfUI, and needs its joypads.
+  - The pads a stream took over stay unclaimed (`StreamSession::kept_joypads`) until the client claims
+    each, with a CONTROLLER_ARRIVAL or its first input (XERK-2402).
+    - An arrival of another type replaces the kept pad; a pad still unclaimed `unclaimed_joypads_timeout`
+      after the ENet connect is unplugged. Only kept pads are replaced: a pad this stream created ignores
+      a second arrival.
+    - Their unplug goes to the lobby they were taken over from while `taken_over_joypads` still lists that
+      pad (same pointer), else to the session: one addressed to the session before the join never reaches
+      the lobby's app, and after a join or the combo the pad follows the session.
+    - Claim, release and re-park change `kept_joypads` and the session's `joypads` together under
+      `KeptJoypads::mutex`; without it QA lost the pad in ~90% of forced arrival-vs-release races.
+      Fire events only after unlocking: lobby handlers take the mutex while the bus lock is held.
+    - Re-parking clears the unclaimed set, so a stream that ends before its timeout releases nothing.
+    - A stream stopped before it joins a lobby unplugs its `taken_over_joypads` from the lobby that kept
+      them (the `StopStreamEvent` handler in `sessions/moonlight.cpp`): the lobby no longer lists them and
+      the stream isn't in it, so nothing else would (XERK-2407). Tests: "Lobbies: a stream stopped before
+      it joins unplugs the joypads it took over from the lobby".
+    - Tests: `tests/platforms/linux/inputtino.cpp` "uinput - joypads kept from a lobby are replaced or
+      released unless the client claims them"; `tests/testWolfAPI.cpp` "Lobbies: a kept joypad never
+      claimed is unplugged from the lobby its stream joined".
   - Tests: `tests/testWolfAPI.cpp` "Lobbies: a stream that ends in a lobby leaves its joypads plugged in
     for the next one", "...doesn't take over the kept joypads unplugs them on joining" (skip without
     `/dev/uinput`).
@@ -158,6 +177,8 @@ paths:
     routed by neither (ghost pad in the lobby's app, or a pad in the wrong runner).
   - Lock order: `membership_lock` before it. A join takes it only after leaving its current lobby (which
     takes it too); never fire Join/Leave/StopLobby while holding it. Resume carries it with the joypads.
+  - Every pad removal holds it from `take_joypad` until its unplug is fired (multi unplug, arrival replace,
+    `release_unclaimed_joypads`), taken before `KeptJoypads::mutex`. Plain pad input doesn't take it.
   - A leave rewrites the lobby's keep (`parked_joypads`) to the joypads the stream has then: pads changed
     since `on_moonlight_session_over` parked them were relayed to the lobby.
   - Tests: "Lobby join and leave wait for an in-flight joypad change", "Lobbies: a leave keeps the joypads

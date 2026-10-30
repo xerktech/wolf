@@ -416,6 +416,11 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
       new_session->control_feedback = parked->second->control_feedback;
       new_session->taken_over_joypads->store(std::make_shared<const events::TakenOverJoypads>(
           events::TakenOverJoypads{.lobby_id = parked->first.id, .joypads = parked->second->joypads}));
+      // Until its client claims them: it may bring other controllers this time (control::release_unclaimed_joypads)
+      std::lock_guard lock(new_session->kept_joypads->mutex);
+      for (auto [joypad_nr, _joypad] : parked->second->joypads) {
+        new_session->kept_joypads->unclaimed.insert(joypad_nr);
+      }
     }
 
     // Every session event is keyed by session_id: a second session under the same one would be unreachable.

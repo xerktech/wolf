@@ -52,7 +52,10 @@ if (UNIX AND NOT APPLE)
         FetchContent_Declare(
                 inputtino
                 GIT_REPOSITORY https://github.com/games-on-whales/inputtino.git
-                GIT_TAG fd136cf)
+                GIT_TAG fd136cf
+                # Thread-safety fixes not (yet) upstream: see patches/inputtino-thread-safety.patch
+                PATCH_COMMAND ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/inputtino-thread-safety.patch
+                              -P ${CMAKE_CURRENT_SOURCE_DIR}/patches/apply-patch.cmake)
         FetchContent_MakeAvailable(inputtino)
     endif ()
 
