@@ -337,6 +337,24 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         });
         lobby_lock.unlock();
 
+        // A pad unplugged since the snapshot above sent its UnplugDeviceEvent to the session before the relay knew
+        // about it. Every pad of the snapshot is in the lobby's app by now (queued, or taken over): unplug gone ones
+        auto current_joypads = session->joypads->load();
+        for (auto [joypad_nr, joypad] : joypads) {
+          auto current = current_joypads->find(joypad_nr);
+          if (!current || *current != joypad) {
+            logs::log(logs::debug, "[LOBBY] Joypad {} unplugged while joining lobby {}", joypad_nr, lobby->id);
+            events::UnplugDeviceEvent unplug_ev{.session_id = lobby->id};
+            std::visit(
+                [&unplug_ev](auto &pad) {
+                  unplug_ev.udev_events = pad.get_udev_events();
+                  unplug_ev.udev_hw_db_entries = pad.get_udev_hw_db_entries();
+                },
+                *joypad);
+            app_state->event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{unplug_ev});
+          }
+        }
+
         // switch mouse and keyboard in session to use the lobby wayland server
         auto wl_state = lobby->wayland_display->load();
         session->mouse->emplace(virtual_display::WaylandMouse(wl_state));

@@ -1,4 +1,5 @@
 #include <atomic>
+#include <mutex>
 #include <runners/docker.hpp>
 
 namespace wolf::core::docker {
@@ -242,10 +243,22 @@ void RunDocker::run(std::string_view session_id,
       stop_container();
     }
 
+    // Serialises unplugs with the plugging loop below: an unplug either finds its plug still queued, or runs after
+    // that plug's commands, never before them (which would leave the container a device nobody unplugs)
+    std::mutex devices_mutex;
     auto unplug_device_handler = this->ev_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
-        [session_id, container_id, hw_db_path, this](const immer::box<events::UnplugDeviceEvent> &ev) {
+        [session_id, container_id, hw_db_path, plugged_devices_queue, &devices_mutex, this](
+            const immer::box<events::UnplugDeviceEvent> &ev) {
           if (ev->session_id == session_id) {
             logs::log(logs::debug, "[DOCKER] Received UnplugDeviceEvent for session: {}", ev->session_id);
+            std::lock_guard lock(devices_mutex);
+            auto never_plugged = plugged_devices_queue->remove_if([&](const immer::box<events::PlugDeviceEvent> &plug) {
+              return plug->session_id == session_id && events::is_same_device(*plug, *ev);
+            });
+            if (never_plugged > 0) {
+              logs::log(logs::debug, "[DOCKER] Dropped the queued plug of a device unplugged before it was plugged");
+              return;
+            }
             for (const auto &[filename, content] : ev->udev_hw_db_entries) {
               try {
                 std::filesystem::remove(hw_db_path / filename);
@@ -271,7 +284,12 @@ void RunDocker::run(std::string_view session_id,
 
     do {
       // Plug all devices that are waiting in the queue
-      while (auto device_ev = plugged_devices_queue->pop(50ms)) {
+      while (true) {
+        std::lock_guard lock(devices_mutex);
+        auto device_ev = plugged_devices_queue->pop(0ms);
+        if (!device_ev) {
+          break;
+        }
         if (device_ev->get().session_id == session_id) {
           logs::log(logs::debug, "[DOCKER] Plugging device from queue in session: {}", session_id);
           if (use_fake_udev) {

@@ -2,6 +2,7 @@
 
 #define BOOST_THREAD_PROVIDES_FUTURE_CONTINUATION
 #define BOOST_THREAD_PROVIDES_FUTURE
+#include <algorithm>
 #include <atomic>
 #include <boost/thread.hpp>
 #include <boost/thread/future.hpp>
@@ -45,6 +46,25 @@ struct UnplugDeviceEvent {
   std::vector<std::map<std::string, std::string>> udev_events;
   std::vector<std::pair<std::string, std::vector<std::string>>> udev_hw_db_entries;
 };
+
+/**
+ * Whether an unplug is for the device a plug added: same udev events and hwdb entries, ignoring USEC_INITIALIZED,
+ * a timestamp in seconds taken each time a device's events are built (so a plug's and its unplug's can differ)
+ */
+inline bool is_same_device(const PlugDeviceEvent &plug, const UnplugDeviceEvent &unplug) {
+  auto same_event = [](const std::map<std::string, std::string> &a, const std::map<std::string, std::string> &b) {
+    auto without_time = [](std::map<std::string, std::string> ev) {
+      ev.erase("USEC_INITIALIZED");
+      return ev;
+    };
+    return without_time(a) == without_time(b);
+  };
+  return plug.udev_hw_db_entries == unplug.udev_hw_db_entries && std::equal(plug.udev_events.begin(),
+                                                                            plug.udev_events.end(),
+                                                                            unplug.udev_events.begin(),
+                                                                            unplug.udev_events.end(),
+                                                                            same_event);
+}
 
 using devices_atom_queue = TSQueue<immer::box<events::PlugDeviceEvent>>;
 using RunnerTypes = rfl::TaggedUnion<"type", wolf::config::AppCMD, wolf::config::AppDocker>;
