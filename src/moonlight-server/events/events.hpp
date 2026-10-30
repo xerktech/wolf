@@ -59,12 +59,11 @@ inline bool is_same_device(const PlugDeviceEvent &plug, const UnplugDeviceEvent 
     };
     return without_time(a) == without_time(b);
   };
-  return plug.udev_hw_db_entries == unplug.udev_hw_db_entries &&
-         std::equal(plug.udev_events.begin(),
-                    plug.udev_events.end(),
-                    unplug.udev_events.begin(),
-                    unplug.udev_events.end(),
-                    same_event);
+  return plug.udev_hw_db_entries == unplug.udev_hw_db_entries && std::equal(plug.udev_events.begin(),
+                                                                            plug.udev_events.end(),
+                                                                            unplug.udev_events.begin(),
+                                                                            unplug.udev_events.end(),
+                                                                            same_event);
 }
 
 using devices_atom_queue = TSQueue<immer::box<events::PlugDeviceEvent>>;
