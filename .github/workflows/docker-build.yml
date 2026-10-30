@@ -26,9 +26,9 @@ env:
   # Each build would otherwise upload a .dockerbuild record artifact that counts
   # against the org's shared Actions storage quota (XERK-1796).
   DOCKER_BUILD_RECORD_UPLOAD: "false"
-  # docker/wolf.Dockerfile's default BASE_IMAGE, pinned. Bump it together with
+  # docker/wolf.Dockerfile's default BASE_IMAGE (Fedora 44), pinned. Bump it together with
   # that default when rebasing onto a stable that moves GStreamer.
-  BASE_IMAGE: ghcr.io/games-on-whales/gstreamer:1.26.7@sha256:512b53b03b256a87fb4bd204ed1d91219148b0b77ff4ee4fc121c37d869f8d29
+  BASE_IMAGE: ghcr.io/games-on-whales/gstreamer:1.26.7@sha256:f71d899c3ea3607b65e676ffe789e549e761abefb23e26435541201202abfba9
 
 jobs:
   wolf:
@@ -75,3 +75,15 @@ jobs:
 
       - name: Image digest
         run: echo "ghcr.io/${{ github.repository_owner }}/wolf@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Smoke-test the image just pushed, by digest: binaries, dynamic linking,
+      # compositor plugin + software encoder, embedded PulseAudio, and a full
+      # entrypoint boot under supervisord. GPU-dependent elements are not
+      # checked (no GPU on CI runners).
+      - name: Smoke test image
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/wolf@${{ steps.build.outputs.digest }}"
+          docker pull "$IMAGE"
+          docker run --rm --entrypoint "" \
+            -v "$(pwd)/docker/smoke-test.sh:/smoke.sh:ro" \
+            "$IMAGE" bash /smoke.sh
