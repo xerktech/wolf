@@ -58,11 +58,12 @@ std::string api_socket_path() {
  * Servers started by earlier tests keep running: their socket file is removed first, so that we can't reach one of
  * them instead of the new server.
  */
-void start_api_server(const immer::box<state::AppState> &app_state) {
+void start_api_server(const immer::box<state::AppState> &app_state,
+                      std::chrono::milliseconds sse_keepalive_interval = wolf::api::SSE_KEEPALIVE_INTERVAL) {
   auto socket_path = api_socket_path();
   std::filesystem::remove(socket_path);
-  std::thread([app_state, runtime_dir = api_runtime_dir()]() {
-    wolf::api::start_server(runtime_dir, app_state);
+  std::thread([app_state, runtime_dir = api_runtime_dir(), sse_keepalive_interval]() {
+    wolf::api::start_server(runtime_dir, app_state, sse_keepalive_interval);
   }).detach();
   for (int attempt = 0; attempt < 500; attempt++) {
     boost::asio::io_context ctx;
@@ -2307,6 +2308,49 @@ TEST_CASE("SSE APIs large events", "[API]") {
   }
   REQUIRE(ec == boost::asio::error::eof);
   REQUIRE(drained < 80 * big_event.container_id.size());
+}
+
+TEST_CASE("SSE APIs idle subscriber gets keepalives", "[API]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .running_sessions = running_sessions});
+
+  // A short interval, so that the test doesn't have to wait for the production one
+  start_api_server(app_state, std::chrono::milliseconds(100));
+
+  boost::asio::io_context client_ctx;
+  boost::asio::local::stream_protocol::socket client(client_ctx);
+  client.connect(boost::asio::local::stream_protocol::endpoint(api_socket_path()));
+  boost::asio::write(client, boost::asio::buffer(std::string_view("GET /api/v1/events HTTP/1.0\r\n\r\n")));
+  boost::asio::streambuf headers;
+  boost::asio::read_until(client, headers, "\r\n\r\n");
+  std::string received(boost::asio::buffers_begin(headers.data()), boost::asio::buffers_end(headers.data()));
+  received = received.substr(received.find("\r\n\r\n") + 4);
+
+  // Send nothing and fire no event: only the keepalive timer writes to us. Two of them show it keeps re-arming.
+  // Fail instead of hanging if they never come
+  client.non_blocking(true);
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  std::array<char, 1024> chunk{};
+  boost::system::error_code ec;
+  while (received.size() < 2 * 12 && !ec && std::chrono::steady_clock::now() < deadline) {
+    pollfd fd = {.fd = client.native_handle(), .events = POLLIN, .revents = 0};
+    if (poll(&fd, 1, 100) > 0) {
+      received.append(chunk.data(), client.read_some(boost::asio::buffer(chunk), ec));
+    }
+  }
+  REQUIRE(!ec);
+  // A stalled reader may get more than two at once: check that it got at least two and nothing else
+  REQUIRE(received.size() >= 2 * 12);
+  for (std::size_t pos = 0; pos < received.size(); pos += 12) {
+    REQUIRE_THAT(received.substr(pos, 12), Equals(":keepalive\n\n"));
+  }
 }
 
 TEST_CASE("API refuses requests it can't read with a JSON error", "[API]") {
