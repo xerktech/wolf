@@ -8,6 +8,9 @@ ENV GSTREAMER_VERSION=$GSTREAMER_VERSION
 ENV SOURCE_PATH=/sources/
 WORKDIR $SOURCE_PATH
 
+# GstInterpipe at 0c45491 + a fix so a listener renegotiates when it switches to a node with different
+# caps (XERK-2496: with zero copy, a stream switching to a lobby's producer lost its video).
+COPY patches/gst-interpipe-renegotiate-on-switch.patch /tmp/
 RUN <<_GSTREAMER_INSTALL
     #!/bin/bash
     set -e
@@ -69,6 +72,8 @@ RUN <<_GSTREAMER_INSTALL
     # Add GstInterpipe
     git clone https://github.com/games-on-whales/gst-interpipe.git $SOURCE_PATH/gst-interpipe
     cd $SOURCE_PATH/gst-interpipe
+    git checkout 0c454917cb3cf4f2b2f2729f5f72a4dee072c7c9
+    git apply /tmp/gst-interpipe-renegotiate-on-switch.patch
     mkdir build
     meson build -Denable-gtk-doc=false
     meson install -C build
