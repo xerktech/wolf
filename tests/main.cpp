@@ -6,6 +6,7 @@
 #include <helpers/logger.hpp>
 #include <helpers/utils.hpp>
 #include <streaming/streaming.hpp>
+#include <unistd.h>
 
 int main(int argc, char *argv[]) {
   logs::init(logs::parse_level(utils::get_env("WOLF_LOG_LEVEL", "TRACE")));
@@ -15,5 +16,11 @@ int main(int argc, char *argv[]) {
 
   int result = Catch::Session().run(argc, argv);
 
-  return result;
+  // Leave without running static destructors, like wolf itself (see wolf.cpp): the API servers and SSE clients the
+  // tests detach are still running, and would touch destroyed statics (the logger, the SSE keepalive) during exit().
+  // _exit, not _Exit: TSan intercepts _exit, so a reported race still turns the exit code into 66.
+  std::clog.flush();
+  std::cout.flush();
+  std::fflush(nullptr);
+  ::_exit(result);
 }
