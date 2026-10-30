@@ -13,6 +13,10 @@ race:libgstbase-1.0.so
 race:libgstapp-1.0.so
 race:libgstinterpipe.so
 race:libgstwaylanddisplaysrc.so
+# Same for GStreamer's audio library and libpulse: pulsesrc (the audio producers) and Wolf's own audio::Server each run
+# a threaded mainloop, and libpulse shares its lock-free free-lists (memblocks, packets) between them
+race:libgstaudio-1.0.so
+race:libpulsecommon
 # OpenSSL initialises its RNG lazily with atomics TSan can't see: two first RAND_bytes calls at once are reported
 race:libcrypto.so
 

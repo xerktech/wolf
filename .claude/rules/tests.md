@@ -34,3 +34,6 @@ paths:
   test uses, or the second bind aborts the whole binary.
 - A real joypad (uhid/uinput) can take seconds to appear on a loaded host: poll for it with a deadline,
   never a fixed sleep.
+- Join, never detach, a test thread that can still log (or touch anything static) after the test ends:
+  exit destroys Boost.Log's logger while it runs, and the CI TSan leg fails with exit 66 after every
+  test passed (XERK-2438). A blocking curl transfer stops via `CURLOPT_XFERINFOFUNCTION` (see `listen_sse`).
