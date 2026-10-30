@@ -636,6 +636,14 @@ struct StreamSession {
   std::shared_ptr<KeptJoypads> kept_joypads = std::make_shared<KeptJoypads>();
 
   /**
+   * Orders "joypad set changed" against "session joined/left a lobby".
+   * Held while a pad is added/removed together with its Plug/UnplugDeviceEvent, and by join/leave
+   * around the joypads snapshot + connected_sessions update, so a pad is never routed to the wrong runner.
+   * Carried over on resume with the joypads. Never fire Join/Leave/StopLobby events while holding it.
+   */
+  std::shared_ptr<std::mutex> joypads_lobby_mutex = std::make_shared<std::mutex>();
+
+  /**
    * WOLF_LOBBY_KEEPS_JOYPADS: set by sessions/add when it takes over a lobby's kept joypads, taken (cleared) by the
    * stream's next lobby join, which must not move them out of an app that has them already.
    */

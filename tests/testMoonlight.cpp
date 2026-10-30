@@ -1400,6 +1400,7 @@ TEST_CASE("HTTPS /resume carries the stream's devices over to the new instance",
   REQUIRE(resumed.mouse == kept.mouse);
   REQUIRE(resumed.keyboard == kept.keyboard);
   REQUIRE(resumed.joypads == kept.joypads);
+  REQUIRE(resumed.joypads_lobby_mutex == kept.joypads_lobby_mutex); // still ordered against lobby joins/leaves
   REQUIRE(resumed.control_feedback == kept.control_feedback); // the joypads' feedback reaches the new peer
   REQUIRE(resumed.pen_tablet == kept.pen_tablet);
   REQUIRE(resumed.touch_screen == kept.touch_screen);

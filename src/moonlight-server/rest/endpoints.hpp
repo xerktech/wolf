@@ -492,7 +492,8 @@ inline void carry_over_resumed_session(events::StreamSession &old_session, event
   new_session.mouse = std::move(old_session.mouse);
   new_session.keyboard = std::move(old_session.keyboard);
   new_session.joypads = std::move(old_session.joypads);
-  new_session.control_feedback = std::move(old_session.control_feedback); // the joypads send through it
+  new_session.joypads_lobby_mutex = std::move(old_session.joypads_lobby_mutex); // guards the joypads
+  new_session.control_feedback = std::move(old_session.control_feedback);       // the joypads send through it
   new_session.pen_tablet = std::move(old_session.pen_tablet);
   new_session.touch_screen = std::move(old_session.touch_screen);
 }

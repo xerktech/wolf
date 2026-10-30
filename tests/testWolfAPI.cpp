@@ -1709,6 +1709,104 @@ TEST_CASE("Lobby relays a device unplug to its runner", "[API]") {
   REQUIRE(relayed_to_lobby == 1);
 }
 
+TEST_CASE("Lobby join and leave wait for an in-flight joypad change", "[API]") {
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
+      .running_sessions = running_sessions});
+
+  const std::string lobby_id = "lobby-under-test";
+  events::Lobby lobby{.id = lobby_id, .name = lobby_id, .multi_user = false, .stop_when_everyone_leaves = false};
+  app_state->lobbies->update([&](const immer::vector<events::Lobby> &lobbies) { return lobbies.push_back(lobby); });
+  auto session = events::StreamSession{.event_bus = event_bus, .session_id = 1234};
+  running_sessions->update([&](const auto &sessions) { return sessions.push_back(session); });
+
+  auto lobbies_handlers = sessions::setup_lobbies_handlers(app_state, api_runtime_dir(), {});
+  auto connected = [&]() { return lobby.connected_sessions->load()->size(); };
+
+  // CHECK, not REQUIRE, while a thread is joinable: a thrown REQUIRE would std::terminate the binary
+  { // A join fired while a joypad is being plugged/unplugged must not switch lobbies until that change is done
+    std::unique_lock pad_change(*session.joypads_lobby_mutex);
+    auto join_ev = events::JoinLobbyEvent{.lobby_id = lobby_id, .moonlight_session_id = session.session_id};
+    std::thread join([&]() { event_bus->fire_event(immer::box<events::JoinLobbyEvent>(join_ev)); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(connected() == 0);
+    pad_change.unlock();
+    join.join();
+    REQUIRE(join_ev.error_message.get()->get_future().get().empty());
+    REQUIRE(connected() == 1);
+  }
+
+  { // Same for a leave
+    std::unique_lock pad_change(*session.joypads_lobby_mutex);
+    std::thread leave([&]() {
+      event_bus->fire_event(immer::box<events::LeaveLobbyEvent>{
+          events::LeaveLobbyEvent{.lobby_id = lobby_id, .moonlight_session_id = session.session_id}});
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(connected() == 1);
+    pad_change.unlock();
+    leave.join();
+    REQUIRE(connected() == 0);
+  }
+}
+
+TEST_CASE("Lobbies: a leave keeps the joypads the stream has then, not those it had when they were kept", "[API]") {
+  auto created = inputtino::XboxOneJoypad::create();
+  if (!created) {
+    SKIP("Creating a joypad needs /dev/uinput: " << created.getErrorMessage());
+  }
+  auto event_bus = std::make_shared<events::EventBusType>();
+  auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto config = immer::box<state::Config>(state::load_or_default("config.test.toml", event_bus, running_sessions));
+  auto app_state = immer::box<state::AppState>(state::AppState{
+      .config = config,
+      .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
+      .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
+      .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
+      .running_sessions = running_sessions});
+  const std::string lobby_id = "game-lobby";
+  constexpr std::size_t session_id = 1234;
+  events::Lobby lobby{.id = lobby_id, .name = lobby_id, .multi_user = false, .stop_when_everyone_leaves = false};
+  lobby.connected_sessions->update(
+      [&](const auto &connected) { return connected.push_back(immer::box<std::string>{std::to_string(session_id)}); });
+  app_state->lobbies->update([&](const immer::vector<events::Lobby> &lobbies) { return lobbies.push_back(lobby); });
+  auto stream = events::StreamSession{.event_bus = event_bus, .session_id = session_id};
+  running_sessions->update([&](const auto &sessions) { return sessions.push_back(stream); });
+  auto lobbies_handlers = sessions::setup_lobbies_handlers(app_state, api_runtime_dir(), {});
+
+  // The stream ended with a joypad, kept by the lobby (on_moonlight_session_over), which was then unplugged (relayed
+  // to the lobby, the session still connected) before the leave
+  std::weak_ptr<events::JoypadTypes> pad;
+  {
+    auto joypad = std::make_shared<events::JoypadTypes>(input::XboxOneJoypad(std::move(*created)));
+    pad = joypad;
+    lobby.parked_joypads->update([&](const auto &all) {
+      return all.set(session_id,
+                     std::make_shared<const events::ParkedJoypads>(
+                         events::ParkedJoypads{.joypads = events::JoypadList{}.set(0, joypad),
+                                               .control_feedback = stream.control_feedback}));
+    });
+  }
+  event_bus->fire_event(immer::box<events::LeaveLobbyEvent>{
+      events::LeaveLobbyEvent{.lobby_id = lobby_id, .moonlight_session_id = session_id}});
+
+  // The lobby keeps what the stream has at the leave: nothing, so the next stream can't take over the unplugged pad
+  auto parked = lobby.parked_joypads->load();
+  auto kept = parked->find(session_id);
+  REQUIRE(kept);
+  REQUIRE((*kept)->joypads.empty());
+  REQUIRE((*kept)->control_feedback == stream.control_feedback);
+  REQUIRE(pad.expired());
+}
+
 TEST_CASE("Joining a second lobby leaves the first one", "[API]") {
   auto event_bus = std::make_shared<events::EventBusType>();
   auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();

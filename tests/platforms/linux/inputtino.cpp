@@ -1,4 +1,5 @@
 #include "libinput.h"
+#include <atomic>
 #include <boost/endian/conversion.hpp>
 #include <boost/locale.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -413,6 +414,84 @@ TEST_CASE("uinput - joypad WolfUI combo", "[UINPUT]") {
   control::handle_input(session, {}, &c_pkt, sizeof(c_pkt));
 
   REQUIRE(combo_events == (wolf_ui_combo ? 1 : 0));
+}
+
+TEST_CASE("uinput - joypad plug/unplug waits for a lobby join/leave in progress", "[UINPUT]") {
+  auto session = events::StreamSession{.event_bus = std::make_shared<events::EventBusType>(),
+                                       .app = std::make_shared<events::App>(events::App{})};
+  std::atomic<int> plugged = 0, unplugged = 0;
+  auto plug_handler = session.event_bus->register_handler<immer::box<events::PlugDeviceEvent>>(
+      [&](const immer::box<events::PlugDeviceEvent> &) { plugged++; });
+  auto unplug_handler = session.event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
+      [&](const immer::box<events::UnplugDeviceEvent> &) { unplugged++; });
+
+  auto send_multi = [&](short active_gamepad_mask) {
+    auto c_pkt = pkts::CONTROLLER_MULTI_PACKET{.controller_number = 0, .active_gamepad_mask = active_gamepad_mask};
+    c_pkt.type = pkts::CONTROLLER_MULTI;
+    control::handle_input(session, {}, &c_pkt, sizeof(c_pkt));
+  };
+
+  // A join/leave holds joypads_lobby_mutex across its joypads snapshot and lobby update: a pad must not be added and
+  // announced in between. CHECK, not REQUIRE, while a thread is joinable: a thrown REQUIRE would std::terminate.
+  {
+    std::unique_lock lobby_switch(*session.joypads_lobby_mutex);
+    std::thread arrival([&]() { send_multi(1); }); // first mention of pad 0 creates it
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(plugged == 0);
+    CHECK(session.joypads->load()->size() == 0);
+    lobby_switch.unlock();
+    arrival.join();
+    REQUIRE(plugged == 1);
+    REQUIRE(session.joypads->load()->size() == 1);
+  }
+
+  { // ...nor removed and announced in between
+    std::unique_lock lobby_switch(*session.joypads_lobby_mutex);
+    std::thread removal([&]() { send_multi(0); }); // pad 0 no longer active
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(unplugged == 0);
+    CHECK(session.joypads->load()->size() == 1);
+    lobby_switch.unlock();
+    removal.join();
+    REQUIRE(unplugged == 1);
+    REQUIRE(session.joypads->load()->size() == 0);
+  }
+}
+
+TEST_CASE("uinput - a kept joypad's replace or release waits for a lobby join/leave in progress", "[UINPUT]") {
+  auto session = events::StreamSession{.event_bus = std::make_shared<events::EventBusType>(), .session_id = 1234};
+  // A pad the stream took over from a lobby's keep, not claimed by its client yet
+  auto created = inputtino::XboxOneJoypad::create();
+  REQUIRE(created);
+  session.joypads->store(
+      events::JoypadList{}.set(0, std::make_shared<events::JoypadTypes>(XboxOneJoypad(std::move(*created)))));
+  session.kept_joypads->unclaimed.insert(0);
+  std::atomic<int> unplugged = 0;
+  auto unplug_handler = session.event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
+      [&](const immer::box<events::UnplugDeviceEvent> &) { unplugged++; });
+
+  // A join/leave holds joypads_lobby_mutex across its joypads snapshot and lobby update: the pad must not be taken and
+  // its unplug announced in between. CHECK, not REQUIRE, while a thread is joinable.
+  std::unique_lock lobby_switch(*session.joypads_lobby_mutex);
+  std::thread removal;
+  SECTION("Another type of controller arrives in its place") {
+    removal = std::thread([&]() {
+      auto c_pkt = pkts::CONTROLLER_ARRIVAL_PACKET{.controller_number = 0,
+                                                   .controller_type = pkts::NINTENDO,
+                                                   .capabilities = pkts::ANALOG_TRIGGERS};
+      c_pkt.type = pkts::CONTROLLER_ARRIVAL;
+      control::handle_input(session, {}, &c_pkt, sizeof(c_pkt));
+    });
+  }
+  SECTION("The client never claims it") {
+    removal = std::thread([&]() { control::release_unclaimed_joypads(session); });
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  CHECK(unplugged == 0);
+  CHECK(std::holds_alternative<XboxOneJoypad>(*session.joypads->load()->at(0)));
+  lobby_switch.unlock();
+  removal.join();
+  REQUIRE(unplugged == 1);
 }
 
 TEST_CASE("uinput - paste UTF8", "[UINPUT]") {

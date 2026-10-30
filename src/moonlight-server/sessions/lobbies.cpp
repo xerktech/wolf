@@ -53,6 +53,9 @@ void leave_lobby(const std::shared_ptr<events::EventBusType> &ev_bus,
                  const events::Lobby &lobby,
                  const events::StreamSession &session) {
   logs::log(logs::info, "[LOBBY] Session {} leaving lobby {}", session.session_id, lobby.id);
+  // Hold joypads_lobby_mutex across the lobby update and the joypads snapshot: a pad plugged or unplugged concurrently
+  // is then either in the snapshot (and moved here) or fired after the leave (and routed to the session only)
+  std::unique_lock lobby_lock(*session.joypads_lobby_mutex);
   // Remove the current session from the lobby list
   lobby.connected_sessions->update([session](const immer::vector<immer::box<std::string>> &connected_sessions) {
     return connected_sessions | //
@@ -70,8 +73,21 @@ void leave_lobby(const std::shared_ptr<events::EventBusType> &ev_bus,
 
   // Switch over all joypads present in the lobby back into the original session, unless the lobby keeps them for the
   // session's next stream: then the lobby's app must not see them unplugged
-  auto parked = lobby.parked_joypads->load();
-  events::JoypadList joypads = parked->find(session.session_id) ? events::JoypadList{} : *session.joypads->load();
+  events::JoypadList session_joypads = *session.joypads->load();
+  bool is_parked = false;
+  lobby.parked_joypads->update([&](const auto &all) {
+    if (auto found = all.find(session.session_id)) {
+      is_parked = true;
+      // Keep the current set: a pad plugged or unplugged since they were parked (on_moonlight_session_over) was relayed
+      // to the lobby while the session was still connected
+      return all.set(
+          session.session_id,
+          std::make_shared<const events::ParkedJoypads>(
+              events::ParkedJoypads{.joypads = session_joypads, .control_feedback = (*found)->control_feedback}));
+    }
+    return all;
+  });
+  events::JoypadList joypads = is_parked ? events::JoypadList{} : session_joypads;
   for (auto [_joypad_nr, joypad] : joypads) {
     // Plug them into original session
     events::PlugDeviceEvent plug_ev{.session_id = std::to_string(session.session_id)};
@@ -89,6 +105,7 @@ void leave_lobby(const std::shared_ptr<events::EventBusType> &ev_bus,
                                   .udev_hw_db_entries = plug_ev.udev_hw_db_entries}});
   }
   // TODO: hotplug pen_tablet and touch_screen
+  lobby_lock.unlock();
 
   // Switch audio/video gstreamer stream producers
   ev_bus->fire_event(immer::box<events::SwitchStreamProducerEvents>{
@@ -276,6 +293,11 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           leave_lobby(app_state->event_bus, *current_lobby, *session);
         }
 
+        // Hold joypads_lobby_mutex across the joypads snapshot and the lobby update: a pad plugged or unplugged
+        // concurrently is then either in the snapshot (and migrated here) or fired after the join (and relayed).
+        // Taken after leaving current_lobby, which takes it itself.
+        std::unique_lock lobby_lock(*session->joypads_lobby_mutex);
+
         // Migrate joypads BEFORE adding the session to connected_sessions, or the relayed unplug races the queued plug
         events::JoypadList joypads = session->joypads->load();
         // Joypads the lobby kept for this session: those its stream took over (sessions/add) are in `joypads`, plugged
@@ -312,6 +334,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         lobby->connected_sessions->update([session](const immer::vector<immer::box<std::string>> &connected_sessions) {
           return connected_sessions.push_back({std::to_string(session->session_id)});
         });
+        lobby_lock.unlock();
 
         // switch mouse and keyboard in session to use the lobby wayland server
         auto wl_state = lobby->wayland_display->load();

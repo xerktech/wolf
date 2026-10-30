@@ -223,6 +223,8 @@ std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSessi
     request_motion_events(session, connected_client, controller_number, capabilities);
   }
 
+  // Under joypads_lobby_mutex, so a concurrent lobby join/leave either sees this pad or routes its plug
+  std::lock_guard lobby_lock(*session.joypads_lobby_mutex);
   session.joypads->update([&](events::JoypadList joypads) {
     logs::log(logs::debug,
               "[INPUT] Sending PlugDeviceEvent for joypad {} of type: {}",
@@ -694,6 +696,9 @@ void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
                         immer::box<std::shared_ptr<ENetPeer>> connected_client) {
   std::shared_ptr<events::JoypadTypes> present;
   std::optional<events::UnplugDeviceEvent> replaced;
+  // Under joypads_lobby_mutex (taken before kept_joypads->mutex) until a replaced pad's unplug is fired, so a
+  // concurrent lobby join/leave either sees it or routes its unplug. Released before create_new_joypad takes it.
+  std::unique_lock lobby_lock(*session.joypads_lobby_mutex);
   {
     std::lock_guard lock(session.kept_joypads->mutex);
     events::JoypadList joypads = session.joypads->load();
@@ -717,6 +722,7 @@ void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
               session.session_id);
     session.event_bus->fire_event(immer::box<events::UnplugDeviceEvent>(*replaced));
   }
+  lobby_lock.unlock();
   if (present) {
     logs::log(logs::debug,
               "[INPUT] Received CONTROLLER_ARRIVAL for controller {} which is already present; skipping...",
@@ -736,6 +742,9 @@ void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
 }
 
 void release_unclaimed_joypads(events::StreamSession &session) {
+  // Under joypads_lobby_mutex (taken before kept_joypads->mutex) until the unplugs are fired, so a concurrent lobby
+  // join/leave either sees these pads or routes their unplugs
+  std::lock_guard lobby_lock(*session.joypads_lobby_mutex);
   std::vector<events::UnplugDeviceEvent> unplugs;
   {
     std::lock_guard lock(session.kept_joypads->mutex);
@@ -783,12 +792,20 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
   if (auto joypad = joypads->find(pkt.controller_number)) {
     selected_pad = std::move(*joypad);
     std::optional<events::UnplugDeviceEvent> removed;
+    // Check if Moonlight is sending the final packet for this pad
+    bool removing = !(pkt.active_gamepad_mask & (1 << pkt.controller_number));
+    // Removing: under joypads_lobby_mutex (taken before kept_joypads->mutex) until the unplug is fired, so a
+    // concurrent lobby join/leave either sees this pad or routes its unplug. Not for plain input: a join/leave
+    // holding it must not stall the pad's buttons.
+    std::unique_lock<std::mutex> lobby_lock;
+    if (removing) {
+      lobby_lock = std::unique_lock(*session.joypads_lobby_mutex);
+    }
     {
       std::lock_guard lock(session.kept_joypads->mutex);
       // Old Moonlight sends no CONTROLLER_ARRIVAL: a kept pad's first input claims it
       session.kept_joypads->unclaimed.erase(pkt.controller_number);
-      // Check if Moonlight is sending the final packet for this pad
-      if (!(pkt.active_gamepad_mask & (1 << pkt.controller_number))) {
+      if (removing) {
         logs::log(logs::debug, "Removing joypad {}", pkt.controller_number);
         removed = take_joypad(session, pkt.controller_number);
       }
