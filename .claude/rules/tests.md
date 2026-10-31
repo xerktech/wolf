@@ -34,6 +34,9 @@ paths:
   test uses, or the second bind aborts the whole binary.
 - A real joypad (uhid/uinput) can take seconds to appear on a loaded host: poll for it with a deadline,
   never a fixed sleep.
+- Pick a virtual joypad's evdev nodes by name (libevdev name suffix), never by sorted position: node
+  numbers drift with what earlier tests leave open, and string order breaks across event9/event10.
+  Tests: "Create PS5 pad with CONTROLLER_ARRIVAL" (failed CI's ASan leg at uhid.cpp:62).
 - Join, never detach, a test thread that can still log (or touch anything static) after the test ends:
   exit destroys Boost.Log's logger while it runs, and the CI TSan leg fails with exit 66 after every
   test passed (XERK-2438). A blocking curl transfer stops via `CURLOPT_XFERINFOFUNCTION` (see `listen_sse`).
