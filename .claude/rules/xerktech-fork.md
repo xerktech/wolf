@@ -10,7 +10,10 @@ pods run (`ghcr.io/xerktech/wolf`, XERK-1944).
     fork's default still points at) — `gh pr create --base xerktech`.
   - PRs into `xerktech` are squash-merged, so keep one patch per PR: the squash commit is the
     patch that a rebase carries forward.
-- Upstream every generally useful patch as a PR to games-on-whales/wolf (against `beta`).
+- Never open a PR, issue, advisory or comment on games-on-whales repos from a session.
+  - Upstream maintainers are time-limited: ~10 PRs in hours (#547-#549) drew a ban warning.
+  - Queue a generally useful patch on XERK-2685 instead; Malcolm sends one upstream PR at a
+    time, one topic, under ~300 lines, after the previous one merges.
   - Fork-only commits carry `(xerktech)` in their subject, e.g. `ci(xerktech): …`; they are never
     upstreamed.
 
