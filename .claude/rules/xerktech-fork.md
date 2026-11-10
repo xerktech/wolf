@@ -12,9 +12,10 @@ pods run (`ghcr.io/xerktech/wolf`, XERK-1944).
     patch that a rebase carries forward.
 - Upstream generally useful patches to games-on-whales/wolf (against `beta`), paced: ~10 PRs in
   hours (#547-#549) drew a ban warning, and maintainers merge a few outside PRs a month.
-  - At most one open upstream PR of ours at a time, across all sessions. Before opening, check
-    `gh pr list -R games-on-whales/wolf --author xerhab --state open`; if one is open, queue the
-    patch on XERK-2685 instead and stop there.
+  - At most two open upstream PRs of ours at a time, across all sessions and games-on-whales
+    repos. Before opening, check
+    `gh search prs --author xerhab --owner games-on-whales --state open`; if two are open, queue
+    the patch on XERK-2685 instead and stop there.
   - One topic, under ~300 lines, tests included, verified on real hardware (talos04).
   - Take the next patch from XERK-2685's queue order, not whatever this session just wrote.
   - A new feature or API/config surface gets an upstream issue first; code waits for a yes.
